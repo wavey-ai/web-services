@@ -3,6 +3,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use h3_webtransport::server::WebTransportSession;
 use http::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_tungstenite::WebSocketStream;
 
 /// Result type for handlers
 pub type HandlerResult<T> = Result<T, ServerError>;
@@ -77,6 +80,29 @@ pub trait WebTransportHandler: Send + Sync + 'static {
     ) -> HandlerResult<()>;
 }
 
+#[async_trait]
+pub trait WebSocketHandler: Send + Sync + 'static {
+    async fn handle_websocket(
+        &self,
+        req: Request<()>,
+        stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
+    ) -> HandlerResult<()>;
+
+    fn can_handle(&self, path: &str) -> bool;
+}
+
+#[async_trait]
+pub trait RawTcpHandler: Send + Sync + 'static {
+    async fn handle_stream(
+        &self,
+        stream: Box<dyn RawStream>,
+        is_tls: bool,
+    ) -> HandlerResult<()>;
+}
+
+pub trait RawStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> RawStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
 /// Router trait for composing multiple handlers
 #[async_trait]
 pub trait Router: Send + Sync + 'static {
@@ -95,6 +121,9 @@ pub trait Router: Send + Sync + 'static {
 
     /// Get WebTransport handler if available
     fn webtransport_handler(&self) -> Option<&dyn WebTransportHandler>;
+
+    /// Get WebSocket handler if available
+    fn websocket_handler(&self, path: &str) -> Option<&dyn WebSocketHandler>;
 }
 
 /// Server builder trait
@@ -107,6 +136,11 @@ pub trait ServerBuilder: Sized {
     fn with_router(self, router: Box<dyn Router>) -> Self;
     fn enable_h2(self, enable: bool) -> Self;
     fn enable_h3(self, enable: bool) -> Self;
+    fn enable_websocket(self, enable: bool) -> Self;
+    fn enable_raw_tcp(self, enable: bool) -> Self;
+    fn with_raw_tcp_port(self, port: u16) -> Self;
+    fn with_raw_tcp_tls(self, enable: bool) -> Self;
+    fn with_raw_tcp_handler(self, handler: Box<dyn RawTcpHandler>) -> Self;
     fn build(self) -> Result<Self::Server, ServerError>;
 }
 

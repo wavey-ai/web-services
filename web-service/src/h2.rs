@@ -5,10 +5,11 @@ use crate::{
 };
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
-use http::Response;
+use http::{Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
+use hyper::upgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -16,6 +17,10 @@ use std::sync::Arc;
 use tls_helpers::tls_acceptor_from_base64;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tokio_tungstenite::{
+    tungstenite::{handshake::derive_accept_key, protocol::Role},
+    WebSocketStream,
+};
 use tracing::{error, info};
 
 pub struct Http2Server {
@@ -33,13 +38,14 @@ impl Http2Server {
         let tls_acceptor = tls_acceptor_from_base64(
             &self.config.cert_pem_base64,
             &self.config.privkey_pem_base64,
-            false,
+            true,
             true,
         )
         .map_err(|e| ServerError::Tls(e.to_string()))?;
 
         let listener = TcpListener::bind(addr).await.map_err(ServerError::Io)?;
         info!("HTTP/2 server listening at {}", addr);
+        let enable_websocket = self.config.enable_websocket;
 
         loop {
             tokio::select! {
@@ -66,7 +72,7 @@ impl Http2Server {
                                 let service = service_fn(move |req: http::Request<Incoming>| {
                                     let router = Arc::clone(&router);
                                     async move {
-                                        match handle_h2_request(req, router, port).await {
+                                        match handle_h2_request(req, router, port, enable_websocket).await {
                                             Ok(resp) => Ok(resp),
                                             Err(e) => {
                                                 error!("Request handling error: {}", e);
@@ -77,7 +83,10 @@ impl Http2Server {
                                 });
 
                                 if let Err(e) = ConnectionBuilder::new(TokioExecutor::new())
-                                    .serve_connection(TokioIo::new(tls_stream), service)
+                                    .serve_connection_with_upgrades(
+                                        TokioIo::new(tls_stream),
+                                        service,
+                                    )
                                     .await
                                 {
                                     error!("Serving HTTP/2 connection failed: {}", e);
@@ -100,7 +109,92 @@ async fn handle_h2_request(
     req: http::Request<Incoming>,
     router: Arc<dyn Router>,
     port: u16,
+    enable_websocket: bool,
 ) -> Result<Response<Full<Bytes>>, H2Error> {
+    if enable_websocket && is_websocket_upgrade(&req) {
+        if let Some(key) = req.headers().get("sec-websocket-key") {
+            let has_handler = router.websocket_handler(req.uri().path()).is_some();
+            if !has_handler {
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Full::new(Bytes::new()))
+                    .map_err(|e| H2Error::Router(ServerError::Http(e)))?);
+            }
+
+            let accept_key = derive_accept_key(key.as_bytes());
+
+            let method = req.method().clone();
+            let uri = req.uri().clone();
+            let version = req.version();
+            let headers = req.headers().clone();
+            let upgrade_fut = upgrade::on(req);
+            let router = Arc::clone(&router);
+
+            tokio::spawn(async move {
+                match upgrade_fut.await {
+                    Ok(upgraded) => {
+                        tracing::info!("Accepted WebSocket upgrade for {}", uri);
+                        let mut builder = http::Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .version(version);
+                        for (name, value) in headers.iter() {
+                            builder = builder.header(name, value);
+                        }
+
+                        let ws_request = match builder.body(()) {
+                            Ok(req) => req,
+                            Err(e) => {
+                                error!("Failed to rebuild WebSocket request: {}", e);
+                                return;
+                            }
+                        };
+
+                        let mut ws_stream = WebSocketStream::from_raw_socket(
+                            TokioIo::new(upgraded),
+                            Role::Server,
+                            None,
+                        )
+                        .await;
+
+                        if let Some(handler) =
+                            router.websocket_handler(ws_request.uri().path())
+                        {
+                            if let Err(e) = handler.handle_websocket(ws_request, ws_stream).await
+                            {
+                                error!("WebSocket handler error: {}", e);
+                            }
+                        } else {
+                            error!(
+                                "WebSocket handler went missing for path {}",
+                                ws_request.uri().path()
+                            );
+                            // best effort close
+                            let _ = ws_stream.close(None).await;
+                        }
+                    }
+                    Err(e) => error!("WebSocket upgrade failed: {}", e),
+                }
+            });
+
+            let response = Response::builder()
+                .status(StatusCode::SWITCHING_PROTOCOLS)
+                .header(HeaderName::from_static("upgrade"), HeaderValue::from_static("websocket"))
+                .header(
+                    HeaderName::from_static("connection"),
+                    HeaderValue::from_static("Upgrade"),
+                )
+                .header(
+                    HeaderName::from_static("sec-websocket-accept"),
+                    HeaderValue::from_str(&accept_key)?,
+                )
+                .body(Full::new(Bytes::new()))
+                .map_err(|e| H2Error::Router(ServerError::Http(e)))?;
+
+            return Ok(response);
+        }
+    }
+
     let (parts, _body) = req.into_parts();
     let req = http::Request::from_parts(parts, ());
 
@@ -150,4 +244,25 @@ fn add_cors_headers(res: &mut Response<Full<Bytes>>) {
         HeaderName::from_static("access-control-allow-headers"),
         HeaderValue::from_static("*"),
     );
+}
+
+fn is_websocket_upgrade(req: &http::Request<Incoming>) -> bool {
+    req.method() == http::Method::GET
+        && req.version() == http::Version::HTTP_11
+        && header_has_token(req.headers(), "connection", "upgrade")
+        && header_has_token(req.headers(), "upgrade", "websocket")
+        && req.headers().get("sec-websocket-key").is_some()
+        && req
+            .headers()
+            .get("sec-websocket-version")
+            .map(|v| v == "13")
+            .unwrap_or(false)
+}
+
+fn header_has_token(headers: &http::HeaderMap, name: &str, token: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.split(',').any(|part| part.trim().eq_ignore_ascii_case(token)))
 }

@@ -8,7 +8,7 @@ use tokio::time::{Duration, sleep, timeout};
 use tracing::{error, info};
 use web_service::{
     HandlerResponse, HandlerResult, RequestHandler, Router, ServerError, StreamWriter,
-    StreamingHandler, WebTransportHandler,
+    StreamingHandler, WebSocketHandler, WebTransportHandler,
 };
 
 pub struct ChunkRouter {
@@ -68,6 +68,9 @@ impl Router for ChunkRouter {
         ))
     }
     fn webtransport_handler(&self) -> Option<&dyn WebTransportHandler> {
+        None
+    }
+    fn websocket_handler(&self, _: &str) -> Option<&dyn WebSocketHandler> {
         None
     }
 }

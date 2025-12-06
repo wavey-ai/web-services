@@ -8,6 +8,10 @@ pub struct ServerConfig {
     pub enable_h2: bool,
     pub enable_h3: bool,
     pub enable_webtransport: bool,
+    pub enable_websocket: bool,
+    pub enable_raw_tcp: bool,
+    pub raw_tcp_port: u16,
+    pub raw_tcp_tls: bool,
 }
 
 impl Default for ServerConfig {
@@ -19,6 +23,10 @@ impl Default for ServerConfig {
             enable_h2: true,
             enable_h3: true,
             enable_webtransport: true,
+            enable_websocket: true,
+            enable_raw_tcp: false,
+            raw_tcp_port: 9000,
+            raw_tcp_tls: false,
         }
     }
 }

@@ -6,10 +6,9 @@ use playlists::m3u8_cache::M3u8Cache;
 use regex::Regex;
 use std::{collections::HashMap, sync::Arc};
 use tokio::time::{Duration, sleep, timeout};
-use tracing::{error, info};
 use web_service::{
     HandlerResponse, HandlerResult, RequestHandler, Router, ServerError, StreamWriter,
-    StreamingHandler, WebTransportHandler,
+    StreamingHandler, WebSocketHandler, WebTransportHandler,
 };
 
 pub mod streaming;
@@ -19,6 +18,7 @@ pub struct HlsRouter {
     handlers: Vec<Box<dyn RequestHandler>>,
     streaming_handlers: Vec<Box<dyn StreamingHandler>>,
     webtransport_handler: Option<Box<dyn WebTransportHandler>>,
+    websocket_handlers: Vec<Box<dyn WebSocketHandler>>,
 }
 
 impl HlsRouter {
@@ -27,6 +27,7 @@ impl HlsRouter {
             handlers: Vec::new(),
             streaming_handlers: Vec::new(),
             webtransport_handler: None,
+            websocket_handlers: Vec::new(),
         }
     }
     pub fn add_handler(mut self, handler: Box<dyn RequestHandler>) -> Self {
@@ -39,6 +40,15 @@ impl HlsRouter {
     }
     pub fn with_webtransport(mut self, handler: Box<dyn WebTransportHandler>) -> Self {
         self.webtransport_handler = Some(handler);
+        self
+    }
+    pub fn add_websocket_handler(mut self, handler: Box<dyn WebSocketHandler>) -> Self {
+        self.websocket_handlers.push(handler);
+        self
+    }
+    pub fn with_websocket_tail(mut self, fmp4_cache: Arc<Fmp4Cache>) -> Self {
+        self.websocket_handlers
+            .push(Box::new(streaming::TailWebSocketHandler::new(fmp4_cache)));
         self
     }
     fn parse_path(path: &str) -> Vec<&str> {
@@ -89,6 +99,12 @@ impl Router for HlsRouter {
     }
     fn webtransport_handler(&self) -> Option<&dyn WebTransportHandler> {
         self.webtransport_handler.as_deref()
+    }
+    fn websocket_handler(&self, path: &str) -> Option<&dyn WebSocketHandler> {
+        self.websocket_handlers
+            .iter()
+            .find(|handler| handler.can_handle(path))
+            .map(|handler| handler.as_ref())
     }
 }
 

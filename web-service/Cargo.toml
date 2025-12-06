@@ -17,6 +17,7 @@ http = "1"
 regex = "1.10.2"
 http-body-util = "0.1"
 anyhow = "1.0.31"
+dotenvy = "0.15"
 quinn = { version = "0.11", default-features = false, features = [
   "runtime-tokio",
   "rustls",
@@ -40,6 +41,16 @@ tls-helpers = "0.1.5"
 xmpegts = { git = "https://github.com/wavey-ai/xiu" }
 async-trait = "0.1.88"
 thiserror = "2.0.12"
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+tokio-rustls = "0.26"
+portpicker = "0.1"
+base64 = "0.22"
+rustls-pemfile = "2"
+rustls-native-certs = "0.7"
 
 [profile.release]
 opt-level = 3

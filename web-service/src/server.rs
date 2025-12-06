@@ -5,15 +5,16 @@ use crate::{
     error::ServerError,
     h2::Http2Server,
     h3::Http3Server,
-    traits::{HandlerResult, Router, Server, ServerBuilder, ServerHandle},
+    raw_tcp::RawTcpServer,
+    traits::{HandlerResult, Router, Server, ServerBuilder, ServerHandle, RawTcpHandler},
 };
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch};
-use tracing::info;
 
 pub struct H2H3Server {
     config: ServerConfig,
     router: Arc<dyn Router>,
+    raw_tcp_handler: Option<Arc<dyn RawTcpHandler>>,
 }
 
 impl H2H3Server {
@@ -30,6 +31,25 @@ impl Server for H2H3Server {
         let (finished_tx, finished_rx) = oneshot::channel();
 
         let mut tasks = vec![];
+
+        // Start Raw TCP server if enabled
+        if self.config.enable_raw_tcp {
+            if let Some(handler) = &self.raw_tcp_handler {
+                let raw_server =
+                    RawTcpServer::new(self.config.clone(), Arc::clone(handler));
+                let shutdown_rx = shutdown_rx.clone();
+
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = raw_server.start(shutdown_rx).await {
+                        tracing::error!("Raw TCP server error: {}", e);
+                    }
+                });
+
+                tasks.push(handle);
+            } else {
+                tracing::warn!("Raw TCP enabled but no handler configured");
+            }
+        }
 
         // Start HTTP/2 server if enabled
         if self.config.enable_h2 {
@@ -81,6 +101,7 @@ impl Server for H2H3Server {
 pub struct H2H3ServerBuilder {
     config: ServerConfig,
     router: Option<Box<dyn Router>>,
+    raw_tcp_handler: Option<Box<dyn RawTcpHandler>>,
 }
 
 impl ServerBuilder for H2H3ServerBuilder {
@@ -90,6 +111,7 @@ impl ServerBuilder for H2H3ServerBuilder {
         Self {
             config: ServerConfig::default(),
             router: None,
+            raw_tcp_handler: None,
         }
     }
 
@@ -119,6 +141,31 @@ impl ServerBuilder for H2H3ServerBuilder {
         self
     }
 
+    fn enable_websocket(mut self, enable: bool) -> Self {
+        self.config.enable_websocket = enable;
+        self
+    }
+
+    fn enable_raw_tcp(mut self, enable: bool) -> Self {
+        self.config.enable_raw_tcp = enable;
+        self
+    }
+
+    fn with_raw_tcp_port(mut self, port: u16) -> Self {
+        self.config.raw_tcp_port = port;
+        self
+    }
+
+    fn with_raw_tcp_tls(mut self, enable: bool) -> Self {
+        self.config.raw_tcp_tls = enable;
+        self
+    }
+
+    fn with_raw_tcp_handler(mut self, handler: Box<dyn RawTcpHandler>) -> Self {
+        self.raw_tcp_handler = Some(handler);
+        self
+    }
+
     fn build(self) -> Result<Self::Server, ServerError> {
         let router = self
             .router
@@ -135,10 +182,16 @@ impl ServerBuilder for H2H3ServerBuilder {
                 "At least one protocol (HTTP/2 or HTTP/3) must be enabled".into(),
             ));
         }
+        if self.config.enable_raw_tcp && self.raw_tcp_handler.is_none() {
+            return Err(ServerError::Config(
+                "Raw TCP enabled but no handler provided".into(),
+            ));
+        }
 
         Ok(H2H3Server {
             config: self.config,
             router: Arc::from(router),
+            raw_tcp_handler: self.raw_tcp_handler.map(Arc::from),
         })
     }
 }

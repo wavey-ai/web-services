@@ -1,17 +1,21 @@
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures_util::{SinkExt, StreamExt};
 use h3_quinn::Connection as QuinnConnection;
 use h3_webtransport::server::WebTransportSession;
+use hyper_util::rt::TokioIo;
 use http::{Request, Response, StatusCode};
 use playlists::fmp4_cache::Fmp4Cache;
 use std::sync::Arc;
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{error, info};
 use web_service::{
-    HandlerResult, ServerError, StreamWriter, StreamingHandler, WebTransportHandler,
+    HandlerResult, ServerError, StreamWriter, StreamingHandler, WebSocketHandler,
+    WebTransportHandler,
 };
 use xmpegts::define::epsi_stream_type;
 use xmpegts::ts::TsMuxer;
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
 /// Tail streaming handler
 pub struct TailStreamHandler {
@@ -180,4 +184,69 @@ async fn handle_transport_session(
 
     info!("WebTransport session finished");
     Ok(())
+}
+
+/// WebSocket tail handler (binary frames carrying fMP4 parts)
+pub struct TailWebSocketHandler {
+    fmp4_cache: Arc<Fmp4Cache>,
+}
+
+impl TailWebSocketHandler {
+    pub fn new(fmp4_cache: Arc<Fmp4Cache>) -> Self {
+        Self { fmp4_cache }
+    }
+}
+
+#[async_trait]
+impl WebSocketHandler for TailWebSocketHandler {
+    async fn handle_websocket(
+        &self,
+        req: Request<()>,
+        mut stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
+    ) -> HandlerResult<()> {
+        let parts: Vec<&str> = req.uri().path().split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() != 2 || parts[1] != "ws" {
+            return Err(ServerError::Config("Invalid WebSocket path".into()));
+        }
+
+        let stream_id = parts[0]
+            .parse::<u64>()
+            .map_err(|_| ServerError::Config("Invalid stream ID".into()))?;
+
+        let idx = self
+            .fmp4_cache
+            .get_stream_idx(stream_id)
+            .await
+            .ok_or(ServerError::Config("Stream not found".into()))?;
+        let mut last = self.fmp4_cache.last(idx).unwrap_or(0);
+
+        loop {
+            match tokio::time::timeout(Duration::from_millis(1), stream.next()).await {
+                Ok(Some(Ok(Message::Close(_)))) => break,
+                Ok(Some(Ok(Message::Ping(payload)))) => {
+                    let _ = stream.send(Message::Pong(payload)).await;
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(e))) => return Err(ServerError::Handler(Box::new(e))),
+                Ok(None) => break,
+                Err(_) => {}
+            }
+
+            if let Some((data, _)) = self.fmp4_cache.get(idx, last).await {
+                if let Err(e) = stream.send(Message::Binary(data)).await {
+                    return Err(ServerError::Handler(Box::new(e)));
+                }
+                last += 1;
+            } else {
+                sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn can_handle(&self, path: &str) -> bool {
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        parts.len() == 2 && parts[1] == "ws"
+    }
 }
