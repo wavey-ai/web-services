@@ -1,13 +1,14 @@
 use crate::{
     config::ServerConfig,
     error::{H2Error, ServerError, ServerResult},
-    traits::Router,
+    traits::{BodyStream, HandlerResponse, Router},
 };
 use bytes::Bytes;
+use http_body_util::BodyExt;
 use http::header::{HeaderName, HeaderValue};
 use http::{Response, StatusCode};
 use http_body_util::Full;
-use hyper::body::Incoming;
+use hyper::body::{Incoming};
 use hyper::service::service_fn;
 use hyper::upgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -195,10 +196,37 @@ async fn handle_h2_request(
         }
     }
 
-    let (parts, _body) = req.into_parts();
-    let req = http::Request::from_parts(parts, ());
+    let (parts, body) = req.into_parts();
+    let path = parts.uri.path().to_string();
+    if router.has_body_handler(&path) {
+        use futures_util::stream::unfold;
+        let stream: BodyStream = Box::pin(unfold(body, |mut b: Incoming| async move {
+            match b.frame().await {
+                Some(Ok(frame)) => {
+                    let data = frame
+                        .into_data()
+                        .map(Bytes::from)
+                        .unwrap_or_else(|_| Bytes::new());
+                    Some((Ok(data), b))
+                }
+                Some(Err(e)) => Some((Err(ServerError::Handler(Box::new(e))), b)),
+                None => None,
+            }
+        }));
+        let req = http::Request::from_parts(parts, ());
+        let handler_response = router.route_body(req, stream).await.map_err(H2Error::Router)?;
+        return build_response(handler_response, port);
+    }
 
+    let req = http::Request::from_parts(parts, ());
     let handler_response = router.route(req).await.map_err(H2Error::Router)?;
+    build_response(handler_response, port)
+}
+
+fn build_response(
+    handler_response: HandlerResponse,
+    port: u16,
+) -> Result<Response<Full<Bytes>>, H2Error> {
 
     let mut response = Response::new(Full::from(handler_response.body.unwrap_or_else(Bytes::new)));
     *response.status_mut() = handler_response.status;

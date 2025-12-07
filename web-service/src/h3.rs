@@ -1,14 +1,15 @@
 use crate::{
     config::ServerConfig,
     error::{H3Error, ServerError, ServerResult},
-    traits::{Router, StreamWriter},
+    traits::{BodyStream, Router, StreamWriter},
 };
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use h3::ext::Protocol;
 use h3::server::{Connection, RequestStream};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
 use h3_webtransport::server::WebTransportSession;
 use http::{Method, Response};
+use futures_util::stream;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
@@ -154,8 +155,34 @@ async fn handle_h3_request(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     router: Arc<dyn Router>,
 ) -> Result<(), H3Error> {
-    let handler_response = router.route(req).await.map_err(H3Error::Router)?;
+    let path = req.uri().path().to_string();
+    if router.has_body_handler(&path) {
+        let mut collected = Vec::new();
+        while let Some(mut chunk) = stream
+            .recv_data()
+            .await
+            .map_err(|e| H3Error::Transport(e.to_string()))?
+        {
+            let data = chunk.copy_to_bytes(chunk.remaining());
+            collected.push(Bytes::from(data));
+        }
+        let body_stream: BodyStream =
+            Box::pin(stream::iter(collected.into_iter().map(Ok::<_, ServerError>)));
+        let handler_response = router
+            .route_body(req, body_stream)
+            .await
+            .map_err(H3Error::Router)?;
+        return send_h3_response(handler_response, stream).await;
+    }
 
+    let handler_response = router.route(req).await.map_err(H3Error::Router)?;
+    send_h3_response(handler_response, stream).await
+}
+
+async fn send_h3_response(
+    handler_response: crate::traits::HandlerResponse,
+    mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+) -> Result<(), H3Error> {
     let mut builder = http::Response::builder().status(handler_response.status);
     if let Some(ct) = handler_response.content_type {
         builder = builder.header("content-type", ct);

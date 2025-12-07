@@ -51,10 +51,3 @@ portpicker = "0.1"
 base64 = "0.22"
 rustls-pemfile = "2"
 rustls-native-certs = "0.7"
-
-[profile.release]
-opt-level = 3
-strip = true
-debug = false
-codegen-units = 1
-lto = true

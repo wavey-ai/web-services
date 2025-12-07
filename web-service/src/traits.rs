@@ -4,6 +4,7 @@ use bytes::Bytes;
 use h3_webtransport::server::WebTransportSession;
 use http::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use futures_util::stream::BoxStream;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 
@@ -19,6 +20,9 @@ pub struct HandlerResponse {
     pub headers: Vec<(String, String)>,
     pub etag: Option<u64>,
 }
+
+/// Stream type for request bodies
+pub type BodyStream = BoxStream<'static, Result<Bytes, ServerError>>;
 
 impl Default for HandlerResponse {
     fn default() -> Self {
@@ -108,6 +112,22 @@ impl<T> RawStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 pub trait Router: Send + Sync + 'static {
     /// Route a request to the appropriate handler
     async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse>;
+
+    /// Route a request that expects a streaming body
+    async fn route_body(
+        &self,
+        req: Request<()>,
+        body: BodyStream,
+    ) -> HandlerResult<HandlerResponse> {
+        // Default to ignoring the body and using the normal route
+        let _ = body;
+        self.route(req).await
+    }
+
+    /// Check if a streaming-body handler exists for this path
+    fn has_body_handler(&self, _path: &str) -> bool {
+        false
+    }
 
     /// Check if this is a streaming endpoint
     fn is_streaming(&self, path: &str) -> bool;

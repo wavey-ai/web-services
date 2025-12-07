@@ -1,2 +1,10 @@
 [workspace]
 members = ["web-service", "hls", "chunks"]
+resolver = "3"
+
+[profile.release]
+opt-level = 3
+strip = true
+debug = false
+codegen-units = 1
+lto = true

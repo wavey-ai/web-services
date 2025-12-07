@@ -12,6 +12,7 @@ pub use config::ServerConfig;
 pub use error::{ServerError, ServerResult};
 pub use server::{H2H3Server, H2H3ServerBuilder};
 pub use traits::{
-    HandlerResponse, HandlerResult, RequestHandler, Router, Server, ServerBuilder, ServerHandle,
-    StreamWriter, StreamingHandler, WebSocketHandler, WebTransportHandler, RawTcpHandler,
+    BodyStream, HandlerResponse, HandlerResult, RequestHandler, Router, Server, ServerBuilder,
+    ServerHandle, StreamWriter, StreamingHandler, WebSocketHandler, WebTransportHandler,
+    RawTcpHandler,
 };
