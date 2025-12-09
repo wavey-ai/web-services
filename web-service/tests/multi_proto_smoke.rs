@@ -5,25 +5,20 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine};
 use bytes::{Buf, Bytes};
 use dotenvy::dotenv;
 use futures_util::{SinkExt, StreamExt};
 use http::{Request, StatusCode};
 use portpicker::pick_unused_port;
+use rustls_native_certs;
+use tls_helpers::{from_base64_raw, load_certs_from_base64};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::lookup_host;
-use tokio_rustls::rustls::{
-    self,
-    pki_types::ServerName,
-    ClientConfig, RootCertStore,
-};
+use tokio_rustls::rustls::{self, pki_types::ServerName, ClientConfig, RootCertStore};
 use tokio_tungstenite::tungstenite::Message;
-use rustls_pemfile;
-use rustls_native_certs;
 use web_service::{
-    HandlerResponse, HandlerResult, H2H3Server, RequestHandler, Router, Server, ServerBuilder,
-    ServerError, WebSocketHandler, RawTcpHandler,
+    H2H3Server, HandlerResponse, HandlerResult, RawTcpHandler, RequestHandler, Router, Server,
+    ServerBuilder, ServerError, WebSocketHandler,
 };
 
 struct HelloHandler;
@@ -116,10 +111,7 @@ impl Router for TestRouter {
         let path = req.uri().path().to_string();
         let query = req.uri().query().map(str::to_string);
         if self.http.can_handle(&path) {
-            return self
-                .http
-                .handle(req, vec![], query.as_deref())
-                .await;
+            return self.http.handle(req, vec![], query.as_deref()).await;
         }
 
         Ok(HandlerResponse {
@@ -169,12 +161,9 @@ fn tls_client_config(cert_pem_b64: &str) -> ClientConfig {
             let _ = roots.add(cert);
         }
     }
-    if let Ok(cert_pem) = STANDARD.decode(cert_pem_b64) {
-        let mut reader = std::io::Cursor::new(cert_pem);
-        if let Ok(certs) = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() {
-            for c in certs {
-                let _ = roots.add(c);
-            }
+    if let Ok(certs) = load_certs_from_base64(cert_pem_b64) {
+        for cert in certs {
+            let _ = roots.add(cert);
         }
     }
 
@@ -369,19 +358,24 @@ async fn http1_works() {
         }
     };
 
-    run_with_server(cert_b64.clone(), key_b64, host.clone(), |port, host| async move {
-        let cert_pem = STANDARD.decode(&cert_b64).expect("decode cert");
-        let reqwest_cert = reqwest::Certificate::from_pem(&cert_pem).unwrap();
-        let client = reqwest::Client::builder()
-            .add_root_certificate(reqwest_cert)
-            .http1_only()
-            .build()
-            .unwrap();
-        let url = format!("https://{host}:{port}/");
-        let resp = client.get(url).send().await.expect("http1 request");
-        assert_eq!(resp.version(), reqwest::Version::HTTP_11);
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    })
+    run_with_server(
+        cert_b64.clone(),
+        key_b64,
+        host.clone(),
+        |port, host| async move {
+            let cert_pem = from_base64_raw(&cert_b64).expect("decode cert");
+            let reqwest_cert = reqwest::Certificate::from_pem(&cert_pem).expect("reqwest cert");
+            let client = reqwest::Client::builder()
+                .add_root_certificate(reqwest_cert)
+                .http1_only()
+                .build()
+                .unwrap();
+            let url = format!("https://{host}:{port}/");
+            let resp = client.get(url).send().await.expect("http1 request");
+            assert_eq!(resp.version(), reqwest::Version::HTTP_11);
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        },
+    )
     .await;
 }
 
@@ -396,18 +390,23 @@ async fn http2_works() {
         }
     };
 
-    run_with_server(cert_b64.clone(), key_b64, host.clone(), |port, host| async move {
-        let cert_pem = STANDARD.decode(&cert_b64).expect("decode cert");
-        let reqwest_cert = reqwest::Certificate::from_pem(&cert_pem).unwrap();
-        let client = reqwest::Client::builder()
-            .add_root_certificate(reqwest_cert)
-            .build()
-            .unwrap();
-        let url = format!("https://{host}:{port}/");
-        let resp = client.get(url).send().await.expect("http2 request");
-        assert_eq!(resp.version(), reqwest::Version::HTTP_2);
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    })
+    run_with_server(
+        cert_b64.clone(),
+        key_b64,
+        host.clone(),
+        |port, host| async move {
+            let cert_pem = from_base64_raw(&cert_b64).expect("decode cert");
+            let reqwest_cert = reqwest::Certificate::from_pem(&cert_pem).expect("reqwest cert");
+            let client = reqwest::Client::builder()
+                .add_root_certificate(reqwest_cert)
+                .build()
+                .unwrap();
+            let url = format!("https://{host}:{port}/");
+            let resp = client.get(url).send().await.expect("http2 request");
+            assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        },
+    )
     .await;
 }
 
@@ -422,37 +421,45 @@ async fn websocket_works() {
         }
     };
 
-    run_with_server(cert_b64.clone(), key_b64, host.clone(), |port, host| async move {
-        let ws_url = format!("wss://{host}:{port}/ws");
-        let tcp = tokio::net::TcpStream::connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+    run_with_server(
+        cert_b64.clone(),
+        key_b64,
+        host.clone(),
+        |port, host| async move {
+            let ws_url = format!("wss://{host}:{port}/ws");
+            let tcp = tokio::net::TcpStream::connect(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+            ))
             .await
             .expect("connect ws tcp");
-        let mut ws_cfg = tls_client_config(&std::env::var("TLS_CERT_BASE64").unwrap());
-        ws_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(ws_cfg));
-        let server_name = ServerName::try_from(host.clone()).expect("sni");
-        let tls_stream = tls_connector
-            .connect(server_name, tcp)
-            .await
-            .expect("ws tls connect");
-        let (mut ws, resp) = tokio_tungstenite::client_async(ws_url, tls_stream)
-            .await
-            .expect("ws handshake");
-        assert_eq!(resp.status(), http::StatusCode::SWITCHING_PROTOCOLS);
-        ws.send(Message::Text("hi".into())).await.expect("ws send");
-        match ws.next().await {
-            Some(Ok(frame)) => {
-                assert_eq!(frame.into_text().expect("ws text"), "echo: hi");
-            }
-            Some(Err(e)) => {
-                if !e.to_string().contains("close_notify") {
-                    panic!("ws recv error: {e}");
+            let mut ws_cfg = tls_client_config(&std::env::var("TLS_CERT_BASE64").unwrap());
+            ws_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(ws_cfg));
+            let server_name = ServerName::try_from(host.clone()).expect("sni");
+            let tls_stream = tls_connector
+                .connect(server_name, tcp)
+                .await
+                .expect("ws tls connect");
+            let (mut ws, resp) = tokio_tungstenite::client_async(ws_url, tls_stream)
+                .await
+                .expect("ws handshake");
+            assert_eq!(resp.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+            ws.send(Message::Text("hi".into())).await.expect("ws send");
+            match ws.next().await {
+                Some(Ok(frame)) => {
+                    assert_eq!(frame.into_text().expect("ws text"), "echo: hi");
                 }
+                Some(Err(e)) => {
+                    if !e.to_string().contains("close_notify") {
+                        panic!("ws recv error: {e}");
+                    }
+                }
+                None => eprintln!("ws closed without echo"),
             }
-            None => eprintln!("ws closed without echo"),
-        }
-        let _ = ws.close(None).await;
-    })
+            let _ = ws.close(None).await;
+        },
+    )
     .await;
 }
 
@@ -467,46 +474,51 @@ async fn http3_works() {
         }
     };
 
-    run_with_server(cert_b64.clone(), key_b64, host.clone(), |port, host| async move {
-        let mut h3_client_cfg = tls_client_config(&std::env::var("TLS_CERT_BASE64").unwrap());
-        h3_client_cfg.alpn_protocols = vec![b"h3".to_vec()];
-        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(h3_client_cfg)
-            .expect("quic cfg");
-        let quic_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
-        let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))
-            .expect("create client endpoint");
-        endpoint.set_default_client_config(quic_cfg);
-        let target_ip = lookup_host((host.as_str(), port))
-            .await
-            .ok()
-            .and_then(|mut iter| iter.next().map(|sa| sa.ip()))
-            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let conn = endpoint
-            .connect(SocketAddr::new(target_ip, port), &host)
-            .expect("connect h3")
-            .await
-            .expect("h3 handshake");
-        let (_h3_conn, mut sender): (
-            h3::client::Connection<h3_quinn::Connection, Bytes>,
-            h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-        ) = h3::client::builder()
-            .build(h3_quinn::Connection::new(conn))
-            .await
-            .expect("h3 build");
-        let uri = format!("https://{host}:{port}/");
-        let mut req_stream = sender
-            .send_request(Request::get(uri).body(()).unwrap())
-            .await
-            .expect("h3 request");
-        let response = req_stream.recv_response().await.expect("h3 response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let mut body = Vec::new();
-        while let Some(mut chunk) = req_stream.recv_data().await.expect("recv data") {
-            let data = chunk.copy_to_bytes(chunk.remaining());
-            body.extend_from_slice(&data);
-        }
-        assert_eq!(body, b"hello from test");
-    })
+    run_with_server(
+        cert_b64.clone(),
+        key_b64,
+        host.clone(),
+        |port, host| async move {
+            let mut h3_client_cfg = tls_client_config(&std::env::var("TLS_CERT_BASE64").unwrap());
+            h3_client_cfg.alpn_protocols = vec![b"h3".to_vec()];
+            let quic_crypto =
+                quinn::crypto::rustls::QuicClientConfig::try_from(h3_client_cfg).expect("quic cfg");
+            let quic_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
+            let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))
+                .expect("create client endpoint");
+            endpoint.set_default_client_config(quic_cfg);
+            let target_ip = lookup_host((host.as_str(), port))
+                .await
+                .ok()
+                .and_then(|mut iter| iter.next().map(|sa| sa.ip()))
+                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let conn = endpoint
+                .connect(SocketAddr::new(target_ip, port), &host)
+                .expect("connect h3")
+                .await
+                .expect("h3 handshake");
+            let (_h3_conn, mut sender): (
+                h3::client::Connection<h3_quinn::Connection, Bytes>,
+                h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+            ) = h3::client::builder()
+                .build(h3_quinn::Connection::new(conn))
+                .await
+                .expect("h3 build");
+            let uri = format!("https://{host}:{port}/");
+            let mut req_stream = sender
+                .send_request(Request::get(uri).body(()).unwrap())
+                .await
+                .expect("h3 request");
+            let response = req_stream.recv_response().await.expect("h3 response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = Vec::new();
+            while let Some(mut chunk) = req_stream.recv_data().await.expect("recv data") {
+                let data = chunk.copy_to_bytes(chunk.remaining());
+                body.extend_from_slice(&data);
+            }
+            assert_eq!(body, b"hello from test");
+        },
+    )
     .await;
 }
 
@@ -521,19 +533,25 @@ async fn raw_tcp_plain_works() {
         }
     };
 
-    run_with_raw_server(cert_b64, key_b64, host, false, |raw_port, _host| async move {
-        let mut stream = tokio::net::TcpStream::connect(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            raw_port,
-        ))
-        .await
-        .expect("connect raw tcp");
-        let greeting = read_frame(&mut stream).await.expect("read greeting");
-        assert_eq!(greeting, b"hello-plain");
-        write_frame(&mut stream, b"ping").await.expect("write ping");
-        let response = read_frame(&mut stream).await.expect("read echo");
-        assert_eq!(response, b"echo-plain:ping");
-    })
+    run_with_raw_server(
+        cert_b64,
+        key_b64,
+        host,
+        false,
+        |raw_port, _host| async move {
+            let mut stream = tokio::net::TcpStream::connect(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                raw_port,
+            ))
+            .await
+            .expect("connect raw tcp");
+            let greeting = read_frame(&mut stream).await.expect("read greeting");
+            assert_eq!(greeting, b"hello-plain");
+            write_frame(&mut stream, b"ping").await.expect("write ping");
+            let response = read_frame(&mut stream).await.expect("read echo");
+            assert_eq!(response, b"echo-plain:ping");
+        },
+    )
     .await;
 }
 
@@ -549,32 +567,38 @@ async fn raw_tcp_tls_works() {
     };
     let client_cert = cert_b64.clone();
 
-    run_with_raw_server(cert_b64, key_b64, host.clone(), true, move |raw_port, host| {
-        let client_cert = client_cert.clone();
-        async move {
-            let tcp = tokio::net::TcpStream::connect(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                raw_port,
-            ))
-            .await
-            .expect("connect raw tls tcp");
-            let mut cfg = tls_client_config(&client_cert);
-            cfg.alpn_protocols.clear();
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
-            let server_name = ServerName::try_from(host.clone()).expect("sni");
-            let mut tls = connector
-                .connect(server_name, tcp)
+    run_with_raw_server(
+        cert_b64,
+        key_b64,
+        host.clone(),
+        true,
+        move |raw_port, host| {
+            let client_cert = client_cert.clone();
+            async move {
+                let tcp = tokio::net::TcpStream::connect(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    raw_port,
+                ))
                 .await
-                .expect("tls connect");
+                .expect("connect raw tls tcp");
+                let mut cfg = tls_client_config(&client_cert);
+                cfg.alpn_protocols.clear();
+                let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+                let server_name = ServerName::try_from(host.clone()).expect("sni");
+                let mut tls = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .expect("tls connect");
 
-            let greeting = read_frame(&mut tls).await.expect("read greeting");
-            assert_eq!(greeting, b"hello-tls");
-            write_frame(&mut tls, b"ping-tls")
-                .await
-                .expect("write ping");
-            let response = read_frame(&mut tls).await.expect("read echo");
-            assert_eq!(response, b"echo-tls:ping-tls");
-        }
-    })
+                let greeting = read_frame(&mut tls).await.expect("read greeting");
+                assert_eq!(greeting, b"hello-tls");
+                write_frame(&mut tls, b"ping-tls")
+                    .await
+                    .expect("write ping");
+                let response = read_frame(&mut tls).await.expect("read echo");
+                assert_eq!(response, b"echo-tls:ping-tls");
+            }
+        },
+    )
     .await;
 }
