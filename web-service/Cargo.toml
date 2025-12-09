@@ -23,7 +23,7 @@ quinn = { version = "0.11", default-features = false, features = [
   "rustls",
   "ring",
 ] }
-rustls = { version = "0.23", default-features = false, features = [
+rustls = { version = "0.23.35", default-features = false, features = [
   "logging",
   "ring",
   "std",
@@ -37,7 +37,7 @@ h3-quinn = { git = "https://github.com/hyperium/h3.git", features = [
 h3-webtransport = { git = "https://github.com/hyperium/h3.git" }
 h3-datagram = { git = "https://github.com/hyperium/h3.git" }
 playlists = { git = "https://github.com/wavey-ai/playlists.git" }
-tls-helpers = "0.1.5"
+tls-helpers = { git = "https://github.com/wavey-ai/tls-helpers.git" }
 xmpegts = { git = "https://github.com/wavey-ai/xiu" }
 async-trait = "0.1.88"
 thiserror = "2.0.12"
