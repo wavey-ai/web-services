@@ -4,11 +4,11 @@ use crate::{
     traits::{BodyStream, HandlerResponse, Router},
 };
 use bytes::Bytes;
-use http_body_util::BodyExt;
 use http::header::{HeaderName, HeaderValue};
 use http::{Response, StatusCode};
+use http_body_util::BodyExt;
 use http_body_util::Full;
-use hyper::body::{Incoming};
+use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::upgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -158,11 +158,8 @@ async fn handle_h2_request(
                         )
                         .await;
 
-                        if let Some(handler) =
-                            router.websocket_handler(ws_request.uri().path())
-                        {
-                            if let Err(e) = handler.handle_websocket(ws_request, ws_stream).await
-                            {
+                        if let Some(handler) = router.websocket_handler(ws_request.uri().path()) {
+                            if let Err(e) = handler.handle_websocket(ws_request, ws_stream).await {
                                 error!("WebSocket handler error: {}", e);
                             }
                         } else {
@@ -180,7 +177,10 @@ async fn handle_h2_request(
 
             let response = Response::builder()
                 .status(StatusCode::SWITCHING_PROTOCOLS)
-                .header(HeaderName::from_static("upgrade"), HeaderValue::from_static("websocket"))
+                .header(
+                    HeaderName::from_static("upgrade"),
+                    HeaderValue::from_static("websocket"),
+                )
                 .header(
                     HeaderName::from_static("connection"),
                     HeaderValue::from_static("Upgrade"),
@@ -214,7 +214,10 @@ async fn handle_h2_request(
             }
         }));
         let req = http::Request::from_parts(parts, ());
-        let handler_response = router.route_body(req, stream).await.map_err(H2Error::Router)?;
+        let handler_response = router
+            .route_body(req, stream)
+            .await
+            .map_err(H2Error::Router)?;
         return build_response(handler_response, port);
     }
 
@@ -227,7 +230,6 @@ fn build_response(
     handler_response: HandlerResponse,
     port: u16,
 ) -> Result<Response<Full<Bytes>>, H2Error> {
-
     let mut response = Response::new(Full::from(handler_response.body.unwrap_or_else(Bytes::new)));
     *response.status_mut() = handler_response.status;
 
@@ -292,5 +294,9 @@ fn header_has_token(headers: &http::HeaderMap, name: &str, token: &str) -> bool 
         .get_all(name)
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .any(|value| value.split(',').any(|part| part.trim().eq_ignore_ascii_case(token)))
+        .any(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
 }

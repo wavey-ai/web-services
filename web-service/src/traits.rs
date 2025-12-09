@@ -1,10 +1,10 @@
 use crate::error::ServerError;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::stream::BoxStream;
 use h3_webtransport::server::WebTransportSession;
 use http::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use futures_util::stream::BoxStream;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 
@@ -97,11 +97,7 @@ pub trait WebSocketHandler: Send + Sync + 'static {
 
 #[async_trait]
 pub trait RawTcpHandler: Send + Sync + 'static {
-    async fn handle_stream(
-        &self,
-        stream: Box<dyn RawStream>,
-        is_tls: bool,
-    ) -> HandlerResult<()>;
+    async fn handle_stream(&self, stream: Box<dyn RawStream>, is_tls: bool) -> HandlerResult<()>;
 }
 
 pub trait RawStream: AsyncRead + AsyncWrite + Unpin + Send {}

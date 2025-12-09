@@ -3,11 +3,12 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use h3_quinn::Connection as QuinnConnection;
 use h3_webtransport::server::WebTransportSession;
-use hyper_util::rt::TokioIo;
 use http::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use playlists::fmp4_cache::Fmp4Cache;
 use std::sync::Arc;
 use tokio::time::{Duration, Instant, sleep};
+use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 use tracing::{error, info};
 use web_service::{
     HandlerResult, ServerError, StreamWriter, StreamingHandler, WebSocketHandler,
@@ -15,7 +16,6 @@ use web_service::{
 };
 use xmpegts::define::epsi_stream_type;
 use xmpegts::ts::TsMuxer;
-use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
 /// Tail streaming handler
 pub struct TailStreamHandler {
@@ -204,7 +204,12 @@ impl WebSocketHandler for TailWebSocketHandler {
         req: Request<()>,
         mut stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     ) -> HandlerResult<()> {
-        let parts: Vec<&str> = req.uri().path().split('/').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = req
+            .uri()
+            .path()
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
         if parts.len() != 2 || parts[1] != "ws" {
             return Err(ServerError::Config("Invalid WebSocket path".into()));
         }

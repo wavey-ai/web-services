@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use http::{Request, StatusCode};
 use std::env;
 use web_service::{
-    HandlerResponse, HandlerResult, H2H3Server, RequestHandler, Router, Server, ServerBuilder,
+    H2H3Server, HandlerResponse, HandlerResult, RequestHandler, Router, Server, ServerBuilder,
     ServerError, WebSocketHandler,
 };
 
@@ -108,10 +108,7 @@ impl Router for ExampleRouter {
         let query = req.uri().query().map(str::to_string);
         if self.http.can_handle(&path) {
             let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-            return self
-                .http
-                .handle(req, parts, query.as_deref())
-                .await;
+            return self.http.handle(req, parts, query.as_deref()).await;
         }
 
         Ok(HandlerResponse {

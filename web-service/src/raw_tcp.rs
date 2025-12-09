@@ -1,4 +1,8 @@
-use crate::{config::ServerConfig, error::ServerResult, traits::{RawTcpHandler, RawStream}};
+use crate::{
+    config::ServerConfig,
+    error::ServerResult,
+    traits::{RawStream, RawTcpHandler},
+};
 use std::{net::SocketAddr, sync::Arc};
 use tls_helpers::tls_acceptor_from_base64;
 use tokio::net::TcpListener;
@@ -19,7 +23,9 @@ impl RawTcpServer {
 
     pub async fn start(&self, mut shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.raw_tcp_port));
-        let listener = TcpListener::bind(addr).await.map_err(crate::error::ServerError::Io)?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(crate::error::ServerError::Io)?;
         info!(
             "Raw TCP server listening at {} (tls={})",
             addr, self.config.raw_tcp_tls

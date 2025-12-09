@@ -4,12 +4,12 @@ use crate::{
     traits::{BodyStream, Router, StreamWriter},
 };
 use bytes::{Buf, Bytes};
+use futures_util::stream;
 use h3::ext::Protocol;
 use h3::server::{Connection, RequestStream};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
 use h3_webtransport::server::WebTransportSession;
 use http::{Method, Response};
-use futures_util::stream;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
@@ -166,8 +166,9 @@ async fn handle_h3_request(
             let data = chunk.copy_to_bytes(chunk.remaining());
             collected.push(Bytes::from(data));
         }
-        let body_stream: BodyStream =
-            Box::pin(stream::iter(collected.into_iter().map(Ok::<_, ServerError>)));
+        let body_stream: BodyStream = Box::pin(stream::iter(
+            collected.into_iter().map(Ok::<_, ServerError>),
+        ));
         let handler_response = router
             .route_body(req, body_stream)
             .await

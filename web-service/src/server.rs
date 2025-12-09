@@ -6,7 +6,7 @@ use crate::{
     h2::Http2Server,
     h3::Http3Server,
     raw_tcp::RawTcpServer,
-    traits::{HandlerResult, Router, Server, ServerBuilder, ServerHandle, RawTcpHandler},
+    traits::{HandlerResult, RawTcpHandler, Router, Server, ServerBuilder, ServerHandle},
 };
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch};
@@ -35,8 +35,7 @@ impl Server for H2H3Server {
         // Start Raw TCP server if enabled
         if self.config.enable_raw_tcp {
             if let Some(handler) = &self.raw_tcp_handler {
-                let raw_server =
-                    RawTcpServer::new(self.config.clone(), Arc::clone(handler));
+                let raw_server = RawTcpServer::new(self.config.clone(), Arc::clone(handler));
                 let shutdown_rx = shutdown_rx.clone();
 
                 let handle = tokio::spawn(async move {
