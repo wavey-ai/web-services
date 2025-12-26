@@ -17,7 +17,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::tls_acceptor_from_base64;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::watch;
 use tokio_tungstenite::{
     tungstenite::{handshake::derive_accept_key, protocol::Role},
@@ -45,7 +45,7 @@ impl Http2Server {
         )
         .map_err(|e| ServerError::Tls(e.to_string()))?;
 
-        let listener = TcpListener::bind(addr).await.map_err(ServerError::Io)?;
+        let listener = bind_tcp_listener(addr)?;
         info!("HTTP/1.1+HTTP/2 server listening at {}", addr);
         let enable_websocket = self.config.enable_websocket;
 
@@ -93,7 +93,7 @@ impl Http2Server {
                                 });
 
                                 if matches!(alpn, Some(proto) if proto == b"h2") {
-                                    let mut builder = http2::Builder::new(TokioExecutor::new());
+                                    let builder = http2::Builder::new(TokioExecutor::new());
                                     if let Err(e) = builder
                                         .serve_connection(TokioIo::new(tls_stream), service)
                                         .await
@@ -101,7 +101,7 @@ impl Http2Server {
                                         error!("Serving HTTP/2 connection failed: {}", e);
                                     }
                                 } else {
-                                    let mut builder = http1::Builder::new();
+                                    let builder = http1::Builder::new();
                                     let conn =
                                         builder.serve_connection(TokioIo::new(tls_stream), service);
                                     let result = if enable_websocket {
@@ -125,6 +125,17 @@ impl Http2Server {
 
         Ok(())
     }
+}
+
+fn bind_tcp_listener(addr: SocketAddr) -> ServerResult<TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .map_err(ServerError::Io)?;
+    let _ = socket.set_reuseaddr(true);
+    socket.bind(addr).map_err(ServerError::Io)?;
+    socket.listen(1024).map_err(ServerError::Io)
 }
 
 async fn handle_h2_request(
@@ -240,6 +251,13 @@ async fn handle_h2_request(
             .await
             .map_err(H2Error::Router)?;
         return build_response(handler_response, port);
+    }
+
+    let mut body = body;
+    while let Some(frame) = body.frame().await {
+        if let Err(err) = frame {
+            return Err(H2Error::Router(ServerError::Handler(Box::new(err))));
+        }
     }
 
     let req = http::Request::from_parts(parts, ());
