@@ -9,10 +9,11 @@ use http::{Response, StatusCode};
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::upgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::tls_acceptor_from_base64;
@@ -45,13 +46,13 @@ impl Http2Server {
         .map_err(|e| ServerError::Tls(e.to_string()))?;
 
         let listener = TcpListener::bind(addr).await.map_err(ServerError::Io)?;
-        info!("HTTP/2 server listening at {}", addr);
+        info!("HTTP/1.1+HTTP/2 server listening at {}", addr);
         let enable_websocket = self.config.enable_websocket;
 
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
-                    info!("HTTP/2 server shutting down");
+                    info!("HTTP/1.1+HTTP/2 server shutting down");
                     break;
                 }
                 accept_res = listener.accept() => {
@@ -70,10 +71,18 @@ impl Http2Server {
                                     }
                                 };
 
+                                let alpn = tls_stream.get_ref().1.alpn_protocol();
                                 let service = service_fn(move |req: http::Request<Incoming>| {
                                     let router = Arc::clone(&router);
                                     async move {
-                                        match handle_h2_request(req, router, port, enable_websocket).await {
+                                        match handle_h2_request(
+                                            req,
+                                            router,
+                                            port,
+                                            enable_websocket,
+                                        )
+                                        .await
+                                        {
                                             Ok(resp) => Ok(resp),
                                             Err(e) => {
                                                 error!("Request handling error: {}", e);
@@ -83,14 +92,26 @@ impl Http2Server {
                                     }
                                 });
 
-                                if let Err(e) = ConnectionBuilder::new(TokioExecutor::new())
-                                    .serve_connection_with_upgrades(
-                                        TokioIo::new(tls_stream),
-                                        service,
-                                    )
-                                    .await
-                                {
-                                    error!("Serving HTTP/2 connection failed: {}", e);
+                                if matches!(alpn, Some(proto) if proto == b"h2") {
+                                    let mut builder = http2::Builder::new(TokioExecutor::new());
+                                    if let Err(e) = builder
+                                        .serve_connection(TokioIo::new(tls_stream), service)
+                                        .await
+                                    {
+                                        error!("Serving HTTP/2 connection failed: {}", e);
+                                    }
+                                } else {
+                                    let mut builder = http1::Builder::new();
+                                    let conn =
+                                        builder.serve_connection(TokioIo::new(tls_stream), service);
+                                    let result = if enable_websocket {
+                                        conn.with_upgrades().await
+                                    } else {
+                                        conn.await
+                                    };
+                                    if let Err(e) = result {
+                                        error!("Serving HTTP/1.1 connection failed: {}", e);
+                                    }
                                 }
                             });
                         }
