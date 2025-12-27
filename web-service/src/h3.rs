@@ -4,7 +4,7 @@ use crate::{
     traits::{BodyStream, Router, StreamWriter},
 };
 use bytes::{Buf, Bytes};
-use futures_util::stream;
+use futures_util::stream::unfold;
 use h3::ext::Protocol;
 use h3::server::{Connection, RequestStream};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
@@ -13,7 +13,7 @@ use http::{Method, Response};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 
 pub struct Http3Server {
     config: ServerConfig,
@@ -67,9 +67,10 @@ impl Http3Server {
         tls_config.max_early_data_size = u32::MAX;
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(tls_config).map_err(|e| ServerError::Tls(e.to_string()))?,
         ));
+        server_config.transport_config(Arc::new(build_quic_transport_config()));
 
         let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.config.port);
         let endpoint = quinn::Endpoint::server(server_config, addr)
@@ -157,32 +158,39 @@ async fn handle_h3_request(
 ) -> Result<(), H3Error> {
     let path = req.uri().path().to_string();
     if router.has_body_handler(&path) {
-        let mut collected = Vec::new();
-        while let Some(mut chunk) = stream
-            .recv_data()
-            .await
-            .map_err(|e| H3Error::Transport(e.to_string()))?
-        {
-            let data = chunk.copy_to_bytes(chunk.remaining());
-            collected.push(Bytes::from(data));
-        }
-        let body_stream: BodyStream = Box::pin(stream::iter(
-            collected.into_iter().map(Ok::<_, ServerError>),
+        let shared_stream = Arc::new(Mutex::new(stream));
+        let body_stream: BodyStream = Box::pin(unfold(
+            Arc::clone(&shared_stream),
+            |shared| async move {
+                let recv = {
+                    let mut guard = shared.lock().await;
+                    guard.recv_data().await
+                };
+                match recv {
+                    Ok(Some(mut chunk)) => {
+                        let data = chunk.copy_to_bytes(chunk.remaining());
+                        Some((Ok(data), shared))
+                    }
+                    Ok(None) => None,
+                    Err(e) => Some((Err(ServerError::Handler(Box::new(e))), shared)),
+                }
+            },
         ));
         let handler_response = router
             .route_body(req, body_stream)
             .await
             .map_err(H3Error::Router)?;
-        return send_h3_response(handler_response, stream).await;
+        let mut guard = shared_stream.lock().await;
+        return send_h3_response(handler_response, &mut *guard).await;
     }
 
     let handler_response = router.route(req).await.map_err(H3Error::Router)?;
-    send_h3_response(handler_response, stream).await
+    send_h3_response(handler_response, &mut stream).await
 }
 
 async fn send_h3_response(
     handler_response: crate::traits::HandlerResponse,
-    mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
 ) -> Result<(), H3Error> {
     let mut builder = http::Response::builder().status(handler_response.status);
     if let Some(ct) = handler_response.content_type {
@@ -252,4 +260,17 @@ fn configure_h3_connection(
         builder.max_webtransport_sessions(config.max_webtransport_sessions);
     }
     builder
+}
+
+fn build_quic_transport_config() -> quinn::TransportConfig {
+    // Increase flow-control headroom for large uploads and responses.
+    const STREAM_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
+    const MAX_CONCURRENT_STREAMS: u32 = 256;
+
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .stream_receive_window(STREAM_WINDOW_BYTES.into())
+        .max_concurrent_bidi_streams(MAX_CONCURRENT_STREAMS.into())
+        .max_concurrent_uni_streams(MAX_CONCURRENT_STREAMS.into());
+    transport
 }

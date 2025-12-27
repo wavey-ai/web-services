@@ -48,6 +48,7 @@ impl Http2Server {
         let listener = bind_tcp_listener(addr)?;
         info!("HTTP/1.1+HTTP/2 server listening at {}", addr);
         let enable_websocket = self.config.enable_websocket;
+        let advertise_h3 = self.config.enable_h3;
 
         loop {
             tokio::select! {
@@ -80,6 +81,7 @@ impl Http2Server {
                                             router,
                                             port,
                                             enable_websocket,
+                                            advertise_h3,
                                         )
                                         .await
                                         {
@@ -143,6 +145,7 @@ async fn handle_h2_request(
     router: Arc<dyn Router>,
     port: u16,
     enable_websocket: bool,
+    advertise_h3: bool,
 ) -> Result<Response<Full<Bytes>>, H2Error> {
     if enable_websocket && is_websocket_upgrade(&req) {
         if let Some(key) = req.headers().get("sec-websocket-key") {
@@ -250,7 +253,7 @@ async fn handle_h2_request(
             .route_body(req, stream)
             .await
             .map_err(H2Error::Router)?;
-        return build_response(handler_response, port);
+        return build_response(handler_response, port, advertise_h3);
     }
 
     let mut body = body;
@@ -262,20 +265,23 @@ async fn handle_h2_request(
 
     let req = http::Request::from_parts(parts, ());
     let handler_response = router.route(req).await.map_err(H2Error::Router)?;
-    build_response(handler_response, port)
+    build_response(handler_response, port, advertise_h3)
 }
 
 fn build_response(
     handler_response: HandlerResponse,
     port: u16,
+    advertise_h3: bool,
 ) -> Result<Response<Full<Bytes>>, H2Error> {
     let mut response = Response::new(Full::from(handler_response.body.unwrap_or_else(Bytes::new)));
     *response.status_mut() = handler_response.status;
 
-    response.headers_mut().insert(
-        HeaderName::from_static("alt-srv"),
-        HeaderValue::from_str(&format!("h3=\":{}\"; ma=2592000", port))?,
-    );
+    if advertise_h3 {
+        response.headers_mut().insert(
+            HeaderName::from_static("alt-svc"),
+            HeaderValue::from_str(&format!("h3=\":{}\"; ma=2592000", port))?,
+        );
+    }
 
     if let Some(ct) = handler_response.content_type {
         response.headers_mut().insert(

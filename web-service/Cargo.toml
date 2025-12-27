@@ -53,6 +53,6 @@ rustls-pemfile = "2"
 rustls-native-certs = "0.7"
 
 [[test]]
-name = "h1_bench"
-path = "tests/h1_bench.rs"
+name = "benchmark"
+path = "tests/benchmark.rs"
 harness = false
