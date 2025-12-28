@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -6,7 +8,6 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use dotenvy::dotenv;
 use futures_util::{SinkExt, StreamExt};
 use http::{Request, StatusCode};
 use portpicker::pick_unused_port;
@@ -20,6 +21,7 @@ use web_service::{
     H2H3Server, HandlerResponse, HandlerResult, RawTcpHandler, RequestHandler, Router, Server,
     ServerBuilder, ServerError, WebSocketHandler,
 };
+use common::load_test_env;
 
 struct HelloHandler;
 
@@ -190,14 +192,6 @@ async fn start_server(
     server.start().await
 }
 
-fn load_env() -> Option<(String, String, String)> {
-    dotenv().ok();
-    let cert = std::env::var("TLS_CERT_BASE64").ok()?;
-    let key = std::env::var("TLS_KEY_BASE64").ok()?;
-    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "local.aldea.ai".into());
-    Some((cert, key, host))
-}
-
 async fn wait_for_port(port: u16) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
@@ -350,7 +344,7 @@ async fn run_with_raw_server<F, Fut>(
 #[tokio::test(flavor = "multi_thread")]
 async fn http1_works() {
     ensure_rustls_provider();
-    let (cert_b64, key_b64, host) = match load_env() {
+    let (cert_b64, key_b64, host) = match load_test_env() {
         Some(v) => v,
         None => {
             eprintln!("skipping http1: missing TLS env");
@@ -382,7 +376,7 @@ async fn http1_works() {
 #[tokio::test(flavor = "multi_thread")]
 async fn http2_works() {
     ensure_rustls_provider();
-    let (cert_b64, key_b64, host) = match load_env() {
+    let (cert_b64, key_b64, host) = match load_test_env() {
         Some(v) => v,
         None => {
             eprintln!("skipping http2: missing TLS env");
@@ -413,7 +407,7 @@ async fn http2_works() {
 #[tokio::test(flavor = "multi_thread")]
 async fn websocket_works() {
     ensure_rustls_provider();
-    let (cert_b64, key_b64, host) = match load_env() {
+    let (cert_b64, key_b64, host) = match load_test_env() {
         Some(v) => v,
         None => {
             eprintln!("skipping ws: missing TLS env");
@@ -433,7 +427,7 @@ async fn websocket_works() {
             ))
             .await
             .expect("connect ws tcp");
-            let mut ws_cfg = tls_client_config(&std::env::var("TLS_CERT_BASE64").unwrap());
+            let mut ws_cfg = tls_client_config(&cert_b64);
             ws_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
             let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(ws_cfg));
             let server_name = ServerName::try_from(host.clone()).expect("sni");
@@ -466,7 +460,7 @@ async fn websocket_works() {
 #[tokio::test(flavor = "multi_thread")]
 async fn http3_works() {
     ensure_rustls_provider();
-    let (cert_b64, key_b64, host) = match load_env() {
+    let (cert_b64, key_b64, host) = match load_test_env() {
         Some(v) => v,
         None => {
             eprintln!("skipping h3: missing TLS env");
@@ -479,7 +473,7 @@ async fn http3_works() {
         key_b64,
         host.clone(),
         |port, host| async move {
-            let mut h3_client_cfg = tls_client_config(&std::env::var("TLS_CERT_BASE64").unwrap());
+            let mut h3_client_cfg = tls_client_config(&cert_b64);
             h3_client_cfg.alpn_protocols = vec![b"h3".to_vec()];
             let quic_crypto =
                 quinn::crypto::rustls::QuicClientConfig::try_from(h3_client_cfg).expect("quic cfg");
@@ -490,7 +484,14 @@ async fn http3_works() {
             let target_ip = lookup_host((host.as_str(), port))
                 .await
                 .ok()
-                .and_then(|mut iter| iter.next().map(|sa| sa.ip()))
+                .and_then(|addrs| {
+                    let addrs: Vec<_> = addrs.collect();
+                    addrs
+                        .iter()
+                        .find(|addr| addr.is_ipv4())
+                        .map(|addr| addr.ip())
+                        .or_else(|| addrs.first().map(|addr| addr.ip()))
+                })
                 .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
             let conn = endpoint
                 .connect(SocketAddr::new(target_ip, port), &host)
@@ -525,7 +526,7 @@ async fn http3_works() {
 #[tokio::test(flavor = "multi_thread")]
 async fn raw_tcp_plain_works() {
     ensure_rustls_provider();
-    let (cert_b64, key_b64, host) = match load_env() {
+    let (cert_b64, key_b64, host) = match load_test_env() {
         Some(v) => v,
         None => {
             eprintln!("skipping raw tcp plain: missing TLS env");
@@ -558,7 +559,7 @@ async fn raw_tcp_plain_works() {
 #[tokio::test(flavor = "multi_thread")]
 async fn raw_tcp_tls_works() {
     ensure_rustls_provider();
-    let (cert_b64, key_b64, host) = match load_env() {
+    let (cert_b64, key_b64, host) = match load_test_env() {
         Some(v) => v,
         None => {
             eprintln!("skipping raw tcp tls: missing TLS env");

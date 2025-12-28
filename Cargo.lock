@@ -603,6 +603,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gen-id"
+version = "0.3.0"
+source = "git+https://github.com/wavey-ai/gen-id.git#9f90fc2bc28f39abbbfe43d7cefc0b88c39575d6"
+dependencies = [
+ "rand 0.8.5",
+ "serde",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2545,6 +2554,7 @@ dependencies = [
  "dotenvy",
  "env_logger",
  "futures-util",
+ "gen-id",
  "h2",
  "h3",
  "h3-datagram",
@@ -2553,6 +2563,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "playlists 0.1.0",
  "portpicker",
@@ -2562,6 +2573,8 @@ dependencies = [
  "rustls 0.23.35",
  "rustls-native-certs",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "structopt",
  "thiserror 2.0.16",
  "tls-helpers 0.2.0",
@@ -2570,6 +2583,8 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "webpki-roots 0.26.11",
  "xmpegts",
  "xxhash-rust",
 ]

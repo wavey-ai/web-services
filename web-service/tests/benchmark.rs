@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     env,
     io,
@@ -8,7 +10,6 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use dotenvy::dotenv;
 use futures_util::future;
 use http::{Request, StatusCode};
 use portpicker::pick_unused_port;
@@ -20,6 +21,7 @@ use web_service::{
     H2H3Server, HandlerResponse, HandlerResult, RequestHandler, Router, Server, ServerBuilder,
     ServerError,
 };
+use common::load_test_env;
 
 type BenchResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -107,14 +109,6 @@ fn ensure_rustls_provider() {
     INSTALL.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-}
-
-fn load_env() -> Option<(String, String, String)> {
-    dotenv().ok();
-    let cert = env::var("TLS_CERT_BASE64").ok()?;
-    let key = env::var("TLS_KEY_BASE64").ok()?;
-    let host = env::var("HOSTNAME").unwrap_or_else(|_| "local.aldea.ai".into());
-    Some((cert, key, host))
 }
 
 fn tls_client_config(cert_pem_b64: &str) -> rustls::ClientConfig {
@@ -308,8 +302,6 @@ fn build_payload(response_bytes: usize) -> Bytes {
 
 struct BenchStats {
     label: String,
-    completed: usize,
-    elapsed: Duration,
     rps: f64,
     avg_ms: f64,
 }
@@ -466,8 +458,6 @@ async fn run_reqwest_benchmark(
 
     Ok(BenchStats {
         label: label.to_string(),
-        completed,
-        elapsed,
         rps,
         avg_ms,
     })
@@ -533,7 +523,14 @@ async fn resolve_target_ip(host: &str, port: u16) -> IpAddr {
     lookup_host((host, port))
         .await
         .ok()
-        .and_then(|mut iter| iter.next().map(|sa| sa.ip()))
+        .and_then(|addrs| {
+            let addrs: Vec<_> = addrs.collect();
+            addrs
+                .iter()
+                .find(|addr| addr.is_ipv4())
+                .map(|addr| addr.ip())
+                .or_else(|| addrs.first().map(|addr| addr.ip()))
+        })
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
@@ -679,13 +676,7 @@ async fn run_h3_benchmark(
         completed, elapsed, rps, avg_ms
     );
 
-    Ok(BenchStats {
-        label,
-        completed,
-        elapsed,
-        rps,
-        avg_ms,
-    })
+    Ok(BenchStats { label, rps, avg_ms })
 }
 
 async fn run_with_server<F, Fut>(
@@ -772,7 +763,7 @@ fn main() -> BenchResult<()> {
     }
 
     ensure_rustls_provider();
-    let (cert_b64, key_b64, host) = match load_env() {
+    let (cert_b64, key_b64, host) = match load_test_env() {
         Some(v) => v,
         None => {
             eprintln!("skipping benchmarks: missing TLS env");
