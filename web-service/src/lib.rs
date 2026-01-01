@@ -3,6 +3,7 @@
 pub mod config;
 pub mod error;
 pub mod h2;
+pub mod h3;
 pub mod proxy;
 pub mod quic_relay;
 pub mod raw_tcp;

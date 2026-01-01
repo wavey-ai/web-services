@@ -151,6 +151,7 @@ pub trait ServerBuilder: Sized {
     fn with_port(self, port: u16) -> Self;
     fn with_router(self, router: Box<dyn Router>) -> Self;
     fn enable_h2(self, enable: bool) -> Self;
+    fn enable_h3(self, enable: bool) -> Self;
     fn enable_websocket(self, enable: bool) -> Self;
     fn enable_raw_tcp(self, enable: bool) -> Self;
     fn with_raw_tcp_port(self, port: u16) -> Self;

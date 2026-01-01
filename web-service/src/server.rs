@@ -4,6 +4,7 @@ use crate::{
     config::ServerConfig,
     error::ServerError,
     h2::Http2Server,
+    h3::Http3Server,
     raw_tcp::RawTcpServer,
     traits::{HandlerResult, RawTcpHandler, Router, Server, ServerBuilder, ServerHandle},
 };
@@ -57,6 +58,20 @@ impl Server for H2H3Server {
             let handle = tokio::spawn(async move {
                 if let Err(e) = h2_server.start(shutdown_rx).await {
                     tracing::error!("HTTP/2 server error: {}", e);
+                }
+            });
+
+            tasks.push(handle);
+        }
+
+        // Start HTTP/3 server if enabled
+        if self.config.enable_h3 {
+            let h3_server = Http3Server::new(self.config.clone(), Arc::clone(&self.router));
+            let shutdown_rx = shutdown_rx.clone();
+
+            let handle = tokio::spawn(async move {
+                if let Err(e) = h3_server.start(shutdown_rx).await {
+                    tracing::error!("HTTP/3 server error: {}", e);
                 }
             });
 
@@ -120,6 +135,11 @@ impl ServerBuilder for H2H3ServerBuilder {
         self
     }
 
+    fn enable_h3(mut self, enable: bool) -> Self {
+        self.config.enable_h3 = enable;
+        self
+    }
+
     fn enable_websocket(mut self, enable: bool) -> Self {
         self.config.enable_websocket = enable;
         self
@@ -156,9 +176,9 @@ impl ServerBuilder for H2H3ServerBuilder {
             ));
         }
 
-        if !self.config.enable_h2 {
+        if !self.config.enable_h2 && !self.config.enable_h3 {
             return Err(ServerError::Config(
-                "HTTP/1.1+HTTP/2 must be enabled".into(),
+                "At least one protocol (HTTP/2 or HTTP/3) must be enabled".into(),
             ));
         }
         if self.config.enable_raw_tcp && self.raw_tcp_handler.is_none() {
