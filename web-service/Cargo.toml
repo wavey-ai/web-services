@@ -38,9 +38,9 @@ h3-quinn = { git = "https://github.com/hyperium/h3.git", features = [
 ] }
 h3-webtransport = { git = "https://github.com/hyperium/h3.git" }
 h3-datagram = { git = "https://github.com/hyperium/h3.git" }
-playlists = { path = "../../playlists" }
+playlists = { path = "../../playlists", optional = true }
 tls-helpers = { git = "https://github.com/wavey-ai/tls-helpers.git" }
-xmpegts = { git = "https://github.com/wavey-ai/xiu" }
+xmpegts = { git = "https://github.com/wavey-ai/xiu", optional = true }
 async-trait = "0.1.88"
 thiserror = "2.0.12"
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
@@ -50,8 +50,12 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 url = { version = "2", features = ["serde"] }
-http-pack = { path = "../../http-pack" }
+http-pack = { path = "../../http-pack", optional = true }
 rustls-pemfile = "2"
+
+[features]
+default = []
+proxy = ["http-pack", "playlists", "xmpegts"]
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
