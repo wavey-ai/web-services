@@ -7,14 +7,13 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http::{Request, StatusCode};
 use portpicker::pick_unused_port;
 use rustls_native_certs;
 use tls_helpers::{from_base64_raw, load_certs_from_base64};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::lookup_host;
 use tokio_rustls::rustls::{self, pki_types::ServerName, ClientConfig, RootCertStore};
 use tokio_tungstenite::tungstenite::Message;
 use web_service::{
@@ -184,7 +183,6 @@ async fn start_server(
         .with_tls(cert_b64, key_b64)
         .with_port(port)
         .enable_h2(true)
-        .enable_h3(true)
         .enable_websocket(true)
         .with_router(router)
         .build()?;
@@ -287,7 +285,6 @@ async fn start_server_with_raw(
         .with_tls(cert_b64, key_b64)
         .with_port(http_port)
         .enable_h2(true)
-        .enable_h3(false)
         .enable_websocket(false)
         .enable_raw_tcp(true)
         .with_raw_tcp_port(raw_port)
@@ -452,72 +449,6 @@ async fn websocket_works() {
                 None => eprintln!("ws closed without echo"),
             }
             let _ = ws.close(None).await;
-        },
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn http3_works() {
-    ensure_rustls_provider();
-    let (cert_b64, key_b64, host) = match load_test_env() {
-        Some(v) => v,
-        None => {
-            eprintln!("skipping h3: missing TLS env");
-            return;
-        }
-    };
-
-    run_with_server(
-        cert_b64.clone(),
-        key_b64,
-        host.clone(),
-        |port, host| async move {
-            let mut h3_client_cfg = tls_client_config(&cert_b64);
-            h3_client_cfg.alpn_protocols = vec![b"h3".to_vec()];
-            let quic_crypto =
-                quinn::crypto::rustls::QuicClientConfig::try_from(h3_client_cfg).expect("quic cfg");
-            let quic_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
-            let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))
-                .expect("create client endpoint");
-            endpoint.set_default_client_config(quic_cfg);
-            let target_ip = lookup_host((host.as_str(), port))
-                .await
-                .ok()
-                .and_then(|addrs| {
-                    let addrs: Vec<_> = addrs.collect();
-                    addrs
-                        .iter()
-                        .find(|addr| addr.is_ipv4())
-                        .map(|addr| addr.ip())
-                        .or_else(|| addrs.first().map(|addr| addr.ip()))
-                })
-                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-            let conn = endpoint
-                .connect(SocketAddr::new(target_ip, port), &host)
-                .expect("connect h3")
-                .await
-                .expect("h3 handshake");
-            let (_h3_conn, mut sender): (
-                h3::client::Connection<h3_quinn::Connection, Bytes>,
-                h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-            ) = h3::client::builder()
-                .build(h3_quinn::Connection::new(conn))
-                .await
-                .expect("h3 build");
-            let uri = format!("https://{host}:{port}/");
-            let mut req_stream = sender
-                .send_request(Request::get(uri).body(()).unwrap())
-                .await
-                .expect("h3 request");
-            let response = req_stream.recv_response().await.expect("h3 response");
-            assert_eq!(response.status(), StatusCode::OK);
-            let mut body = Vec::new();
-            while let Some(mut chunk) = req_stream.recv_data().await.expect("recv data") {
-                let data = chunk.copy_to_bytes(chunk.remaining());
-                body.extend_from_slice(&data);
-            }
-            assert_eq!(body, b"hello from test");
         },
     )
     .await;

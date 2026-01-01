@@ -20,7 +20,7 @@ impl RequestHandler for HelloHandler {
     ) -> HandlerResult<HandlerResponse> {
         Ok(HandlerResponse {
             status: StatusCode::OK,
-            body: Some(Bytes::from_static(b"hello from h1/h2/h3")),
+            body: Some(Bytes::from_static(b"hello from h1/h2")),
             content_type: Some("text/plain".to_string()),
             ..Default::default()
         })
@@ -159,14 +159,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_tls(cert_pem_base64, key_pem_base64)
         .with_port(443)
         .enable_h2(true)
-        .enable_h3(true)
         .enable_websocket(true)
         .with_router(router)
         .build()?;
 
     let handle = server.start().await?;
     let _ = handle.ready_rx.await;
-    println!("Server ready on h1/h2/h3 and wss at /ws");
+    println!("Server ready on h1/h2 and wss at /ws");
 
     tokio::signal::ctrl_c().await?;
     let _ = handle.shutdown_tx.send(());

@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -15,7 +15,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use portpicker::pick_unused_port;
-use tokio::net::{lookup_host, TcpListener};
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
 use tls_helpers::{from_base64_raw, load_certs_from_base64};
@@ -69,71 +69,6 @@ async fn wait_for_port(port: u16) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-}
-
-async fn h3_request_once(
-    host: &str,
-    port: u16,
-    client_cert: &str,
-) -> Result<Vec<u8>, String> {
-    let mut h3_client_cfg = tls_client_config(client_cert);
-    h3_client_cfg.alpn_protocols = vec![b"h3".to_vec()];
-    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(h3_client_cfg)
-        .map_err(|err| format!("quic cfg: {err}"))?;
-    let quic_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
-    let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))
-        .map_err(|err| format!("endpoint: {err}"))?;
-    endpoint.set_default_client_config(quic_cfg);
-    let target_ip = lookup_host((host, port))
-        .await
-        .ok()
-        .and_then(|addrs| {
-            let addrs: Vec<_> = addrs.collect();
-            addrs
-                .iter()
-                .find(|addr| addr.is_ipv4())
-                .map(|addr| addr.ip())
-                .or_else(|| addrs.first().map(|addr| addr.ip()))
-        })
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    let conn = endpoint
-        .connect(SocketAddr::new(target_ip, port), host)
-        .map_err(|err| format!("connect: {err}"))?
-        .await
-        .map_err(|err| format!("handshake: {err}"))?;
-    let (_h3_conn, mut sender): (
-        h3::client::Connection<h3_quinn::Connection, Bytes>,
-        h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-    ) = h3::client::builder()
-        .build(h3_quinn::Connection::new(conn))
-        .await
-        .map_err(|err| format!("h3 build: {err}"))?;
-    let uri = format!("https://{host}:{port}/");
-    let mut req_stream = sender
-        .send_request(Request::get(uri).body(()).unwrap())
-        .await
-        .map_err(|err| format!("h3 request: {err}"))?;
-    req_stream
-        .finish()
-        .await
-        .map_err(|err| format!("h3 finish: {err}"))?;
-    let response = req_stream
-        .recv_response()
-        .await
-        .map_err(|err| format!("h3 response: {err}"))?;
-    if response.status() != StatusCode::OK {
-        return Err(format!("unexpected status: {}", response.status()));
-    }
-    let mut body = Vec::new();
-    while let Some(mut chunk) = req_stream
-        .recv_data()
-        .await
-        .map_err(|err| format!("recv data: {err}"))?
-    {
-        let data = chunk.copy_to_bytes(chunk.remaining());
-        body.extend_from_slice(&data);
-    }
-    Ok(body)
 }
 
 async fn start_backend() -> io::Result<BackendHandle> {
@@ -191,7 +126,6 @@ async fn run_with_proxy<F, Fut>(
     key_b64: String,
     host: String,
     enable_h2: bool,
-    enable_h3: bool,
     client_fn: F,
 ) -> Version
 where
@@ -214,11 +148,14 @@ where
         key_pem_base64: key_b64,
         port: proxy_port,
         enable_h2,
-        enable_h3,
         enable_websocket: false,
         initial_mode: LoadBalancingMode::LeastConn,
         upstream_protocol: UpstreamProtocol::Http1,
-        max_queue: None,
+        max_queue: 1,
+        max_backends: 1,
+        queue_request_kb: 5 * 1024,
+        queue_slot_kb: 200,
+        quic_relay: None,
     };
     let ingress = ProxyIngress::from_config(config).expect("proxy config");
     let state = ingress.state();
@@ -233,8 +170,6 @@ where
     handle.ready_rx.await.expect("proxy ready");
     if enable_h2 {
         wait_for_port(proxy_port).await;
-    } else if enable_h3 {
-        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     client_fn(proxy_port, host).await;
@@ -280,11 +215,14 @@ async fn proxy_api_adds_backend_during_live_usage() {
         key_pem_base64: key_b64,
         port: proxy_port,
         enable_h2: true,
-        enable_h3: false,
         enable_websocket: false,
         initial_mode: LoadBalancingMode::LeastConn,
         upstream_protocol: UpstreamProtocol::Http1,
-        max_queue: None,
+        max_queue: 1,
+        max_backends: 1,
+        queue_request_kb: 5 * 1024,
+        queue_slot_kb: 200,
+        quic_relay: None,
     };
     let ingress = ProxyIngress::from_config(config).expect("proxy config");
     let handle = ingress.start().await.expect("start proxy");
@@ -354,7 +292,6 @@ async fn proxy_http1_ingress_upstreams_http1() {
         key_b64,
         host.clone(),
         true,
-        false,
         move |port, host| {
             let client_cert = client_cert.clone();
             async move {
@@ -396,7 +333,6 @@ async fn proxy_http2_ingress_upstreams_http1() {
         key_b64,
         host.clone(),
         true,
-        false,
         move |port, host| {
             let client_cert = client_cert.clone();
             async move {
@@ -412,56 +348,6 @@ async fn proxy_http2_ingress_upstreams_http1() {
                 assert_eq!(resp.version(), reqwest::Version::HTTP_2);
                 let body = resp.bytes().await.expect("read body");
                 assert_eq!(body.as_ref(), b"backend ok");
-            }
-        },
-    )
-    .await;
-
-    assert_eq!(version, Version::HTTP_11);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn proxy_http3_ingress_upstreams_http1() {
-    ensure_rustls_provider();
-    let (cert_b64, key_b64, host) = match load_test_env() {
-        Some(v) => v,
-        None => {
-            eprintln!("skipping proxy http3: missing TLS env");
-            return;
-        }
-    };
-    let client_cert = cert_b64.clone();
-
-    let version = run_with_proxy(
-        cert_b64,
-        key_b64,
-        host.clone(),
-        false,
-        true,
-        move |port, host| {
-            let client_cert = client_cert.clone();
-            async move {
-                let mut last_err = None;
-                for attempt in 0..5 {
-                    let attempt_res = tokio::time::timeout(
-                        Duration::from_secs(3),
-                        h3_request_once(&host, port, &client_cert),
-                    )
-                    .await;
-                    match attempt_res {
-                        Ok(Ok(body)) => {
-                            assert_eq!(body, b"backend ok");
-                            return;
-                        }
-                        Ok(Err(err)) => last_err = Some(err),
-                        Err(_) => last_err = Some("h3 request timed out".to_string()),
-                    }
-                    tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
-                }
-                panic!(
-                    "h3 request failed after retries: {}",
-                    last_err.unwrap_or_else(|| "unknown error".to_string())
-                );
             }
         },
     )

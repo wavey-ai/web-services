@@ -1,5 +1,4 @@
 use http::header::{InvalidHeaderName, InvalidHeaderValue};
-use http::Error as HttpError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -32,16 +31,4 @@ pub enum H2Error {
 
     #[error("invalid header value: {0}")]
     InvalidHeaderValue(#[from] InvalidHeaderValue),
-}
-
-#[derive(Debug, Error)]
-pub enum H3Error {
-    #[error("router error: {0}")]
-    Router(#[from] ServerError),
-
-    #[error("response builder error: {0}")]
-    Header(#[from] HttpError),
-
-    #[error("h3 transport error: {0}")]
-    Transport(String),
 }

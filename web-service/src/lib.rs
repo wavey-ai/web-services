@@ -3,8 +3,8 @@
 pub mod config;
 pub mod error;
 pub mod h2;
-pub mod h3;
 pub mod proxy;
+pub mod quic_relay;
 pub mod raw_tcp;
 pub mod server;
 pub mod tls;
@@ -16,6 +16,7 @@ pub use proxy::{
     Backend, BackendScheme, BackendView, LoadBalancingMode, ProxyConfig, ProxyIngress, ProxyRouter,
     ProxyState, UpstreamProtocol,
 };
+pub use quic_relay::QuicRelayConfig;
 pub use server::{H2H3Server, H2H3ServerBuilder};
 pub use traits::{
     BodyStream, HandlerResponse, HandlerResult, RawTcpHandler, RequestHandler, Router, Server,

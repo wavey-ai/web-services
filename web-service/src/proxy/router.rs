@@ -1,9 +1,9 @@
 use super::api;
 use super::context;
 use super::proxy;
+use super::queue::ProxyQueue;
 use super::state::ProxyState;
-use bytes::Bytes;
-use futures_util::StreamExt;
+use crate::quic_relay::QuicRelayPool;
 use http::{Method, Request, StatusCode};
 use std::sync::Arc;
 use tracing::{debug, debug_span, Instrument};
@@ -14,16 +14,24 @@ use crate::{
 
 pub struct ProxyRouter {
     state: Arc<ProxyState>,
+    queue: Arc<ProxyQueue>,
+    quic_relay: Option<Arc<QuicRelayPool>>,
     ws_handler: ProxyWebSocketHandler,
 }
 
 impl ProxyRouter {
-    pub fn new(state: Arc<ProxyState>) -> Self {
+    pub fn new(
+        state: Arc<ProxyState>,
+        queue: Arc<ProxyQueue>,
+        quic_relay: Option<Arc<QuicRelayPool>>,
+    ) -> Self {
         Self {
             ws_handler: ProxyWebSocketHandler {
                 state: Arc::clone(&state),
             },
             state,
+            queue,
+            quic_relay,
         }
     }
 
@@ -37,6 +45,7 @@ impl ProxyRouter {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
+        let stream_id = proxy::next_http_pack_stream_id();
 
         let span = debug_span!(
             "proxy_request",
@@ -58,14 +67,18 @@ impl ProxyRouter {
             }
 
             if path.starts_with("/api") {
-                let bytes = match body {
-                    Some(body) => collect_body(body).await?,
-                    None => Bytes::new(),
-                };
-                return api::handle_api(&self.state, req, bytes).await;
+                let body_bytes = proxy::collect_body_with_http_pack(
+                    &req,
+                    body,
+                    stream_id,
+                    self.quic_relay.as_deref(),
+                )
+                .await?;
+                return api::handle_api(&self.state, req, body_bytes).await;
             }
 
-            proxy::proxy_http(&self.state, req, body).await
+            // Use queue-based proxy instead of direct proxy
+            self.proxy_via_queue(req, body, stream_id).await
         }
         .instrument(span)
         .await?;
@@ -77,6 +90,51 @@ impl ProxyRouter {
             "proxy request completed"
         );
         Ok(response)
+    }
+
+    async fn proxy_via_queue(
+        &self,
+        req: Request<()>,
+        body: Option<BodyStream>,
+        stream_id: u64,
+    ) -> HandlerResult<HandlerResponse> {
+        let _slot = self
+            .queue
+            .acquire_slot()
+            .await
+            .map_err(|e| ServerError::Config(format!("Failed to acquire queue slot: {e}")))?;
+
+        let response_rx = self
+            .queue
+            .begin_request(stream_id)
+            .await
+            .map_err(|e| ServerError::Config(format!("Failed to register request: {}", e)))?;
+
+        if let Err(err) = proxy::stream_request_with_http_pack(
+            &req,
+            body,
+            stream_id,
+            self.quic_relay.as_deref(),
+            &self.queue,
+        )
+        .await
+        {
+            self.queue.drop_response_channel(stream_id).await;
+            return Err(err);
+        }
+
+        let (status, body) = response_rx
+            .await
+            .map_err(|_| ServerError::Config("Response channel closed".into()))?
+            .map_err(|e| ServerError::Config(e))?;
+
+        Ok(HandlerResponse {
+            status,
+            body: Some(body),
+            content_type: Some("application/octet-stream".into()),
+            headers: vec![],
+            etag: None,
+        })
     }
 }
 
@@ -157,15 +215,6 @@ impl WebSocketHandler for ProxyWebSocketHandler {
     }
 }
 
-async fn collect_body(mut body: BodyStream) -> Result<Bytes, ServerError> {
-    let mut data = Vec::new();
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk?;
-        data.extend_from_slice(&chunk);
-    }
-    Ok(Bytes::from(data))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,7 +239,8 @@ mod tests {
     async fn options_returns_no_content_and_request_id() {
         init_crypto();
         let state = Arc::new(ProxyState::new(LoadBalancingMode::LeastConn).unwrap());
-        let router = ProxyRouter::new(state);
+        let queue = Arc::new(ProxyQueue::new(4, 1, 512, 64));
+        let router = ProxyRouter::new(state, queue, None);
 
         let req = Request::builder()
             .method(Method::OPTIONS)
@@ -209,7 +259,8 @@ mod tests {
     async fn api_health_attaches_request_id() {
         init_crypto();
         let state = Arc::new(ProxyState::new(LoadBalancingMode::LeastConn).unwrap());
-        let router = ProxyRouter::new(state);
+        let queue = Arc::new(ProxyQueue::new(4, 1, 512, 64));
+        let router = ProxyRouter::new(state, queue, None);
 
         let req = Request::builder()
             .method(Method::GET)

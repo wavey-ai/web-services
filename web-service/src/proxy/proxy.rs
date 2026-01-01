@@ -1,21 +1,27 @@
 use super::context;
 use super::pool::AcquireError;
+use super::queue::ProxyQueue;
 use super::state::ProxyState;
-use super::upstream::UpstreamProtocol;
-use bytes::{Buf, Bytes};
+use super::DEFAULT_HTTP_PACK_BODY_CHUNK_BYTES;
+use crate::quic_relay::QuicRelayPool;
+use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
+use http_pack::stream::{StreamBody, StreamEnd, StreamFrame, StreamHeaders};
 use http::header::HeaderName;
-use http::{HeaderMap, Request, StatusCode, Uri};
+use http::{HeaderMap, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, field, debug_span, Instrument};
 use crate::{BodyStream, HandlerResponse, HandlerResult, ServerError};
 
+static HTTP_PACK_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
 pub async fn proxy_http(
     state: &ProxyState,
     req: Request<()>,
-    body: Option<BodyStream>,
+    body: Bytes,
 ) -> HandlerResult<HandlerResponse> {
     debug!(
         method = %req.method(),
@@ -54,23 +60,8 @@ pub async fn proxy_http(
         }
     };
 
-    let body = match body {
-        Some(body) => collect_body(body).await?,
-        None => Bytes::new(),
-    };
-
-    let protocol = state.upstream_protocol();
-    if protocol == UpstreamProtocol::Http3 {
-        return proxy_http_h3(state, req, backend_url, body).await;
-    }
-
-    let version = match protocol {
-        UpstreamProtocol::Http1 => http::Version::HTTP_11,
-        UpstreamProtocol::Http2 => http::Version::HTTP_2,
-        UpstreamProtocol::Http3 => http::Version::HTTP_11,
-    };
-
-    proxy_http_hyper(state, req, &backend_url, body, version).await
+    // Always use HTTP/1.1 for upstream connections to local backends
+    proxy_http_hyper(state, req, &backend_url, body, http::Version::HTTP_11).await
 }
 
 async fn proxy_http_hyper(
@@ -125,7 +116,7 @@ async fn proxy_http_hyper(
     );
 
     let upstream_request = builder
-        .body(Full::new(body))
+        .body(Full::new(body).boxed())
         .map_err(|err| ServerError::Handler(Box::new(err)))?;
 
     let client = match state.http_client() {
@@ -183,6 +174,8 @@ async fn proxy_http_h3(
     };
     let port = backend_url.port_or_known_default().unwrap_or(443);
 
+    let retryable = matches!(req.method(), &Method::GET | &Method::HEAD) && body.is_empty();
+    let retry_req = if retryable { Some(req.clone()) } else { None };
     let upstream_request = match build_h3_request(req, &backend_url) {
         Ok(request) => request,
         Err(err) => return Ok(text_response(StatusCode::BAD_GATEWAY, &err)),
@@ -198,12 +191,8 @@ async fn proxy_http_h3(
         }
     };
 
-    let mut send_request = match pool.get_or_connect(host, port).await {
-        Ok(send_request) => send_request,
-        Err(err) => return Ok(text_response(StatusCode::BAD_GATEWAY, &err)),
-    };
-
-    let response: Result<HandlerResponse, String> = (|| async {
+    let send_once = |upstream_request: http::Request<()>, body: Bytes| async {
+        let mut send_request = pool.get_or_connect(host, port).await?;
         let mut stream = send_request
             .send_request(upstream_request)
             .await
@@ -239,13 +228,25 @@ async fn proxy_http_h3(
             response_body.extend_from_slice(&bytes);
         }
 
-        Ok(handler_response_from_parts(
+        Ok::<HandlerResponse, String>(handler_response_from_parts(
             response.status(),
             response.headers(),
             Bytes::from(response_body),
         ))
-    })()
-    .await;
+    };
+
+    let mut response = send_once(upstream_request, body.clone()).await;
+    if response.is_err() && retryable {
+        pool.invalidate(host, port).await;
+        if let Some(req_retry) = retry_req {
+            match build_h3_request(req_retry, &backend_url) {
+                Ok(request) => {
+                    response = send_once(request, body).await;
+                }
+                Err(err) => response = Err(err),
+            }
+        }
+    }
 
     match response {
         Ok(response) => Ok(response),
@@ -479,13 +480,165 @@ fn text_response(status: StatusCode, message: &str) -> HandlerResponse {
     }
 }
 
-async fn collect_body(mut body: BodyStream) -> Result<Bytes, ServerError> {
+pub(crate) fn next_http_pack_stream_id() -> u64 {
+    HTTP_PACK_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) async fn collect_body_with_http_pack(
+    req: &Request<()>,
+    body: Option<BodyStream>,
+    stream_id: u64,
+    relay: Option<&QuicRelayPool>,
+) -> Result<Bytes, ServerError> {
+    let chunk_size = DEFAULT_HTTP_PACK_BODY_CHUNK_BYTES.max(1);
+    let emit_headers = match StreamHeaders::from_request(stream_id, req) {
+        Ok(headers) => {
+            if let Some(relay) = relay {
+                if let Err(err) = relay.enqueue_frame(stream_id, StreamFrame::Headers(headers)).await {
+                    debug!(error = %err, "http-pack quic header enqueue failed");
+                }
+            }
+            true
+        }
+        Err(err) => {
+            debug!(error = %err, "http-pack header encode failed");
+            false
+        }
+    };
+
     let mut data = Vec::new();
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk?;
-        data.extend_from_slice(&chunk);
+    if let Some(mut body) = body {
+        let mut relay_buffer = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            if emit_headers {
+                if let Some(relay) = relay {
+                    let mut offset = 0;
+                    while offset < chunk.len() {
+                        let available = chunk.len() - offset;
+                        let space = chunk_size.saturating_sub(relay_buffer.len()).max(1);
+                        let take = available.min(space);
+                        relay_buffer.extend_from_slice(&chunk[offset..offset + take]);
+                        offset += take;
+                        if relay_buffer.len() >= chunk_size {
+                            let part = relay_buffer.split().freeze();
+                            if let Err(err) = relay
+                                .enqueue_frame(
+                                    stream_id,
+                                    StreamFrame::Body(StreamBody {
+                                        stream_id,
+                                        data: part,
+                                    }),
+                                )
+                                .await
+                            {
+                                debug!(error = %err, "http-pack quic body enqueue failed");
+                            }
+                        }
+                    }
+                }
+            }
+            data.extend_from_slice(&chunk);
+        }
+        if emit_headers {
+            if let Some(relay) = relay {
+                if !relay_buffer.is_empty() {
+                    let part = relay_buffer.freeze();
+                    if let Err(err) = relay
+                        .enqueue_frame(
+                            stream_id,
+                            StreamFrame::Body(StreamBody {
+                                stream_id,
+                                data: part,
+                            }),
+                        )
+                        .await
+                    {
+                        debug!(error = %err, "http-pack quic body enqueue failed");
+                    }
+                }
+            }
+        }
     }
+
+    if emit_headers {
+        if let Some(relay) = relay {
+            if let Err(err) = relay
+                .enqueue_frame(stream_id, StreamFrame::End(StreamEnd { stream_id }))
+                .await
+            {
+                debug!(error = %err, "http-pack quic end enqueue failed");
+            }
+        }
+    }
+
     Ok(Bytes::from(data))
+}
+
+pub(crate) async fn stream_request_with_http_pack(
+    req: &Request<()>,
+    body: Option<BodyStream>,
+    stream_id: u64,
+    relay: Option<&QuicRelayPool>,
+    queue: &ProxyQueue,
+) -> Result<(), ServerError> {
+    let chunk_size = queue.max_body_chunk_bytes().max(1);
+    let headers = StreamHeaders::from_request(stream_id, req)
+        .map_err(|err| ServerError::Config(format!("http-pack header encode failed: {err}")))?;
+    emit_request_frame(queue, relay, StreamFrame::Headers(headers)).await?;
+
+    if let Some(mut body) = body {
+        let mut buffer = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            let mut offset = 0;
+            while offset < chunk.len() {
+                let available = chunk.len() - offset;
+                let space = chunk_size.saturating_sub(buffer.len()).max(1);
+                let take = available.min(space);
+                buffer.extend_from_slice(&chunk[offset..offset + take]);
+                offset += take;
+                if buffer.len() >= chunk_size {
+                    let data = buffer.split().freeze();
+                    emit_request_frame(
+                        queue,
+                        relay,
+                        StreamFrame::Body(StreamBody { stream_id, data }),
+                    )
+                    .await?;
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            let data = buffer.freeze();
+            emit_request_frame(
+                queue,
+                relay,
+                StreamFrame::Body(StreamBody { stream_id, data }),
+            )
+            .await?;
+        }
+    }
+
+    emit_request_frame(queue, relay, StreamFrame::End(StreamEnd { stream_id })).await?;
+    Ok(())
+}
+
+async fn emit_request_frame(
+    queue: &ProxyQueue,
+    relay: Option<&QuicRelayPool>,
+    frame: StreamFrame,
+) -> Result<(), ServerError> {
+    queue
+        .enqueue_request_frame(frame.clone())
+        .await
+        .map_err(|err| ServerError::Config(format!("Failed to enqueue request frame: {err}")))?;
+    if let Some(relay) = relay {
+        if let Err(err) = relay.enqueue_frame(frame.stream_id(), frame).await {
+            debug!(error = %err, "http-pack quic frame enqueue failed");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

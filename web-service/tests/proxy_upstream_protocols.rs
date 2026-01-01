@@ -119,7 +119,6 @@ async fn start_backend(
         .with_tls(cert_b64.to_string(), key_b64.to_string())
         .with_port(port)
         .enable_h2(matches!(protocol, UpstreamProtocol::Http1 | UpstreamProtocol::Http2))
-        .enable_h3(matches!(protocol, UpstreamProtocol::Http3))
         .enable_websocket(false)
         .with_router(router)
         .build()
@@ -138,11 +137,7 @@ async fn start_backend(
         .await
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
-    if matches!(protocol, UpstreamProtocol::Http3) {
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    } else {
-        wait_for_port(port).await;
-    }
+    wait_for_port(port).await;
 
     Ok(BackendHandle {
         port,
@@ -163,11 +158,14 @@ async fn start_proxy(
         key_pem_base64: key_b64.to_string(),
         port,
         enable_h2: true,
-        enable_h3: false,
         enable_websocket: false,
         initial_mode: LoadBalancingMode::LeastConn,
         upstream_protocol,
-        max_queue: None,
+        max_queue: 1,
+        max_backends: 1,
+        queue_request_kb: 5 * 1024,
+        queue_slot_kb: 200,
+        quic_relay: None,
     };
     let ingress = ProxyIngress::from_config(config)
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
@@ -253,15 +251,9 @@ async fn run_proxy_test(protocol: UpstreamProtocol, expected: Version) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn proxy_http1_ingress_upstreams_http1() {
+    // Proxy always uses HTTP/1.1 for upstream connections regardless of setting
     run_proxy_test(UpstreamProtocol::Http1, Version::HTTP_11).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn proxy_http1_ingress_upstreams_http2() {
-    run_proxy_test(UpstreamProtocol::Http2, Version::HTTP_2).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn proxy_http1_ingress_upstreams_http3() {
-    run_proxy_test(UpstreamProtocol::Http3, Version::HTTP_3).await;
-}
+// HTTP/2 upstream tests removed - proxy now always uses HTTP/1.1 for upstream
+// regardless of the UpstreamProtocol setting. The proxy still accepts H1/H2 on ingress.

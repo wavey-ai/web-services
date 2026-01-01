@@ -1,8 +1,14 @@
 use super::balancer::LoadBalancingMode;
 use super::upstream::UpstreamProtocol;
+use super::{
+    DEFAULT_MAX_BACKENDS, DEFAULT_MAX_QUEUE_PER_BACKEND, DEFAULT_QUEUE_REQUEST_KB,
+    DEFAULT_QUEUE_SLOT_KB,
+};
 use anyhow::Context;
 use crate::{default_tls_paths, load_default_tls_base64};
+use crate::quic_relay::QuicRelayConfig;
 use std::env;
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -10,11 +16,14 @@ pub struct ProxyConfig {
     pub key_pem_base64: String,
     pub port: u16,
     pub enable_h2: bool,
-    pub enable_h3: bool,
     pub enable_websocket: bool,
     pub initial_mode: LoadBalancingMode,
     pub upstream_protocol: UpstreamProtocol,
-    pub max_queue: Option<usize>,
+    pub max_queue: usize,
+    pub max_backends: usize,
+    pub queue_request_kb: usize,
+    pub queue_slot_kb: usize,
+    pub quic_relay: Option<QuicRelayConfig>,
 }
 
 impl ProxyConfig {
@@ -46,9 +55,9 @@ impl ProxyConfig {
             .unwrap_or(443);
 
         let enable_h2 = env_bool("ENABLE_H2", true);
-        let enable_h3 = env_bool("ENABLE_H3", true);
         let enable_websocket = env_bool("ENABLE_WEBSOCKET", true);
-        let max_queue = env_optional_usize("LB_MAX_QUEUE")?;
+        let max_queue =
+            env_optional_usize("LB_MAX_QUEUE")?.unwrap_or(DEFAULT_MAX_QUEUE_PER_BACKEND);
 
         let upstream_protocol = match env::var("UPSTREAM_PROTOCOL") {
             Ok(value) => value
@@ -64,16 +73,62 @@ impl ProxyConfig {
             Err(_) => LoadBalancingMode::LeastConn,
         };
 
+        let max_backends = match env_optional_usize("PROXY_MAX_BACKENDS")? {
+            Some(value) => value,
+            None => match env_optional_usize("PROXY_WORKERS")? {
+                Some(value) => value,
+                None => DEFAULT_MAX_BACKENDS,
+            },
+        }
+        .max(1);
+
+        let queue_slot_kb = env_optional_usize("PROXY_QUEUE_SLOT_KB")?
+            .unwrap_or(DEFAULT_QUEUE_SLOT_KB)
+            .max(1);
+        let queue_request_kb = env_optional_usize("PROXY_QUEUE_REQUEST_KB")?
+            .unwrap_or(DEFAULT_QUEUE_REQUEST_KB)
+            .max(queue_slot_kb);
+
+        let quic_relay = match (
+            env::var("QUIC_FORWARD_ADDR").ok(),
+            env::var("QUIC_FORWARD_LISTEN_ADDR").ok(),
+            env::var("QUIC_FORWARD_BACKEND_ADDR").ok(),
+        ) {
+            (Some(forward_addr), Some(listen_addr), Some(backend_addr)) => {
+                let forward_addr = parse_socket_addr("QUIC_FORWARD_ADDR", &forward_addr)?;
+                let listen_addr = parse_socket_addr("QUIC_FORWARD_LISTEN_ADDR", &listen_addr)?;
+                let backend_addr = parse_socket_addr("QUIC_FORWARD_BACKEND_ADDR", &backend_addr)?;
+                let pool_size = env_optional_usize("QUIC_FORWARD_POOL_SIZE")?.unwrap_or(1);
+                Some(QuicRelayConfig {
+                    forward_addr,
+                    listen_addr,
+                    backend_addr,
+                    pool_size,
+                    cert_pem_base64: cert_pem_base64.clone(),
+                    key_pem_base64: key_pem_base64.clone(),
+                })
+            }
+            (None, None, None) => None,
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "QUIC_FORWARD_ADDR, QUIC_FORWARD_LISTEN_ADDR, and QUIC_FORWARD_BACKEND_ADDR must all be set or all omitted"
+                ))
+            }
+        };
+
         Ok(Self {
             cert_pem_base64,
             key_pem_base64,
             port,
             enable_h2,
-            enable_h3,
             enable_websocket,
             initial_mode,
             upstream_protocol,
             max_queue,
+            max_backends,
+            queue_request_kb,
+            queue_slot_kb,
+            quic_relay,
         })
     }
 }
@@ -99,6 +154,12 @@ fn env_optional_usize(name: &str) -> anyhow::Result<Option<usize>> {
         }
         Err(_) => Ok(None),
     }
+}
+
+fn parse_socket_addr(name: &str, value: &str) -> anyhow::Result<SocketAddr> {
+    value
+        .parse::<SocketAddr>()
+        .with_context(|| format!("{name} must be in host:port format"))
 }
 
 #[cfg(test)]
@@ -140,32 +201,52 @@ mod tests {
             "TLS_KEY_BASE64",
             "PROXY_PORT",
             "ENABLE_H2",
-            "ENABLE_H3",
             "ENABLE_WEBSOCKET",
             "LB_MODE",
             "LB_MAX_QUEUE",
+            "PROXY_MAX_BACKENDS",
+            "PROXY_WORKERS",
+            "PROXY_QUEUE_REQUEST_KB",
+            "PROXY_QUEUE_SLOT_KB",
             "UPSTREAM_PROTOCOL",
+            "QUIC_FORWARD_ADDR",
+            "QUIC_FORWARD_LISTEN_ADDR",
+            "QUIC_FORWARD_BACKEND_ADDR",
+            "QUIC_FORWARD_POOL_SIZE",
         ]);
 
         env::set_var("TLS_CERT_BASE64", "cert");
         env::set_var("TLS_KEY_BASE64", "key");
         env::set_var("PROXY_PORT", "8443");
         env::set_var("ENABLE_H2", "false");
-        env::set_var("ENABLE_H3", "0");
         env::set_var("ENABLE_WEBSOCKET", "no");
         env::set_var("LB_MODE", "queue");
-        env::set_var("LB_MAX_QUEUE", "25");
+        env::set_var("LB_MAX_QUEUE", "2");
+        env::set_var("PROXY_MAX_BACKENDS", "6");
+        env::set_var("PROXY_QUEUE_REQUEST_KB", "4096");
+        env::set_var("PROXY_QUEUE_SLOT_KB", "128");
         env::set_var("UPSTREAM_PROTOCOL", "http2");
+        env::set_var("QUIC_FORWARD_ADDR", "127.0.0.1:9101");
+        env::set_var("QUIC_FORWARD_LISTEN_ADDR", "127.0.0.1:9102");
+        env::set_var("QUIC_FORWARD_BACKEND_ADDR", "127.0.0.1:9103");
+        env::set_var("QUIC_FORWARD_POOL_SIZE", "4");
 
         let config = ProxyConfig::from_env().unwrap();
         assert_eq!(config.cert_pem_base64, "cert");
         assert_eq!(config.key_pem_base64, "key");
         assert_eq!(config.port, 8443);
         assert!(!config.enable_h2);
-        assert!(!config.enable_h3);
         assert!(!config.enable_websocket);
         assert_eq!(config.initial_mode, LoadBalancingMode::Queue);
         assert_eq!(config.upstream_protocol, UpstreamProtocol::Http2);
-        assert_eq!(config.max_queue, Some(25));
+        assert_eq!(config.max_queue, 2);
+        assert_eq!(config.max_backends, 6);
+        assert_eq!(config.queue_request_kb, 4096);
+        assert_eq!(config.queue_slot_kb, 128);
+        let quic = config.quic_relay.expect("quic forward config");
+        assert_eq!(quic.forward_addr, "127.0.0.1:9101".parse().unwrap());
+        assert_eq!(quic.listen_addr, "127.0.0.1:9102".parse().unwrap());
+        assert_eq!(quic.backend_addr, "127.0.0.1:9103".parse().unwrap());
+        assert_eq!(quic.pool_size, 4);
     }
 }

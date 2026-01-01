@@ -5,12 +5,13 @@ use super::id;
 use super::pool::{AcquireError, BackendLease, BackendPool};
 use super::upstream::UpstreamProtocol;
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::combinators::BoxBody;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::convert::Infallible;
 use tokio::sync::RwLock;
 use tracing::debug;
 use tls_helpers::load_certs_from_base64;
@@ -18,7 +19,7 @@ use webpki_roots::TLS_SERVER_ROOTS;
 use url::Url;
 
 pub type ProxyHttpClient =
-    Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+    Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>>;
 
 pub struct ProxyState {
     http_pool: Arc<BackendPool>,
@@ -47,37 +48,19 @@ impl ProxyState {
         upstream_protocol: UpstreamProtocol,
         upstream_ca_cert_base64: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let (http_client, h3_pool) = match upstream_protocol {
-            UpstreamProtocol::Http1 => (
-                Some(build_proxy_client(
-                    UpstreamProtocol::Http1,
-                    upstream_ca_cert_base64,
-                )?),
-                None,
-            ),
-            UpstreamProtocol::Http2 => (
-                Some(build_proxy_client(
-                    UpstreamProtocol::Http2,
-                    upstream_ca_cert_base64,
-                )?),
-                None,
-            ),
-            UpstreamProtocol::Http3 => {
-                let ca_cert = upstream_ca_cert_base64.ok_or_else(|| {
-                    anyhow::anyhow!("http3 upstream requires a CA cert")
-                })?;
-                let endpoint = build_h3_endpoint(ca_cert)?;
-                (None, Some(H3ConnectionPool::new(endpoint)))
-            }
-        };
+        // Always use HTTP/1.1 for upstream connections (ignoring upstream_protocol setting)
+        let http_client = Some(build_proxy_client(
+            UpstreamProtocol::Http1,
+            upstream_ca_cert_base64,
+        )?);
 
         Ok(Self {
             http_pool: Arc::new(BackendPool::new(max_queue)),
             ws_pool: Arc::new(BackendPool::new(max_queue)),
             mode: RwLock::new(mode),
-            upstream_protocol,
+            upstream_protocol: UpstreamProtocol::Http1, // Always HTTP/1.1
             http_client,
-            h3_pool,
+            h3_pool: None,
         })
     }
 
@@ -157,6 +140,13 @@ impl ProxyState {
 
     pub async fn acquire_http(&self) -> Result<BackendLease, AcquireError> {
         let mode = self.mode().await;
+        self.http_pool.acquire(mode).await
+    }
+
+    pub async fn acquire_http_with_mode(
+        &self,
+        mode: LoadBalancingMode,
+    ) -> Result<BackendLease, AcquireError> {
         self.http_pool.acquire(mode).await
     }
 
