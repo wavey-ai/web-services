@@ -3,6 +3,7 @@
 pub mod config;
 pub mod error;
 pub mod h2;
+pub mod h3;
 #[cfg(feature = "proxy")]
 pub mod proxy;
 #[cfg(feature = "proxy")]
