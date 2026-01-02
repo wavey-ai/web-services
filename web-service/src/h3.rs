@@ -217,10 +217,8 @@ async fn handle_h3_body_stream_request(
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     router: Arc<dyn Router>,
 ) -> Result<(), H3Error> {
-    // Split the stream into separate send/recv halves to avoid lock contention
     let (send_stream, recv_stream) = stream.split();
 
-    // Create body stream from the receive half
     let body_stream: BodyStream = Box::pin(unfold(recv_stream, |mut recv| async move {
         match recv.recv_data().await {
             Ok(Some(mut chunk)) => {
