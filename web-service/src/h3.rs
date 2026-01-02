@@ -77,6 +77,35 @@ impl StreamWriter for H3SharedStreamWriter {
     }
 }
 
+/// Stream writer using split send half for true bidirectional streaming without lock contention
+pub struct H3SplitStreamWriter {
+    stream: Arc<Mutex<RequestStream<h3_quinn::SendStream<Bytes>, Bytes>>>,
+}
+
+#[async_trait::async_trait]
+impl StreamWriter for H3SplitStreamWriter {
+    async fn send_response(&mut self, response: Response<()>) -> Result<(), ServerError> {
+        let mut guard = self.stream.lock().await;
+        guard
+            .send_response(response)
+            .await
+            .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))
+    }
+
+    async fn send_data(&mut self, data: Bytes) -> Result<(), ServerError> {
+        let mut guard = self.stream.lock().await;
+        guard
+            .send_data(data)
+            .await
+            .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))
+    }
+
+    async fn finish(&mut self) -> Result<(), ServerError> {
+        // Don't finish here - the caller will finish after route_body_stream returns
+        Ok(())
+    }
+}
+
 impl Http3Server {
     pub fn new(config: ServerConfig, router: Arc<dyn Router>) -> Self {
         Self { config, router }
@@ -188,30 +217,25 @@ async fn handle_h3_body_stream_request(
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     router: Arc<dyn Router>,
 ) -> Result<(), H3Error> {
-    let shared_stream = Arc::new(Mutex::new(stream));
+    // Split the stream into separate send/recv halves to avoid lock contention
+    let (send_stream, recv_stream) = stream.split();
 
-    // Create body stream
-    let body_stream: BodyStream = Box::pin(unfold(
-        Arc::clone(&shared_stream),
-        |shared| async move {
-            let recv = {
-                let mut guard = shared.lock().await;
-                guard.recv_data().await
-            };
-            match recv {
-                Ok(Some(mut chunk)) => {
-                    let data = chunk.copy_to_bytes(chunk.remaining());
-                    Some((Ok(data), shared))
-                }
-                Ok(None) => None,
-                Err(e) => Some((Err(ServerError::Handler(Box::new(e))), shared)),
+    // Create body stream from the receive half
+    let body_stream: BodyStream = Box::pin(unfold(recv_stream, |mut recv| async move {
+        match recv.recv_data().await {
+            Ok(Some(mut chunk)) => {
+                let data = chunk.copy_to_bytes(chunk.remaining());
+                Some((Ok(data), recv))
             }
-        },
-    ));
+            Ok(None) => None,
+            Err(e) => Some((Err(ServerError::Handler(Box::new(e))), recv)),
+        }
+    }));
 
-    // Create stream writer that shares the stream
-    let stream_writer = H3SharedStreamWriter {
-        stream: Arc::clone(&shared_stream),
+    // Create stream writer from the send half - wrap in Arc<Mutex> for shared ownership
+    let send_stream = Arc::new(Mutex::new(send_stream));
+    let stream_writer = H3SplitStreamWriter {
+        stream: Arc::clone(&send_stream),
     };
 
     // Call the body stream handler
@@ -221,7 +245,7 @@ async fn handle_h3_body_stream_request(
         .map_err(H3Error::Router)?;
 
     // Finish the stream
-    let mut guard = shared_stream.lock().await;
+    let mut guard = send_stream.lock().await;
     guard
         .finish()
         .await
