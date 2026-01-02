@@ -48,6 +48,35 @@ impl StreamWriter for H3StreamWriter {
     }
 }
 
+/// Stream writer that uses a shared (mutex-protected) stream for bidirectional streaming
+pub struct H3SharedStreamWriter {
+    stream: Arc<Mutex<RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>>>,
+}
+
+#[async_trait::async_trait]
+impl StreamWriter for H3SharedStreamWriter {
+    async fn send_response(&mut self, response: Response<()>) -> Result<(), ServerError> {
+        let mut guard = self.stream.lock().await;
+        guard
+            .send_response(response)
+            .await
+            .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))
+    }
+
+    async fn send_data(&mut self, data: Bytes) -> Result<(), ServerError> {
+        let mut guard = self.stream.lock().await;
+        guard
+            .send_data(data)
+            .await
+            .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))
+    }
+
+    async fn finish(&mut self) -> Result<(), ServerError> {
+        // Don't finish here - the caller will finish after route_body_stream returns
+        Ok(())
+    }
+}
+
 impl Http3Server {
     pub fn new(config: ServerConfig, router: Arc<dyn Router>) -> Self {
         Self { config, router }
@@ -139,6 +168,8 @@ async fn handle_h3_connection(
                     if router.is_streaming(&path) {
                         let writer = H3StreamWriter { stream };
                         let _ = router.route_stream(req, Box::new(writer)).await;
+                    } else if router.is_body_streaming(&path) {
+                        let _ = handle_h3_body_stream_request(req, stream, router).await;
                     } else {
                         let _ = handle_h3_request(req, stream, router).await;
                     }
@@ -149,6 +180,52 @@ async fn handle_h3_connection(
         }
     }
     Ok(())
+}
+
+/// Handle a request with bidirectional streaming (body in, stream out)
+async fn handle_h3_body_stream_request(
+    req: http::Request<()>,
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    router: Arc<dyn Router>,
+) -> Result<(), H3Error> {
+    let shared_stream = Arc::new(Mutex::new(stream));
+
+    // Create body stream
+    let body_stream: BodyStream = Box::pin(unfold(
+        Arc::clone(&shared_stream),
+        |shared| async move {
+            let recv = {
+                let mut guard = shared.lock().await;
+                guard.recv_data().await
+            };
+            match recv {
+                Ok(Some(mut chunk)) => {
+                    let data = chunk.copy_to_bytes(chunk.remaining());
+                    Some((Ok(data), shared))
+                }
+                Ok(None) => None,
+                Err(e) => Some((Err(ServerError::Handler(Box::new(e))), shared)),
+            }
+        },
+    ));
+
+    // Create stream writer that shares the stream
+    let stream_writer = H3SharedStreamWriter {
+        stream: Arc::clone(&shared_stream),
+    };
+
+    // Call the body stream handler
+    router
+        .route_body_stream(req, body_stream, Box::new(stream_writer))
+        .await
+        .map_err(H3Error::Router)?;
+
+    // Finish the stream
+    let mut guard = shared_stream.lock().await;
+    guard
+        .finish()
+        .await
+        .map_err(|e| H3Error::Transport(e.to_string()))
 }
 
 async fn handle_h3_request(
