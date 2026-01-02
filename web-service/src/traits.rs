@@ -135,6 +135,24 @@ pub trait Router: Send + Sync + 'static {
         stream_writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()>;
 
+    /// Check if this endpoint streams both body input AND response output
+    fn is_body_streaming(&self, _path: &str) -> bool {
+        false
+    }
+
+    /// Route a request with streaming body input AND streaming response output
+    async fn route_body_stream(
+        &self,
+        _req: Request<()>,
+        _body: BodyStream,
+        _stream_writer: Box<dyn StreamWriter>,
+    ) -> HandlerResult<()> {
+        Err(ServerError::Handler(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Body streaming not supported",
+        ))))
+    }
+
     /// Get WebTransport handler if available
     fn webtransport_handler(&self) -> Option<&dyn WebTransportHandler>;
 

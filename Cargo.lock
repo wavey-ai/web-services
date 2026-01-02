@@ -2675,6 +2675,7 @@ dependencies = [
  "tls-helpers 0.2.0",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
