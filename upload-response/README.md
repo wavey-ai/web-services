@@ -2,6 +2,8 @@
 
 A high-performance request/response proxy service that streams requests into a shared-memory cache for external workers to process, then returns responses back to clients.
 
+The shared-memory ChunkCache and slot-based streaming architecture are inspired by Low-Latency HLS (LL-HLS) partial segment delivery patterns.
+
 ## Supported Protocols
 
 | Protocol | Transport | Encryption | Auth | Notes |
