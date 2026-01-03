@@ -16,6 +16,10 @@ use h3_quinn::quinn;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tls_helpers::from_base64_raw;
 
+// WebSocket imports
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+
 const SLOT_SIZE_KB: usize = 64;
 
 fn load_test_env() -> Option<(String, String)> {
@@ -323,6 +327,113 @@ async fn run_h3_upload_test(
     (throughput, passed)
 }
 
+async fn run_wss_upload_test(
+    port: u16,
+    upload_size_mb: usize,
+    cert_b64: &str,
+    _key_b64: &str,
+) -> (f64, bool) {
+    ensure_rustls_provider();
+
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+
+    println!("Generating {} MB test data for WSS...", upload_size_mb);
+    let gen_start = Instant::now();
+    let (data, expected_hash) = generate_test_data(upload_size_bytes);
+    println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
+
+    // Parse certs for client verification skip
+    let (certs, _key) = parse_certs_and_key(cert_b64, _key_b64);
+
+    // Build TLS config with cert verification disabled for self-signed
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in &certs {
+        let _ = root_store.add(cert.clone());
+    }
+
+    let client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+
+    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(client_config));
+
+    println!("Uploading {} MB via WSS...", upload_size_mb);
+    let start = Instant::now();
+
+    let url = format!("wss://localhost:{}/upload", port);
+    let (mut ws_stream, _response) = tokio_tungstenite::connect_async_tls_with_config(
+        &url,
+        None,
+        false,
+        Some(connector),
+    )
+    .await
+    .expect("WebSocket connect");
+
+    // Send data in 64KB chunks
+    let chunk_size = 64 * 1024;
+    for chunk in data.chunks(chunk_size) {
+        ws_stream
+            .send(Message::Binary(chunk.to_vec().into()))
+            .await
+            .expect("send binary");
+    }
+
+    // Signal end of upload with empty binary frame
+    ws_stream
+        .send(Message::Binary(Vec::new().into()))
+        .await
+        .expect("send end marker");
+
+    // Wait for response (keep connection open)
+    let mut body_data = Vec::new();
+    while let Some(msg) = ws_stream.next().await {
+        match msg {
+            Ok(Message::Binary(data)) => {
+                if data.is_empty() {
+                    continue;
+                }
+                body_data.extend_from_slice(&data);
+                break; // Response received, exit loop
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => continue,
+            Err(e) => {
+                eprintln!("WebSocket recv error: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Now close
+    let _ = ws_stream.close(None).await;
+
+    let body = String::from_utf8_lossy(&body_data).to_string();
+
+    let total_elapsed = start.elapsed();
+
+    let expected_hex = format!("{:016x}", expected_hash);
+    let throughput = upload_size_mb as f64 / total_elapsed.as_secs_f64();
+
+    println!(
+        "WSS: {:.2}s ({:.1} MB/s)",
+        total_elapsed.as_secs_f64(),
+        throughput
+    );
+    println!("Expected: {}", expected_hex);
+    println!("Got:      {}", body.trim());
+
+    let passed = body.trim() == expected_hex;
+    if passed {
+        println!("WSS PASSED\n");
+    } else {
+        println!("WSS FAILED\n");
+    }
+
+    (throughput, passed)
+}
+
 #[derive(Debug)]
 struct SkipServerVerification;
 
@@ -404,6 +515,7 @@ async fn setup_server(
         .with_port(port)
         .enable_h2(true)
         .enable_h3(true)
+        .enable_websocket(true)
         .with_router(router)
         .build()
         .expect("build server");
@@ -548,6 +660,50 @@ async fn test_http3_1gb() {
     let _ = shutdown_tx.send(());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wss_100mb() {
+    let (cert_b64, key_b64) = match load_test_env() {
+        Some(v) => v,
+        None => {
+            eprintln!("Skipping: TLS_CERT_BASE64 and TLS_KEY_BASE64 env vars required");
+            return;
+        }
+    };
+
+    let port = pick_unused_port().expect("pick port");
+    let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 100).await;
+
+    println!("\n=== WSS 100MB Upload Test ===");
+    let (throughput, passed) = run_wss_upload_test(port, 100, &cert_b64, &key_b64).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("=============================\n");
+
+    assert!(passed, "WSS test failed");
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wss_1gb() {
+    let (cert_b64, key_b64) = match load_test_env() {
+        Some(v) => v,
+        None => {
+            eprintln!("Skipping: TLS_CERT_BASE64 and TLS_KEY_BASE64 env vars required");
+            return;
+        }
+    };
+
+    let port = pick_unused_port().expect("pick port");
+    let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 1024).await;
+
+    println!("\n=== WSS 1GB Upload Test ===");
+    let (throughput, passed) = run_wss_upload_test(port, 1024, &cert_b64, &key_b64).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("===========================\n");
+
+    assert!(passed, "WSS 1GB test failed");
+    let _ = shutdown_tx.send(());
+}
+
 /// Compare all protocols
 #[tokio::test(flavor = "multi_thread")]
 async fn test_protocol_comparison() {
@@ -569,6 +725,7 @@ async fn test_protocol_comparison() {
     let (h1_throughput, h1_passed) = run_upload_test(port, 512, false).await;
     let (h2_throughput, h2_passed) = run_upload_test(port, 512, true).await;
     let (h3_throughput, h3_passed) = run_h3_upload_test(port, 512, &cert_b64, &key_b64).await;
+    let (wss_throughput, wss_passed) = run_wss_upload_test(port, 512, &cert_b64, &key_b64).await;
 
     println!("========================================");
     println!("    Results Summary");
@@ -576,8 +733,9 @@ async fn test_protocol_comparison() {
     println!("HTTP/1.1: {:.1} MB/s {}", h1_throughput, if h1_passed { "✓" } else { "✗" });
     println!("HTTP/2:   {:.1} MB/s {}", h2_throughput, if h2_passed { "✓" } else { "✗" });
     println!("HTTP/3:   {:.1} MB/s {}", h3_throughput, if h3_passed { "✓" } else { "✗" });
+    println!("WSS:      {:.1} MB/s {}", wss_throughput, if wss_passed { "✓" } else { "✗" });
     println!("========================================\n");
 
-    assert!(h1_passed && h2_passed && h3_passed, "Protocol tests failed");
+    assert!(h1_passed && h2_passed && h3_passed && wss_passed, "Protocol tests failed");
     let _ = shutdown_tx.send(());
 }

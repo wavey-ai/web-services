@@ -13,6 +13,9 @@ async-trait = "0.1.88"
 http = "1"
 tracing = "0.1.40"
 futures-util = "0.3"
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+hyper-util = { version = "0.1", features = ["full"] }
+hyper = { version = "1.6", features = ["full"] }
 
 [dev-dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
@@ -28,3 +31,4 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = "1"
 rustls-pemfile = "2"
 futures-util = "0.3"
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }

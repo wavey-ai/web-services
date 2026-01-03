@@ -7,7 +7,7 @@ A high-performance request/response proxy service that streams HTTP requests int
 ```mermaid
 flowchart TB
     subgraph Ingress
-        Client[Client Request<br/>H1.1/H2/H3]
+        Client[Client Request<br/>H1.1/H2/H3/WSS]
         Router[UploadResponseRouter]
     end
 
@@ -163,15 +163,20 @@ Upload size: 512 MB
       2048 KB |    1307 MB/s |          256
 ```
 
-### Protocol Throughput (1GB Upload)
+### Protocol Throughput (512 MB Upload)
 
 End-to-end benchmarks with real HTTP servers (TLS + protocol overhead):
 
 | Protocol | Throughput | Notes |
 |----------|------------|-------|
-| HTTP/1.1 | 662 MB/s | Chunked transfer |
-| HTTP/2   | 659 MB/s | Single stream |
-| HTTP/3   | 242 MB/s | QUIC/UDP |
+| WSS      | 947 MB/s | WebSocket binary frames |
+| HTTP/2   | 671 MB/s | Single stream |
+| HTTP/1.1 | 658 MB/s | Chunked transfer |
+| HTTP/3   | 253 MB/s | QUIC/UDP |
+
+**Why is WSS fastest?**
+
+WebSocket over TLS has lower per-message overhead than HTTP protocols. Once the connection is established, binary frames have minimal framing (2-14 bytes header vs HTTP's chunked encoding overhead). The bidirectional nature also eliminates request/response round-trip delays.
 
 **Why is HTTP/3 slower?**
 

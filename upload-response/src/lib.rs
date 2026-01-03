@@ -13,6 +13,10 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, warn};
+use futures_util::{SinkExt, StreamExt};
+use hyper_util::rt::TokioIo;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use web_service::{
     BodyStream, HandlerResponse, HandlerResult, Router, ServerError, StreamWriter,
     WebSocketHandler, WebTransportHandler,
@@ -410,12 +414,14 @@ impl UploadResponseService {
 /// Router implementation for upload-response
 pub struct UploadResponseRouter {
     service: Arc<UploadResponseService>,
+    ws_handler: UploadResponseWsHandler,
 }
 
 impl UploadResponseRouter {
     /// Create a new router with the given service
     pub fn new(service: Arc<UploadResponseService>) -> Self {
-        Self { service }
+        let ws_handler = UploadResponseWsHandler::new(Arc::clone(&service));
+        Self { service, ws_handler }
     }
 
     /// Get a reference to the underlying service
@@ -562,8 +568,132 @@ impl Router for UploadResponseRouter {
         None
     }
 
-    fn websocket_handler(&self, _path: &str) -> Option<&dyn WebSocketHandler> {
-        None
+    fn websocket_handler(&self, path: &str) -> Option<&dyn WebSocketHandler> {
+        if path.starts_with("/upload") || path.starts_with("/ws") {
+            Some(&self.ws_handler)
+        } else {
+            None
+        }
+    }
+}
+
+/// WebSocket handler for upload-response
+pub struct UploadResponseWsHandler {
+    service: Arc<UploadResponseService>,
+}
+
+impl UploadResponseWsHandler {
+    pub fn new(service: Arc<UploadResponseService>) -> Self {
+        Self { service }
+    }
+}
+
+#[async_trait]
+impl WebSocketHandler for UploadResponseWsHandler {
+    async fn handle_websocket(
+        &self,
+        req: Request<()>,
+        mut stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
+    ) -> HandlerResult<()> {
+        // Acquire stream slot
+        let _permit = self
+            .service
+            .acquire_stream()
+            .await
+            .map_err(|e| ServerError::Config(e))?;
+
+        let stream_id = self.service.next_id();
+        debug!(stream_id, uri = %req.uri(), "WebSocket stream started");
+
+        // Slot 1: HPKS headers frame
+        let headers = StreamHeaders::from_request(stream_id, &req)
+            .map_err(|e| ServerError::Config(e.to_string()))?;
+        self.service
+            .write_request_headers(stream_id, headers)
+            .await
+            .map_err(|e| ServerError::Config(e))?;
+
+        let slot_bytes = self.service.config.slot_bytes();
+
+        // Read binary frames and write to request cache
+        // Empty binary frame signals end of upload
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    if data.is_empty() {
+                        // Empty binary = end marker from client
+                        break;
+                    }
+                    // Split into slot-sized chunks if needed
+                    if data.len() <= slot_bytes {
+                        self.service
+                            .append_request_body(stream_id, Bytes::from(data))
+                            .await
+                            .map_err(|e| ServerError::Config(e))?;
+                    } else {
+                        let mut remaining = Bytes::from(data);
+                        while !remaining.is_empty() {
+                            let take = remaining.len().min(slot_bytes);
+                            let chunk = remaining.split_to(take);
+                            self.service
+                                .append_request_body(stream_id, chunk)
+                                .await
+                                .map_err(|e| ServerError::Config(e))?;
+                        }
+                    }
+                }
+                Ok(Message::Close(_)) => break,
+                Ok(_) => continue, // Ignore text, ping, pong
+                Err(e) => {
+                    error!(stream_id, error = %e, "WebSocket error");
+                    break;
+                }
+            }
+        }
+
+        // End marker
+        self.service
+            .end_request(stream_id)
+            .await
+            .map_err(|e| ServerError::Config(e))?;
+
+        debug!(stream_id, "Request complete, waiting for response");
+
+        // Wait for response
+        let rx = self.service.register_response(stream_id).await;
+        let timeout_duration = Duration::from_millis(self.service.config.response_timeout_ms);
+
+        match timeout(timeout_duration, rx).await {
+            Ok(Ok(Ok((status, body)))) => {
+                debug!(stream_id, ?status, "Sending WebSocket response");
+                // Send response as binary frame
+                if let Err(e) = stream.send(Message::Binary(body.to_vec().into())).await {
+                    error!(stream_id, error = %e, "Failed to send WebSocket response");
+                }
+                let _ = stream.close(None).await;
+            }
+            Ok(Ok(Err(e))) => {
+                error!(stream_id, error = %e, "Response error");
+                self.service.drop_response_channel(stream_id).await;
+                let _ = stream.close(None).await;
+            }
+            Ok(Err(_)) => {
+                error!(stream_id, "Response channel closed");
+                self.service.drop_response_channel(stream_id).await;
+                let _ = stream.close(None).await;
+            }
+            Err(_) => {
+                error!(stream_id, "Response timeout");
+                self.service.drop_response_channel(stream_id).await;
+                let _ = stream.close(None).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn can_handle(&self, path: &str) -> bool {
+        path.starts_with("/upload") || path.starts_with("/ws")
     }
 }
 
