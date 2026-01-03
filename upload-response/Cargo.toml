@@ -16,3 +16,8 @@ futures-util = "0.3"
 
 [dev-dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "http2"] }
+portpicker = "0.1"
+dotenvy = "0.15"
+tls-helpers = { git = "https://github.com/wavey-ai/tls-helpers.git" }
+tokio-rustls = "0.26"
