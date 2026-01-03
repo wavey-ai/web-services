@@ -2,9 +2,9 @@
 
 A high-performance request/response proxy service that streams requests into a shared-memory cache for external workers to process, then returns responses back to clients.
 
-## Acknowledgements
+## Architecture Notes
 
-This crate is based on Low-Latency HLS (LL-HLS) concepts and adapted from the [wavey-ai/hls](https://github.com/wavey-ai/hls) codebase. The shared-memory ChunkCache and slot-based streaming architecture are derived from LL-HLS partial segment delivery patterns.
+The shared-memory ChunkCache and slot-based streaming architecture are inspired by Low-Latency HLS (LL-HLS) partial segment delivery patterns. See [wavey-ai/hls](https://github.com/wavey-ai/hls) for the related HLS implementation.
 
 ## Supported Protocols
 
