@@ -157,7 +157,17 @@ Upload size: 512 MB
       2048 KB |    1307 MB/s |          256
 ```
 
-### 1GB Upload Test
+### Protocol Throughput (1GB Upload)
+
+End-to-end benchmarks with real HTTP servers (TLS + protocol overhead):
+
+| Protocol | Throughput | Notes |
+|----------|------------|-------|
+| HTTP/1.1 | 662 MB/s | Chunked transfer |
+| HTTP/2   | 659 MB/s | Single stream |
+| HTTP/3   | 242 MB/s | QUIC/UDP |
+
+### Cache Throughput (In-Memory)
 
 ```
 Upload size: 1024 MB

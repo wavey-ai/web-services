@@ -2,13 +2,19 @@ use bytes::Bytes;
 use http::StatusCode;
 use http_pack::stream::{StreamHeaders, StreamResponseHeaders};
 use portpicker::pick_unused_port;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::time::{interval, Duration};
 use upload_response::{
     ResponseWatcher, TailSlot, UploadResponseConfig, UploadResponseRouter, UploadResponseService,
 };
 use web_service::{H2H3Server, Server, ServerBuilder};
+
+// HTTP/3 imports
+use h3_quinn::quinn;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tls_helpers::from_base64_raw;
 
 const SLOT_SIZE_KB: usize = 64;
 
@@ -118,7 +124,6 @@ fn generate_test_data(size_bytes: usize) -> (Vec<u8>, u64) {
 
 async fn run_upload_test(
     port: u16,
-    cert_b64: &str,
     upload_size_mb: usize,
     use_http2: bool,
 ) -> (f64, bool) {
@@ -130,18 +135,13 @@ async fn run_upload_test(
     let (data, expected_hash) = generate_test_data(upload_size_bytes);
     println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
 
-    let cert_pem = tls_helpers::from_base64_raw(cert_b64).expect("decode cert");
-    let cert = reqwest::Certificate::from_pem(&cert_pem).expect("parse cert");
-
     let mut builder = reqwest::Client::builder()
-        .add_root_certificate(cert)
         .danger_accept_invalid_certs(true);
 
-    if use_http2 {
-        builder = builder.http2_prior_knowledge();
-    } else {
+    if !use_http2 {
         builder = builder.http1_only();
     }
+    // Let reqwest negotiate HTTP/2 via ALPN for use_http2=true
 
     let client = builder.build().expect("build client");
 
@@ -182,6 +182,196 @@ async fn run_upload_test(
     (throughput, passed)
 }
 
+fn ensure_rustls_provider() {
+    static INSTALL: OnceLock<()> = OnceLock::new();
+    INSTALL.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn parse_certs_and_key(
+    cert_b64: &str,
+    key_b64: &str,
+) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let cert_pem = from_base64_raw(cert_b64).expect("decode cert");
+    let key_pem = from_base64_raw(key_b64).expect("decode key");
+
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .expect("parse key")
+        .expect("no key found");
+
+    (certs, key)
+}
+
+async fn run_h3_upload_test(
+    port: u16,
+    upload_size_mb: usize,
+    cert_b64: &str,
+    key_b64: &str,
+) -> (f64, bool) {
+    ensure_rustls_provider();
+
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+
+    println!("Generating {} MB test data for HTTP/3...", upload_size_mb);
+    let gen_start = Instant::now();
+    let (data, expected_hash) = generate_test_data(upload_size_bytes);
+    println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
+
+    // Parse certs for client verification skip
+    let (certs, _key) = parse_certs_and_key(cert_b64, key_b64);
+
+    // Build QUIC client with cert verification disabled for self-signed
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in &certs {
+        let _ = root_store.add(cert.clone());
+    }
+
+    let mut client_crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+    client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).expect("quic config"),
+    ));
+
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).expect("bind endpoint");
+    endpoint.set_default_client_config(client_config);
+
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    println!("Uploading {} MB via HTTP/3...", upload_size_mb);
+    let start = Instant::now();
+
+    // Connect via QUIC
+    let conn = endpoint
+        .connect(server_addr, "localhost")
+        .expect("connect")
+        .await
+        .expect("connection");
+
+    let quinn_conn = h3_quinn::Connection::new(conn);
+    let (mut driver, mut send_request) = h3::client::new(quinn_conn).await.expect("h3 client");
+
+    // Drive the connection in background
+    tokio::spawn(async move {
+        let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+
+    // Build request
+    let req = http::Request::post(format!("https://localhost:{}/upload", port))
+        .body(())
+        .expect("build request");
+
+    let mut stream = send_request.send_request(req).await.expect("send request");
+
+    // Send body in chunks
+    let chunk_size = 64 * 1024;
+    for chunk in data.chunks(chunk_size) {
+        stream
+            .send_data(Bytes::copy_from_slice(chunk))
+            .await
+            .expect("send data");
+    }
+    stream.finish().await.expect("finish stream");
+
+    // Receive response
+    let resp = stream.recv_response().await.expect("recv response");
+    let status = resp.status();
+
+    let mut body_data = Vec::new();
+    while let Some(mut chunk) = stream.recv_data().await.expect("recv data") {
+        use bytes::Buf;
+        while chunk.has_remaining() {
+            let bytes = chunk.chunk();
+            body_data.extend_from_slice(bytes);
+            let len = bytes.len();
+            chunk.advance(len);
+        }
+    }
+    let body = String::from_utf8_lossy(&body_data).to_string();
+
+    let total_elapsed = start.elapsed();
+
+    let expected_hex = format!("{:016x}", expected_hash);
+    let throughput = upload_size_mb as f64 / total_elapsed.as_secs_f64();
+
+    println!(
+        "HTTP/3: {:.2}s ({:.1} MB/s)",
+        total_elapsed.as_secs_f64(),
+        throughput
+    );
+    println!("Expected: {}", expected_hex);
+    println!("Got:      {}", body.trim());
+
+    let passed = status == StatusCode::OK && body.trim() == expected_hex;
+    if passed {
+        println!("HTTP/3 PASSED\n");
+    } else {
+        println!("HTTP/3 FAILED\n");
+    }
+
+    endpoint.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+
+    (throughput, passed)
+}
+
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
 async fn setup_server(
     cert_b64: String,
     key_b64: String,
@@ -213,6 +403,7 @@ async fn setup_server(
         .with_tls(cert_b64, key_b64)
         .with_port(port)
         .enable_h2(true)
+        .enable_h3(true)
         .with_router(router)
         .build()
         .expect("build server");
@@ -239,7 +430,7 @@ async fn test_http1_100mb() {
     let shutdown_tx = setup_server(cert_b64.clone(), key_b64, port, 100).await;
 
     println!("\n=== HTTP/1.1 100MB Upload Test ===");
-    let (throughput, passed) = run_upload_test(port, &cert_b64, 100, false).await;
+    let (throughput, passed) = run_upload_test(port, 100, false).await;
     println!("Throughput: {:.1} MB/s", throughput);
     println!("==================================\n");
 
@@ -261,7 +452,7 @@ async fn test_http2_100mb() {
     let shutdown_tx = setup_server(cert_b64.clone(), key_b64, port, 100).await;
 
     println!("\n=== HTTP/2 100MB Upload Test ===");
-    let (throughput, passed) = run_upload_test(port, &cert_b64, 100, true).await;
+    let (throughput, passed) = run_upload_test(port, 100, true).await;
     println!("Throughput: {:.1} MB/s", throughput);
     println!("================================\n");
 
@@ -283,7 +474,7 @@ async fn test_http1_1gb() {
     let shutdown_tx = setup_server(cert_b64.clone(), key_b64, port, 1024).await;
 
     println!("\n=== HTTP/1.1 1GB Upload Test ===");
-    let (throughput, passed) = run_upload_test(port, &cert_b64, 1024, false).await;
+    let (throughput, passed) = run_upload_test(port, 1024, false).await;
     println!("Throughput: {:.1} MB/s", throughput);
     println!("================================\n");
 
@@ -305,11 +496,55 @@ async fn test_http2_1gb() {
     let shutdown_tx = setup_server(cert_b64.clone(), key_b64, port, 1024).await;
 
     println!("\n=== HTTP/2 1GB Upload Test ===");
-    let (throughput, passed) = run_upload_test(port, &cert_b64, 1024, true).await;
+    let (throughput, passed) = run_upload_test(port, 1024, true).await;
     println!("Throughput: {:.1} MB/s", throughput);
     println!("==============================\n");
 
     assert!(passed, "HTTP/2 1GB test failed");
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_http3_100mb() {
+    let (cert_b64, key_b64) = match load_test_env() {
+        Some(v) => v,
+        None => {
+            eprintln!("Skipping: TLS_CERT_BASE64 and TLS_KEY_BASE64 env vars required");
+            return;
+        }
+    };
+
+    let port = pick_unused_port().expect("pick port");
+    let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 100).await;
+
+    println!("\n=== HTTP/3 100MB Upload Test ===");
+    let (throughput, passed) = run_h3_upload_test(port, 100, &cert_b64, &key_b64).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("================================\n");
+
+    assert!(passed, "HTTP/3 test failed");
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_http3_1gb() {
+    let (cert_b64, key_b64) = match load_test_env() {
+        Some(v) => v,
+        None => {
+            eprintln!("Skipping: TLS_CERT_BASE64 and TLS_KEY_BASE64 env vars required");
+            return;
+        }
+    };
+
+    let port = pick_unused_port().expect("pick port");
+    let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 1024).await;
+
+    println!("\n=== HTTP/3 1GB Upload Test ===");
+    let (throughput, passed) = run_h3_upload_test(port, 1024, &cert_b64, &key_b64).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("==============================\n");
+
+    assert!(passed, "HTTP/3 1GB test failed");
     let _ = shutdown_tx.send(());
 }
 
@@ -325,22 +560,24 @@ async fn test_protocol_comparison() {
     };
 
     let port = pick_unused_port().expect("pick port");
-    let shutdown_tx = setup_server(cert_b64.clone(), key_b64, port, 512).await;
+    let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 512).await;
 
     println!("\n========================================");
     println!("    Protocol Comparison (512 MB)");
     println!("========================================\n");
 
-    let (h1_throughput, h1_passed) = run_upload_test(port, &cert_b64, 512, false).await;
-    let (h2_throughput, h2_passed) = run_upload_test(port, &cert_b64, 512, true).await;
+    let (h1_throughput, h1_passed) = run_upload_test(port, 512, false).await;
+    let (h2_throughput, h2_passed) = run_upload_test(port, 512, true).await;
+    let (h3_throughput, h3_passed) = run_h3_upload_test(port, 512, &cert_b64, &key_b64).await;
 
     println!("========================================");
     println!("    Results Summary");
     println!("========================================");
     println!("HTTP/1.1: {:.1} MB/s {}", h1_throughput, if h1_passed { "✓" } else { "✗" });
     println!("HTTP/2:   {:.1} MB/s {}", h2_throughput, if h2_passed { "✓" } else { "✗" });
+    println!("HTTP/3:   {:.1} MB/s {}", h3_throughput, if h3_passed { "✓" } else { "✗" });
     println!("========================================\n");
 
-    assert!(h1_passed && h2_passed, "Protocol tests failed");
+    assert!(h1_passed && h2_passed && h3_passed, "Protocol tests failed");
     let _ = shutdown_tx.send(());
 }
