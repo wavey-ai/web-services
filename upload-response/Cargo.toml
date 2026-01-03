@@ -18,6 +18,11 @@ hyper-util = { version = "0.1", features = ["full"] }
 hyper = { version = "1.6", features = ["full"] }
 srt = { git = "https://github.com/wavey-ai/av-rs.git", features = ["async"] }
 
+# WebRTC Data Channels
+matchbox_socket = { git = "ssh://git@github.com/wavey-ai/matchbox" }
+futures-timer = "3"
+futures = "0.3"
+
 [dev-dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "http2", "stream"] }

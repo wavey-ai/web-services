@@ -271,5 +271,3 @@ cargo test -p upload-response --release test_gigabyte_upload_benchmark -- --noca
 - `web-service` - HTTP server traits (Router, StreamWriter)
 - `playlists` - ChunkCache shared-memory ring buffer
 - `http-pack` - HPKS streaming HTTP format
-- `tokio` - Async runtime
-- `bytes` - Zero-copy byte buffers
