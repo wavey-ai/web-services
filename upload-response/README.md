@@ -208,10 +208,17 @@ Read:   3966 MB/s (63,461 ops/s)
 Combined: 5830 MB/s
 ```
 
-The ChunkCache operates at near memory-bandwidth speeds due to:
+Massive concurrent reads (1000 readers, 1 writer):
+```
+Read:  22.1M ops/s
+Write: 22K ops/s (concurrent with reads)
+```
+
+The ChunkCache scales to millions of concurrent reads due to:
 
 - Pre-allocated ring buffers (no malloc per write)
-- Per-slot RwLock (fine-grained locking, no cross-stream contention)
+- Per-slot RwLock (readers only contend on same slot, not globally)
+- Lock-free `last()` via atomic load
 - Zero-copy reads via `Bytes::slice()`
 - 12-byte overhead per slot (4-byte length + 8-byte xxhash)
 
