@@ -1,10 +1,14 @@
 use bytes::Bytes;
-use http::StatusCode;
+use futures_util::stream;
+use http::{Request, StatusCode};
 use http_pack::stream::{StreamHeaders, StreamRequestHeaders, StreamResponseHeaders};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{interval, Duration};
-use upload_response::{ResponseWatcher, TailSlot, UploadResponseConfig, UploadResponseService};
+use upload_response::{
+    ResponseWatcher, TailSlot, UploadResponseConfig, UploadResponseRouter, UploadResponseService,
+};
+use web_service::Router;
 use xxhash_rust::xxh64::xxh64;
 
 /// Simulates a worker that:
@@ -533,4 +537,176 @@ async fn test_100mb_upload_validation() {
     assert_eq!(body, Bytes::from(expected_hex));
 
     worker_handle.await.unwrap();
+}
+
+/// Worker that processes ALL streams (not just one specific stream_id)
+async fn run_multi_stream_worker(service: Arc<UploadResponseService>) {
+    let mut poll = interval(Duration::from_micros(100));
+    let num_streams = service.config().num_streams;
+    let mut last_seen: Vec<usize> = vec![0; num_streams];
+    let mut assemblies: std::collections::HashMap<u64, (Option<StreamRequestHeaders>, Vec<Bytes>)> =
+        std::collections::HashMap::new();
+
+    loop {
+        poll.tick().await;
+
+        for stream_idx in 0..num_streams {
+            let stream_id = stream_idx as u64;
+            let current_last = service.request_last(stream_id).unwrap_or(0);
+
+            if current_last <= last_seen[stream_idx] {
+                continue;
+            }
+
+            for slot_id in (last_seen[stream_idx] + 1)..=current_last {
+                match service.tail_request(stream_id, slot_id).await {
+                    Some(TailSlot::Headers(h)) => {
+                        assemblies.insert(stream_id, (Some(h), Vec::new()));
+                    }
+                    Some(TailSlot::Body(data)) => {
+                        if let Some((_, ref mut chunks)) = assemblies.get_mut(&stream_id) {
+                            chunks.push(data);
+                        }
+                    }
+                    Some(TailSlot::End) => {
+                        if let Some((_, chunks)) = assemblies.remove(&stream_id) {
+                            // Compute hash
+                            let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+                            for chunk in &chunks {
+                                hasher.update(chunk);
+                            }
+                            let hash = hasher.digest();
+
+                            // Write response
+                            let resp_headers = StreamHeaders::Response(StreamResponseHeaders {
+                                stream_id,
+                                version: http_pack::HttpVersion::Http11,
+                                status: 200,
+                                headers: vec![],
+                            });
+                            service
+                                .write_response_headers(stream_id, resp_headers)
+                                .await
+                                .unwrap();
+                            service
+                                .append_response_body(stream_id, Bytes::from(format!("{:016x}", hash)))
+                                .await
+                                .unwrap();
+                            service.end_response(stream_id).await.unwrap();
+                        }
+                    }
+                    None => {}
+                }
+            }
+
+            last_seen[stream_idx] = current_last;
+        }
+    }
+}
+
+/// Test the full Router path - this is what H1/H2/H3 servers use
+#[tokio::test]
+async fn test_router_route_body() {
+    let config = UploadResponseConfig {
+        num_streams: 10,
+        slot_size_kb: 64,
+        slots_per_stream: 100,
+        response_timeout_ms: 5000,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+    let router = UploadResponseRouter::new(service.clone());
+
+    // Start response watcher
+    let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
+    let _watcher_handle = watcher.spawn();
+
+    // Start multi-stream worker
+    let worker_service = service.clone();
+    let _worker_handle = tokio::spawn(async move {
+        run_multi_stream_worker(worker_service).await;
+    });
+
+    // Create HTTP request
+    let req = Request::builder()
+        .method("POST")
+        .uri("/upload")
+        .body(())
+        .unwrap();
+
+    // Create body stream
+    let body_data = b"Hello from the Router test!";
+    let expected_hash = xxh64(body_data, 0);
+    let expected_hex = format!("{:016x}", expected_hash);
+
+    let body_stream: web_service::BodyStream = Box::pin(stream::iter(vec![
+        Ok(Bytes::from(&body_data[..14])), // "Hello from the"
+        Ok(Bytes::from(&body_data[14..])), // " Router test!"
+    ]));
+
+    // Call route_body - this is what H1/H2/H3 handlers call
+    let response = router.route_body(req, body_stream).await.unwrap();
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body.unwrap(), Bytes::from(expected_hex));
+}
+
+/// Test multiple concurrent requests through the Router
+#[tokio::test]
+async fn test_router_concurrent_requests() {
+    let config = UploadResponseConfig {
+        num_streams: 10,
+        slot_size_kb: 64,
+        slots_per_stream: 100,
+        response_timeout_ms: 5000,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+    let router = Arc::new(UploadResponseRouter::new(service.clone()));
+
+    // Start response watcher
+    let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
+    let _watcher_handle = watcher.spawn();
+
+    // Start multi-stream worker
+    let worker_service = service.clone();
+    let _worker_handle = tokio::spawn(async move {
+        run_multi_stream_worker(worker_service).await;
+    });
+
+    // Spawn 5 concurrent requests
+    let mut handles = Vec::new();
+
+    for i in 0..5 {
+        let router = router.clone();
+        let handle = tokio::spawn(async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/upload/{}", i))
+                .body(())
+                .unwrap();
+
+            let body_data = format!("Request body {}", i);
+            let expected_hash = xxh64(body_data.as_bytes(), 0);
+            let expected_hex = format!("{:016x}", expected_hash);
+
+            let body_stream: web_service::BodyStream =
+                Box::pin(stream::iter(vec![Ok(Bytes::from(body_data))]));
+
+            let response = router.route_body(req, body_stream).await.unwrap();
+
+            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(response.body.unwrap(), Bytes::from(expected_hex));
+            i
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all requests to complete
+    let mut completed = Vec::new();
+    for handle in handles {
+        completed.push(handle.await.unwrap());
+    }
+
+    // All 5 requests completed
+    assert_eq!(completed.len(), 5);
+    println!("\n5 concurrent Router requests completed successfully\n");
 }
