@@ -213,18 +213,18 @@ Upload size: 512 MB
 
 Benchmarks with real servers measuring client send time:
 
-| Protocol | Throughput | Notes |
-|----------|------------|-------|
-| WSS | 917 MB/s | Binary frames with minimal framing overhead |
-| HTTP/1.1 (chunked) | 795 MB/s | Streaming without Content-Length |
-| RTMP | 428 MB/s | TCP framing with AccessUnit serialization |
-| HTTP/2 | 674 MB/s | Multiplexing overhead, concurrent streams |
-| WebRTC | 195 MB/s | SCTP queue speed (send is non-blocking) |
-| HTTP/1.1 | 621 MB/s | Requires Content-Length |
-| HTTP/3 | 192 MB/s | QUIC encryption overhead |
-| SRT | 149 MB/s | Reliable UDP with ARQ |
+| Protocol | Throughput | TLS | Notes |
+|----------|------------|-----|-------|
+| WebSocket | 917 MB/s | Yes | Binary frames, minimal overhead |
+| HTTP/1.1 (chunked) | 795 MB/s | Yes | Streaming without Content-Length |
+| HTTP/2 | 674 MB/s | Yes | Multiplexing overhead |
+| HTTP/1.1 | 621 MB/s | Yes | Requires Content-Length |
+| RTMP | 428 MB/s | No | Plain TCP, AccessUnit serialization |
+| WebRTC | 195 MB/s | Yes | DTLS, SCTP queue speed |
+| HTTP/3 | 192 MB/s | Yes | QUIC encryption overhead |
+| SRT | 149 MB/s | No | Reliable UDP with ARQ |
 
-Note: HTTP protocols measure end-to-end (wait for response). SRT/RTMP/WebRTC measure client send completion.
+Note: HTTP/WebSocket protocols measure end-to-end (wait for response). SRT/RTMP/WebRTC measure client send completion.
 
 ### High-Throughput Modes
 
