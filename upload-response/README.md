@@ -72,6 +72,40 @@ Each request/response stream uses a simple slot-based format:
 - **Body slots**: Raw bytes, zero-copy from cache
 - **End marker**: Empty slot signals stream completion
 
+### RTMP Payload Format
+
+RTMP streams serialize **AccessUnits** (parsed video/audio frames) to the cache:
+
+```
+[stream_type:1][key:1][id:8][dts:8][pts:8][data_len:4][data:N]
+```
+
+| Field | Size | Description |
+|-------|------|-------------|
+| `stream_type` | 1 byte | `0x1b` = H.264 video, `0x0f` = AAC audio |
+| `key` | 1 byte | `1` = keyframe, `0` = non-key |
+| `id` | 8 bytes | Sequential frame counter (big-endian) |
+| `dts` | 8 bytes | Decode timestamp (big-endian) |
+| `pts` | 8 bytes | Presentation timestamp (big-endian) |
+| `data_len` | 4 bytes | Payload length (big-endian) |
+| `data` | N bytes | Video: Annex-B NALUs, Audio: AAC+ADTS |
+
+Use `rtmp-ingress` with the `upload-response` feature:
+
+```rust
+use rtmp_ingress::upload::{RtmpUploadIngest, deserialize_access_unit};
+
+let rtmp = RtmpUploadIngest::new(service.clone());
+rtmp.start(addr).await?;
+
+// Workers deserialize AccessUnits from body slots
+let (au, bytes_consumed) = deserialize_access_unit(&data)?;
+```
+
+### SRT Payload Format
+
+SRT streams write raw bytes directly to the cache (no framing). Workers receive the exact bytes sent by the SRT client.
+
 ## Configuration
 
 ```rust
