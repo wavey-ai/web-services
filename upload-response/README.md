@@ -1,15 +1,6 @@
-<div align="center">
-
 # upload-response
 
-High-performance streaming request/response proxy via shared-memory cache
-
-[![Rust](https://img.shields.io/badge/rust-1.75+-ff6b9d.svg?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Throughput](https://img.shields.io/badge/throughput-1.4_GB/s-ff6b9d.svg?style=flat-square)](/)
-
-</div>
-
----
+A high-performance request/response proxy service that streams HTTP requests into a shared-memory cache for external workers to process, then returns responses back to clients.
 
 ## Architecture
 
@@ -19,23 +10,27 @@ Client Request (H1.1/H2/H3)
        ▼
 ┌─────────────────────────┐
 │  UploadResponseRouter   │
+│  (implements Router)    │
 └───────────┬─────────────┘
             │
             ▼
 ┌─────────────────────────┐
 │  Request ChunkCache     │  ◄── Worker tails slots
 │  ┌─────┬─────┬─────┐    │
+│  │Slot1│Slot2│...  │    │
 │  │HPKS │Body │Body │    │
 │  │Hdrs │Bytes│Bytes│    │
 │  └─────┴─────┴─────┘    │
 └─────────────────────────┘
             │
+            │ Worker processes request
             ▼
 ┌─────────────────────────┐
 │  Response ChunkCache    │  ◄── Worker writes response
 │  ┌─────┬─────┬─────┐    │
-│  │HPKS │Body │Empty│    │
-│  │Hdrs │Bytes│(END)│    │
+│  │Slot1│Slot2│Empty│    │
+│  │HPKS │Body │(END)│    │
+│  │Hdrs │Bytes│     │    │
 │  └─────┴─────┴─────┘    │
 └───────────┬─────────────┘
             │
@@ -48,57 +43,154 @@ Client Request (H1.1/H2/H3)
 
 ## Stream Format
 
+Each request/response stream uses a simple slot-based format:
+
 | Slot | Content |
-|:-----|:--------|
-| `1` | HPKS Headers frame |
-| `2..N-1` | Raw body bytes |
-| `N` | Empty slot (end marker) |
+|------|---------|
+| 1 | HPKS Headers frame (method, path, headers) |
+| 2..N-1 | Raw body bytes (no framing overhead) |
+| N | Empty slot (end marker) |
+
+- **HPKS**: HTTP-pack streaming format for headers
+- **Body slots**: Raw bytes, zero-copy from cache
+- **End marker**: Empty slot signals stream completion
 
 ## Configuration
 
 ```rust
+use upload_response::{UploadResponseConfig, UploadResponseService};
+
 let config = UploadResponseConfig {
     num_streams: 100,         // Max concurrent requests
-    slot_size_kb: 64,         // 64KB per slot
+    slot_size_kb: 64,         // 64KB per slot (default)
     slots_per_stream: 16384,  // ~1GB max per request
     response_timeout_ms: 30000,
 };
+
+let service = UploadResponseService::new(config);
+```
+
+### Slot Size Selection
+
+| Slot Size | Throughput | Use Case |
+|-----------|------------|----------|
+| 16 KB | ~1400 MB/s | Many small requests |
+| 64 KB | ~1390 MB/s | **Default** - good balance |
+| 128-512 KB | ~1410-1430 MB/s | Large uploads |
+| 1+ MB | ~1300 MB/s | Slight performance drop |
+
+64KB is the default as it provides excellent throughput while keeping slot count reasonable for large uploads.
+
+## Worker Integration
+
+Workers consume requests by tailing the request cache:
+
+```rust
+use upload_response::{TailSlot, UploadResponseService};
+
+async fn process_requests(service: Arc<UploadResponseService>, stream_id: u64) {
+    let mut slot_id = 0;
+
+    loop {
+        // Wait for new slot
+        let current = service.request_last(stream_id).unwrap_or(0);
+        if current <= slot_id {
+            tokio::time::sleep(Duration::from_micros(100)).await;
+            continue;
+        }
+
+        slot_id += 1;
+
+        match service.tail_request(stream_id, slot_id).await {
+            Some(TailSlot::Headers(h)) => {
+                // h.method, h.path, h.headers
+            }
+            Some(TailSlot::Body(data)) => {
+                // Process body chunk (zero-copy Bytes)
+            }
+            Some(TailSlot::End) => {
+                // Request complete, write response
+                write_response(service, stream_id, result).await;
+                break;
+            }
+            None => {}
+        }
+    }
+}
+
+async fn write_response(
+    service: Arc<UploadResponseService>,
+    stream_id: u64,
+    body: Bytes,
+) {
+    let headers = StreamHeaders::Response(StreamResponseHeaders {
+        stream_id,
+        version: HttpVersion::Http11,
+        status: 200,
+        headers: vec![],
+    });
+
+    service.write_response_headers(stream_id, headers).await.unwrap();
+    service.append_response_body(stream_id, body).await.unwrap();
+    service.end_response(stream_id).await.unwrap();
+}
 ```
 
 ## Performance
 
-```
-┌─────────────┬──────────────┬──────────────┐
-│  Slot Size  │  Throughput  │  Slots Used  │
-├─────────────┼──────────────┼──────────────┤
-│      16 KB  │   1397 MB/s  │       32768  │
-│      64 KB  │   1390 MB/s  │        8192  │
-│     512 KB  │   1430 MB/s  │        1024  │
-│    1024 KB  │   1322 MB/s  │         512  │
-└─────────────┴──────────────┴──────────────┘
+Benchmarked on Apple Silicon (M-series):
 
-1GB Upload: ~1390 MB/s @ 64KB slots
+```
+=== Slot Size Throughput Benchmark ===
+Upload size: 512 MB
+   Slot Size |   Throughput |   Slots Used
+-------------+--------------+-------------
+        16 KB |    1397 MB/s |        32768
+        32 KB |    1374 MB/s |        16384
+        64 KB |    1390 MB/s |         8192
+       100 KB |    1424 MB/s |         5242
+       128 KB |    1412 MB/s |         4096
+       256 KB |    1411 MB/s |         2048
+       512 KB |    1430 MB/s |         1024
+       768 KB |    1418 MB/s |          682
+      1024 KB |    1322 MB/s |          512
+      2048 KB |    1307 MB/s |          256
 ```
 
-## Worker Integration
+### 1GB Upload Test
 
-```rust
-match service.tail_request(stream_id, slot_id).await {
-    Some(TailSlot::Headers(h)) => { /* method, path, headers */ }
-    Some(TailSlot::Body(data)) => { /* zero-copy Bytes */ }
-    Some(TailSlot::End) => { /* write response */ }
-    None => {}
-}
 ```
+Upload size: 1024 MB
+Slot size: 64 KB
+Total slots: 16384
+Throughput: ~1390 MB/s
+```
+
+The ChunkCache operates at near memory-bandwidth speeds (~1.4 GB/s) due to:
+
+- Pre-allocated ring buffers (no malloc per write)
+- Per-slot RwLock (fine-grained locking)
+- Zero-copy reads via `Bytes::slice()`
+- 12-byte overhead per slot (4-byte length + 8-byte xxhash)
 
 ## Testing
 
 ```bash
+# Run all tests
+cargo test -p upload-response
+
+# Run benchmarks (release mode recommended)
 cargo test -p upload-response --release -- --nocapture
+
+# Specific benchmark tests
+cargo test -p upload-response --release test_slot_size_benchmark -- --nocapture
+cargo test -p upload-response --release test_gigabyte_upload_benchmark -- --nocapture
 ```
 
----
+## Dependencies
 
-<div align="center">
-<sub>Built with 🩷 by <a href="https://github.com/wavey-ai">wavey.ai</a></sub>
-</div>
+- `web-service` - HTTP server traits (Router, StreamWriter)
+- `playlists` - ChunkCache shared-memory ring buffer
+- `http-pack` - HPKS streaming HTTP format
+- `tokio` - Async runtime
+- `bytes` - Zero-copy byte buffers
