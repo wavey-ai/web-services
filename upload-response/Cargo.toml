@@ -23,6 +23,11 @@ matchbox_socket = { git = "ssh://git@github.com/wavey-ai/matchbox", branch = "fe
 futures-timer = "3"
 futures = "0.3"
 
+# TCP+TLS
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+
 [dev-dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "http2", "stream"] }

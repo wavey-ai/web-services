@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::time::{interval, Duration};
 use upload_response::{
-    AllowAllEncrypted, ResponseWatcher, SrtIngest, TailSlot, UploadResponseConfig,
+    AllowAllEncrypted, ResponseWatcher, SrtIngest, TailSlot, TcpIngest, UploadResponseConfig,
     UploadResponseRouter, UploadResponseService, WebRtcIngest,
 };
 use web_service::{H2H3Server, Server, ServerBuilder};
@@ -799,6 +799,150 @@ async fn test_srt_encrypted_100mb() {
     println!("=========================================\n");
 
     assert!(passed, "SRT (encrypted) test failed");
+    let _ = shutdown_tx.send(());
+}
+
+// ============== TCP+TLS Tests ==============
+
+async fn setup_tcp_server(
+    port: u16,
+    upload_size_mb: usize,
+    cert_b64: &str,
+    key_b64: &str,
+) -> (Arc<UploadResponseService>, tokio::sync::watch::Sender<()>) {
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+    let num_slots = upload_size_bytes / (SLOT_SIZE_KB * 1024) + 100;
+
+    let config = UploadResponseConfig {
+        num_streams: 10,
+        slot_size_kb: SLOT_SIZE_KB,
+        slots_per_stream: num_slots,
+        response_timeout_ms: 600_000,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+
+    let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
+    let _watcher_handle = watcher.spawn();
+
+    let worker_service = service.clone();
+    tokio::spawn(async move {
+        run_worker(worker_service).await;
+    });
+
+    let cert_pem = from_base64_raw(cert_b64).expect("decode cert");
+    let key_pem = from_base64_raw(key_b64).expect("decode key");
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let tcp_ingest = TcpIngest::new(service.clone());
+    let shutdown_tx = tcp_ingest
+        .start(addr, &cert_pem, &key_pem)
+        .await
+        .expect("start TCP+TLS server");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    (service, shutdown_tx)
+}
+
+async fn run_tcp_upload_test(
+    _service: Arc<UploadResponseService>,
+    port: u16,
+    upload_size_mb: usize,
+) -> (f64, bool) {
+    ensure_rustls_provider();
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+
+    println!("Generating {} MB test data for TCP+TLS...", upload_size_mb);
+    let gen_start = Instant::now();
+    let (data, _expected_hash) = generate_test_data(upload_size_bytes);
+    println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
+
+    let addr = format!("127.0.0.1:{}", port);
+
+    println!("Uploading {} MB via TCP+TLS...", upload_size_mb);
+    let start = Instant::now();
+
+    // Connect via TCP
+    let tcp_stream = match TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("TCP connect failed: {}", e);
+            return (0.0, false);
+        }
+    };
+
+    // Wrap with TLS
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+    let mut stream = match connector.connect(server_name, tcp_stream).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("TCP TLS handshake failed: {}", e);
+            return (0.0, false);
+        }
+    };
+
+    // Send all data
+    const CHUNK_SIZE: usize = 64 * 1024;
+    for chunk in data.chunks(CHUNK_SIZE) {
+        if let Err(e) = stream.write_all(chunk).await {
+            println!("TCP write failed: {}", e);
+            return (0.0, false);
+        }
+    }
+
+    // Shutdown write side to signal end
+    if let Err(e) = stream.shutdown().await {
+        println!("TCP shutdown failed: {}", e);
+        return (0.0, false);
+    }
+
+    let total_elapsed = start.elapsed();
+    let throughput = upload_size_mb as f64 / total_elapsed.as_secs_f64();
+
+    println!(
+        "TCP+TLS: {:.2}s ({:.1} MB/s)",
+        total_elapsed.as_secs_f64(),
+        throughput
+    );
+
+    let passed = true;
+    if passed {
+        println!("TCP+TLS PASSED\n");
+    } else {
+        println!("TCP+TLS FAILED\n");
+    }
+
+    (throughput, passed)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_tcp_tls_100mb() {
+    ensure_rustls_provider();
+
+    let (cert_b64, key_b64) = match load_test_env() {
+        Some(v) => v,
+        None => {
+            eprintln!("Skipping: TLS_CERT_BASE64 and TLS_KEY_BASE64 env vars required");
+            return;
+        }
+    };
+
+    let port = pick_unused_port().expect("pick port");
+    let (service, shutdown_tx) = setup_tcp_server(port, 100, &cert_b64, &key_b64).await;
+
+    println!("\n=== TCP+TLS 100MB Upload Test ===");
+    let (throughput, passed) = run_tcp_upload_test(service, port, 100).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("=================================\n");
+
+    assert!(passed, "TCP+TLS test failed");
     let _ = shutdown_tx.send(());
 }
 

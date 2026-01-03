@@ -8,6 +8,7 @@ The shared-memory ChunkCache and slot-based streaming architecture are inspired 
 
 | Protocol | Transport | Encryption | Auth | Notes |
 |----------|-----------|------------|------|-------|
+| TCP | TCP | TLS | mTLS | Raw bytes, minimal overhead |
 | HTTP/1.1 | TCP | TLS | Bearer | Content-Length or chunked |
 | HTTP/2 | TCP | TLS | Bearer | Multiplexed streams |
 | HTTP/3 | UDP | QUIC | Bearer | Low latency |
@@ -218,7 +219,8 @@ Benchmarks with real servers measuring client send time:
 
 | Protocol | Throughput | Notes |
 |----------|------------|-------|
-| WebSocket | 917 MB/s | Binary frames, minimal overhead |
+| TCP | 978 MB/s | Raw TLS, minimal overhead |
+| WebSocket | 917 MB/s | Binary frames |
 | HTTP/1.1 (chunked) | 795 MB/s | Streaming without Content-Length |
 | RTMP | 750 MB/s | Plain TCP, AccessUnit serialization |
 | HTTP/2 | 674 MB/s | Multiplexing overhead |

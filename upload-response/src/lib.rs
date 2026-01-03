@@ -31,6 +31,9 @@ pub use srt::{AllowAll, AllowAllEncrypted, SrtAuth, SrtIngest};
 mod webrtc;
 pub use webrtc::{AllowAllWebRtc, WebRtcAuth, WebRtcIngest};
 
+mod tcp;
+pub use tcp::{AllowAllTcp, RequireClientCert, TcpAuth, TcpIngest};
+
 // For RTMP support, use rtmp-ingress with the "upload-response" feature:
 // rtmp-ingress = { ..., features = ["upload-response"] }
 // use rtmp_ingress::upload::{RtmpUploadIngest, RtmpAuth, AllowAll};
