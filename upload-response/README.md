@@ -2,10 +2,6 @@
 
 A high-performance request/response proxy service that streams requests into a shared-memory cache for external workers to process, then returns responses back to clients.
 
-## Architecture Notes
-
-The shared-memory ChunkCache and slot-based streaming architecture are inspired by Low-Latency HLS (LL-HLS) partial segment delivery patterns. See [wavey-ai/hls](https://github.com/wavey-ai/hls) for the related HLS implementation.
-
 ## Supported Protocols
 
 | Protocol | Transport | Encryption | Auth | Notes |
