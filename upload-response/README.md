@@ -163,17 +163,17 @@ Upload size: 512 MB
       2048 KB |    1307 MB/s |          256
 ```
 
-### Protocol Throughput (512 MB Upload)
+### Protocol Throughput (1 GB Upload)
 
 End-to-end benchmarks with real HTTP servers (TLS + protocol overhead):
 
 | Protocol | Throughput | Notes |
 |----------|------------|-------|
-| WSS      | 910 MB/s | WebSocket binary frames |
-| HTTP/1.1 (chunked) | 780 MB/s | Transfer-Encoding: chunked |
-| HTTP/2   | 663 MB/s | Single stream |
-| HTTP/1.1 | 658 MB/s | Content-Length |
-| HTTP/3   | 228 MB/s | QUIC/UDP |
+| WSS      | 902 MB/s | WebSocket binary frames |
+| HTTP/1.1 (chunked) | 782 MB/s | Transfer-Encoding: chunked |
+| HTTP/1.1 | 671 MB/s | Content-Length |
+| HTTP/2   | 668 MB/s | Single stream |
+| HTTP/3   | 226 MB/s | QUIC/UDP |
 
 **Why is WSS fastest?**
 

@@ -783,3 +783,41 @@ async fn test_protocol_comparison() {
     assert!(h1_passed && h1c_passed && h2_passed && h3_passed && wss_passed, "Protocol tests failed");
     let _ = shutdown_tx.send(());
 }
+
+/// Compare all protocols at 1GB
+#[tokio::test(flavor = "multi_thread")]
+async fn test_protocol_comparison_1gb() {
+    let (cert_b64, key_b64) = match load_test_env() {
+        Some(v) => v,
+        None => {
+            eprintln!("Skipping: TLS_CERT_BASE64 and TLS_KEY_BASE64 env vars required");
+            return;
+        }
+    };
+
+    let port = pick_unused_port().expect("pick port");
+    let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 1024).await;
+
+    println!("\n========================================");
+    println!("    Protocol Comparison (1 GB)");
+    println!("========================================\n");
+
+    let (h1_throughput, h1_passed) = run_upload_test(port, 1024, false).await;
+    let (h1c_throughput, h1c_passed) = run_upload_test_chunked(port, 1024).await;
+    let (h2_throughput, h2_passed) = run_upload_test(port, 1024, true).await;
+    let (h3_throughput, h3_passed) = run_h3_upload_test(port, 1024, &cert_b64, &key_b64).await;
+    let (wss_throughput, wss_passed) = run_wss_upload_test(port, 1024, &cert_b64, &key_b64).await;
+
+    println!("========================================");
+    println!("    Results Summary (1 GB)");
+    println!("========================================");
+    println!("HTTP/1.1:           {:.1} MB/s {}", h1_throughput, if h1_passed { "✓" } else { "✗" });
+    println!("HTTP/1.1 (chunked): {:.1} MB/s {}", h1c_throughput, if h1c_passed { "✓" } else { "✗" });
+    println!("HTTP/2:             {:.1} MB/s {}", h2_throughput, if h2_passed { "✓" } else { "✗" });
+    println!("HTTP/3:             {:.1} MB/s {}", h3_throughput, if h3_passed { "✓" } else { "✗" });
+    println!("WSS:                {:.1} MB/s {}", wss_throughput, if wss_passed { "✓" } else { "✗" });
+    println!("========================================\n");
+
+    assert!(h1_passed && h1c_passed && h2_passed && h3_passed && wss_passed, "Protocol tests failed");
+    let _ = shutdown_tx.send(());
+}
