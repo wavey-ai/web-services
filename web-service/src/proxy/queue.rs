@@ -3,18 +3,18 @@ use bytes::Bytes;
 use http::StatusCode;
 use http_pack::packetizer::HttpPackStreamMessage;
 use http_pack::stream::StreamFrame;
-use playlists::fmp4_cache::Fmp4Cache;
+use playlists::chunk_cache::ChunkCache;
 use playlists::Options;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::debug;
 
-/// Queue manager using Fmp4Cache for request/response buffering
+/// Queue manager using ChunkCache for request/response buffering
 pub struct ProxyQueue {
     num_workers: usize,
-    request_queue: Arc<Fmp4Cache>,
-    response_queue: Arc<Fmp4Cache>,
+    request_queue: Arc<ChunkCache>,
+    response_queue: Arc<ChunkCache>,
     request_stream_idx: usize,
     response_stream_idx: usize,
     request_write_lock: Mutex<()>,
@@ -49,8 +49,8 @@ impl ProxyQueue {
         options.max_parts_per_segment = max_slots;
         options.buffer_size_kb = slot_kb;
 
-        let request_queue = Arc::new(Fmp4Cache::new(options));
-        let response_queue = Arc::new(Fmp4Cache::new(options));
+        let request_queue = Arc::new(ChunkCache::new(options));
+        let response_queue = Arc::new(ChunkCache::new(options));
 
         // Use stream ID 0 for requests, 1 for responses
         let request_stream_idx = 0;

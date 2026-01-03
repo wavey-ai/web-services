@@ -3,7 +3,7 @@ use base64::Engine;
 use bytes::Bytes;
 use http_pack::packetizer::HttpPackStreamMessage;
 use http_pack::stream::{Http1StreamRebuilder, StreamDecoder, StreamFrame};
-use playlists::fmp4_cache::Fmp4Cache;
+use playlists::chunk_cache::ChunkCache;
 use playlists::Options as PlaylistOptions;
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig};
 use rustls::pki_types::CertificateDer;
@@ -54,8 +54,8 @@ impl std::error::Error for QuicRelayError {}
 #[derive(Clone)]
 pub struct RelayBuffers {
     slots: usize,
-    requests: Arc<Fmp4Cache>,
-    responses: Arc<Fmp4Cache>,
+    requests: Arc<ChunkCache>,
+    responses: Arc<ChunkCache>,
 }
 
 impl RelayBuffers {
@@ -653,7 +653,7 @@ fn start_backend_sender(pool: Arc<BackendConnectionPool>, stream_id: u64) -> mps
     tx
 }
 
-fn build_cache(slots: usize) -> Fmp4Cache {
+fn build_cache(slots: usize) -> ChunkCache {
     let options = PlaylistOptions {
         num_playlists: slots,
         max_segments: BUFFER_MAX_SEGMENTS,
@@ -663,7 +663,7 @@ fn build_cache(slots: usize) -> Fmp4Cache {
         buffer_size_kb: BUFFER_SIZE_KB,
         init_size_kb: BUFFER_INIT_KB,
     };
-    Fmp4Cache::new(options)
+    ChunkCache::new(options)
 }
 
 fn slot_for_stream_id(stream_id: u64, slots: usize) -> usize {

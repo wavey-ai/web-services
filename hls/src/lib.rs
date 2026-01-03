@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Method, Request, StatusCode};
-use playlists::fmp4_cache::Fmp4Cache;
+use playlists::chunk_cache::ChunkCache;
 use playlists::m3u8_cache::M3u8Cache;
 use regex::Regex;
 use std::{collections::HashMap, sync::Arc};
@@ -46,9 +46,9 @@ impl HlsRouter {
         self.websocket_handlers.push(handler);
         self
     }
-    pub fn with_websocket_tail(mut self, fmp4_cache: Arc<Fmp4Cache>) -> Self {
+    pub fn with_websocket_tail(mut self, chunk_cache: Arc<ChunkCache>) -> Self {
         self.websocket_handlers
-            .push(Box::new(streaming::TailWebSocketHandler::new(fmp4_cache)));
+            .push(Box::new(streaming::TailWebSocketHandler::new(chunk_cache)));
         self
     }
     fn parse_path(path: &str) -> Vec<&str> {
@@ -110,13 +110,13 @@ impl Router for HlsRouter {
 
 /// Main HLS handler
 pub struct HlsHandler {
-    fmp4_cache: Arc<Fmp4Cache>,
+    chunk_cache: Arc<ChunkCache>,
     m3u8_cache: Arc<M3u8Cache>,
 }
 impl HlsHandler {
-    pub fn new(fmp4_cache: Arc<Fmp4Cache>, m3u8_cache: Arc<M3u8Cache>) -> Self {
+    pub fn new(chunk_cache: Arc<ChunkCache>, m3u8_cache: Arc<M3u8Cache>) -> Self {
         Self {
-            fmp4_cache,
+            chunk_cache,
             m3u8_cache,
         }
     }
@@ -199,7 +199,7 @@ impl HlsHandler {
         self.m3u8_cache.get(sid, idx, 0).unwrap_or(None)
     }
     async fn get_part(&self, idx: u64, part: usize) -> Option<(Bytes, u64)> {
-        self.fmp4_cache.get(idx as usize, part).await
+        self.chunk_cache.get(idx as usize, part).await
     }
 }
 #[async_trait]
@@ -288,7 +288,7 @@ impl RequestHandler for HlsHandler {
                     }
                 } else if file.starts_with('p') {
                     if let Some(id) = Self::extract_id(file) {
-                        if let Some(idx) = self.fmp4_cache.get_stream_idx(sid).await {
+                        if let Some(idx) = self.chunk_cache.get_stream_idx(sid).await {
                             if let Some(d) = self.get_part(idx as u64, id).await {
                                 Ok(HandlerResponse {
                                     status: StatusCode::OK,

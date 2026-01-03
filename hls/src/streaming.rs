@@ -5,7 +5,7 @@ use h3_quinn::Connection as QuinnConnection;
 use h3_webtransport::server::WebTransportSession;
 use http::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use playlists::fmp4_cache::Fmp4Cache;
+use playlists::chunk_cache::ChunkCache;
 use std::sync::Arc;
 use tokio::time::{Duration, Instant, sleep};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
@@ -19,12 +19,12 @@ use xmpegts::ts::TsMuxer;
 
 /// Tail streaming handler
 pub struct TailStreamHandler {
-    fmp4_cache: Arc<Fmp4Cache>,
+    chunk_cache: Arc<ChunkCache>,
 }
 
 impl TailStreamHandler {
-    pub fn new(fmp4_cache: Arc<Fmp4Cache>) -> Self {
-        Self { fmp4_cache }
+    pub fn new(chunk_cache: Arc<ChunkCache>) -> Self {
+        Self { chunk_cache }
     }
 }
 
@@ -43,12 +43,12 @@ impl StreamingHandler for TailStreamHandler {
             .parse::<u64>()
             .map_err(|_| ServerError::Config("Invalid stream ID".into()))?;
         let idx = self
-            .fmp4_cache
+            .chunk_cache
             .get_stream_idx(stream_id)
             .await
             .ok_or(ServerError::Config("Stream not found".into()))?;
         let mut last = self
-            .fmp4_cache
+            .chunk_cache
             .last(idx)
             .ok_or(ServerError::Config("No data available for stream".into()))?;
         info!("{} [{}] last sequence is {}", stream_id, idx, last);
@@ -88,7 +88,7 @@ impl TailStreamHandler {
         let interval = Duration::from_millis(1);
 
         while start.elapsed() < timeout {
-            if let Some(d) = self.fmp4_cache.get(idx, id).await {
+            if let Some(d) = self.chunk_cache.get(idx, id).await {
                 return Some(d.clone());
             }
             sleep(interval).await;
@@ -99,12 +99,12 @@ impl TailStreamHandler {
 
 /// WebTransport streaming handler for HLS
 pub struct HlsWebTransportHandler {
-    fmp4_cache: Arc<Fmp4Cache>,
+    chunk_cache: Arc<ChunkCache>,
 }
 
 impl HlsWebTransportHandler {
-    pub fn new(fmp4_cache: Arc<Fmp4Cache>) -> Self {
-        Self { fmp4_cache }
+    pub fn new(chunk_cache: Arc<ChunkCache>) -> Self {
+        Self { chunk_cache }
     }
 }
 
@@ -114,13 +114,13 @@ impl WebTransportHandler for HlsWebTransportHandler {
         &self,
         session: WebTransportSession<QuinnConnection, Bytes>,
     ) -> HandlerResult<()> {
-        handle_transport_session(session, Arc::clone(&self.fmp4_cache)).await
+        handle_transport_session(session, Arc::clone(&self.chunk_cache)).await
     }
 }
 
 async fn handle_transport_session(
     session: WebTransportSession<QuinnConnection, Bytes>,
-    fmp4_cache: Arc<Fmp4Cache>,
+    chunk_cache: Arc<ChunkCache>,
 ) -> HandlerResult<()> {
     let mut muxer = TsMuxer::new();
 
@@ -152,9 +152,9 @@ async fn handle_transport_session(
         }
         let stream_id_u64 = buf.get_u64();
         let stream_idx = stream_id_u64 as usize;
-        let mut last = fmp4_cache.last(stream_idx).unwrap_or(0);
+        let mut last = chunk_cache.last(stream_idx).unwrap_or(0);
 
-        while let Some((data, _seq)) = fmp4_cache.get(stream_idx, last).await {
+        while let Some((data, _seq)) = chunk_cache.get(stream_idx, last).await {
             // 2) Mux to TS, logging + returning on error
             if let Err(e) = muxer.write(pid, 0, 0, 0, BytesMut::from(data)) {
                 error!("TS muxer write error: {:?}", e);
@@ -188,12 +188,12 @@ async fn handle_transport_session(
 
 /// WebSocket tail handler (binary frames carrying fMP4 parts)
 pub struct TailWebSocketHandler {
-    fmp4_cache: Arc<Fmp4Cache>,
+    chunk_cache: Arc<ChunkCache>,
 }
 
 impl TailWebSocketHandler {
-    pub fn new(fmp4_cache: Arc<Fmp4Cache>) -> Self {
-        Self { fmp4_cache }
+    pub fn new(chunk_cache: Arc<ChunkCache>) -> Self {
+        Self { chunk_cache }
     }
 }
 
@@ -219,11 +219,11 @@ impl WebSocketHandler for TailWebSocketHandler {
             .map_err(|_| ServerError::Config("Invalid stream ID".into()))?;
 
         let idx = self
-            .fmp4_cache
+            .chunk_cache
             .get_stream_idx(stream_id)
             .await
             .ok_or(ServerError::Config("Stream not found".into()))?;
-        let mut last = self.fmp4_cache.last(idx).unwrap_or(0);
+        let mut last = self.chunk_cache.last(idx).unwrap_or(0);
 
         loop {
             match tokio::time::timeout(Duration::from_millis(1), stream.next()).await {
@@ -237,7 +237,7 @@ impl WebSocketHandler for TailWebSocketHandler {
                 Err(_) => {}
             }
 
-            if let Some((data, _)) = self.fmp4_cache.get(idx, last).await {
+            if let Some((data, _)) = self.chunk_cache.get(idx, last).await {
                 if let Err(e) = stream.send(Message::Binary(data)).await {
                     return Err(ServerError::Handler(Box::new(e)));
                 }

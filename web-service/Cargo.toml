@@ -32,12 +32,10 @@ rustls = { version = "0.23.35", default-features = false, features = [
 webpki-roots = "0.26"
 h2 = "0.4"
 xxhash-rust = { version = "0.8.10", features = ["xxh3", "const_xxh3"] }
-h3 = { git = "https://github.com/hyperium/h3.git" }
-h3-quinn = { git = "https://github.com/hyperium/h3.git", features = [
-  "datagram",
-] }
-h3-webtransport = { git = "https://github.com/hyperium/h3.git" }
-h3-datagram = { git = "https://github.com/hyperium/h3.git" }
+h3 = "0.0.8"
+h3-quinn = { version = "0.0.10", features = ["datagram"] }
+h3-webtransport = "0.1.2"
+h3-datagram = "0.0.2"
 playlists = { path = "../../playlists" }
 tls-helpers = { git = "https://github.com/wavey-ai/tls-helpers.git" }
 xmpegts = { git = "https://github.com/wavey-ai/xiu" }

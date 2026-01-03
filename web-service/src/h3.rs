@@ -15,6 +15,9 @@ use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
 use tokio::sync::{watch, Mutex};
 
+// Stay below the 16,384-byte QUIC varint boundary to avoid 4-byte length encodings.
+const H3_MAX_DATA_CHUNK: usize = 16 * 1024 - 1;
+
 pub struct Http3Server {
     config: ServerConfig,
     router: Arc<dyn Router>,
@@ -34,10 +37,28 @@ impl StreamWriter for H3StreamWriter {
     }
 
     async fn send_data(&mut self, data: Bytes) -> Result<(), ServerError> {
-        self.stream
-            .send_data(data)
-            .await
-            .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))
+        if data.len() <= H3_MAX_DATA_CHUNK {
+            return self.stream
+                .send_data(data)
+                .await
+                .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))));
+        }
+
+        let mut remaining = data;
+        while remaining.len() > H3_MAX_DATA_CHUNK {
+            let chunk = remaining.split_to(H3_MAX_DATA_CHUNK);
+            self.stream
+                .send_data(chunk)
+                .await
+                .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))?;
+        }
+        if !remaining.is_empty() {
+            self.stream
+                .send_data(remaining)
+                .await
+                .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))?;
+        }
+        Ok(())
     }
 
     async fn finish(&mut self) -> Result<(), ServerError> {
@@ -45,6 +66,100 @@ impl StreamWriter for H3StreamWriter {
             .finish()
             .await
             .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))
+    }
+}
+
+/// Stream writer that uses a shared (mutex-protected) stream for bidirectional streaming
+pub struct H3SharedStreamWriter {
+    stream: Arc<Mutex<RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>>>,
+}
+
+#[async_trait::async_trait]
+impl StreamWriter for H3SharedStreamWriter {
+    async fn send_response(&mut self, response: Response<()>) -> Result<(), ServerError> {
+        let mut guard = self.stream.lock().await;
+        guard
+            .send_response(response)
+            .await
+            .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))
+    }
+
+    async fn send_data(&mut self, data: Bytes) -> Result<(), ServerError> {
+        let mut guard = self.stream.lock().await;
+        if data.len() <= H3_MAX_DATA_CHUNK {
+            return guard
+                .send_data(data)
+                .await
+                .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))));
+        }
+
+        let mut remaining = data;
+        while remaining.len() > H3_MAX_DATA_CHUNK {
+            let chunk = remaining.split_to(H3_MAX_DATA_CHUNK);
+            guard
+                .send_data(chunk)
+                .await
+                .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))?;
+        }
+        if !remaining.is_empty() {
+            guard
+                .send_data(remaining)
+                .await
+                .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))?;
+        }
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<(), ServerError> {
+        // Don't finish here - the caller will finish after route_body_stream returns
+        Ok(())
+    }
+}
+
+/// Stream writer using split send half for true bidirectional streaming without lock contention
+pub struct H3SplitStreamWriter {
+    stream: Arc<Mutex<RequestStream<h3_quinn::SendStream<Bytes>, Bytes>>>,
+}
+
+#[async_trait::async_trait]
+impl StreamWriter for H3SplitStreamWriter {
+    async fn send_response(&mut self, response: Response<()>) -> Result<(), ServerError> {
+        let mut guard = self.stream.lock().await;
+        guard
+            .send_response(response)
+            .await
+            .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))
+    }
+
+    async fn send_data(&mut self, data: Bytes) -> Result<(), ServerError> {
+        let mut guard = self.stream.lock().await;
+        if data.len() <= H3_MAX_DATA_CHUNK {
+            return guard
+                .send_data(data)
+                .await
+                .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))));
+        }
+
+        let mut remaining = data;
+        while remaining.len() > H3_MAX_DATA_CHUNK {
+            let chunk = remaining.split_to(H3_MAX_DATA_CHUNK);
+            guard
+                .send_data(chunk)
+                .await
+                .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))?;
+        }
+        if !remaining.is_empty() {
+            guard
+                .send_data(remaining)
+                .await
+                .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))?;
+        }
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<(), ServerError> {
+        // Don't finish here - the caller will finish after route_body_stream returns
+        Ok(())
     }
 }
 

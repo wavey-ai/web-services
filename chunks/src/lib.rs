@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Method, Request, StatusCode};
-use playlists::fmp4_cache::Fmp4Cache as Cache;
+use playlists::chunk_cache::ChunkCache as Cache;
 use regex::Regex;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep, timeout};
