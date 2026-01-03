@@ -194,17 +194,24 @@ For reference, ~250 MB/s is consistent with what others see in QUIC benchmarks. 
 
 ### Cache Throughput (In-Memory)
 
+Single-stream sequential writes:
 ```
 Upload size: 1024 MB
 Slot size: 64 KB
-Total slots: 16384
 Throughput: ~1390 MB/s
 ```
 
-The ChunkCache operates at near memory-bandwidth speeds (~1.4 GB/s) due to:
+Concurrent multi-stream (8 streams, 1 writer + 2 readers each):
+```
+Write:  1864 MB/s (29,827 ops/s)
+Read:   3966 MB/s (63,461 ops/s)
+Combined: 5830 MB/s
+```
+
+The ChunkCache operates at near memory-bandwidth speeds due to:
 
 - Pre-allocated ring buffers (no malloc per write)
-- Per-slot RwLock (fine-grained locking)
+- Per-slot RwLock (fine-grained locking, no cross-stream contention)
 - Zero-copy reads via `Bytes::slice()`
 - 12-byte overhead per slot (4-byte length + 8-byte xxhash)
 
