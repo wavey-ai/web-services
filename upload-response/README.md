@@ -167,6 +167,25 @@ End-to-end benchmarks with real HTTP servers (TLS + protocol overhead):
 | HTTP/2   | 659 MB/s | Single stream |
 | HTTP/3   | 242 MB/s | QUIC/UDP |
 
+**Why is HTTP/3 slower?**
+
+The HTTP/3 results are expected for current implementations. Several factors contribute to the lower throughput:
+
+1. **QUIC overhead**: HTTP/3 runs over QUIC/UDP which has more per-packet processing overhead than TCP. Each QUIC packet requires encryption/decryption and congestion control at the application layer.
+
+2. **Congestion control maturity**: TCP's congestion control has been optimized for decades. QUIC is newer and implementations are still being tuned for bulk transfer scenarios.
+
+3. **UDP socket performance**: The OS network stack is heavily optimized for TCP. UDP doesn't benefit from TSO/GSO offloading on many systems.
+
+4. **Local loopback testing**: QUIC's advantages (0-RTT, multiplexing, connection migration) don't show up in local benchmarks. Its real wins are on lossy networks where it outperforms TCP.
+
+5. **Not QUIC's sweet spot**: Large single-stream uploads aren't what QUIC was designed for. It excels at:
+   - Multiple parallel streams (avoids head-of-line blocking)
+   - High latency networks (0-RTT resume)
+   - Lossy/mobile networks (connection migration)
+
+For reference, ~250 MB/s is consistent with what others see in QUIC benchmarks. HTTP/3 will approach TCP speeds as implementations mature, but for bulk uploads over reliable local networks, TCP-based protocols (H1/H2) are expected to be faster.
+
 ### Cache Throughput (In-Memory)
 
 ```
