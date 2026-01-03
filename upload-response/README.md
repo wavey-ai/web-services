@@ -2,6 +2,10 @@
 
 A high-performance request/response proxy service that streams requests into a shared-memory cache for external workers to process, then returns responses back to clients.
 
+## Acknowledgements
+
+This crate is based on Low-Latency HLS (LL-HLS) concepts and adapted from the [wavey-ai/hls](https://github.com/wavey-ai/hls) codebase. The shared-memory ChunkCache and slot-based streaming architecture are derived from LL-HLS partial segment delivery patterns.
+
 ## Supported Protocols
 
 | Protocol | Transport | Encryption | Auth | Notes |
@@ -12,7 +16,8 @@ A high-performance request/response proxy service that streams requests into a s
 | WebSocket | TCP | TLS | Bearer | Binary frames |
 | WebRTC | UDP | DTLS | Signaling | Data channels, P2P capable |
 | SRT | UDP | AES-128 | Stream ID | Reliable UDP, media ingest |
-| RTMP | TCP | None | Stream key | Media ingest, AccessUnits |
+| RTMP | TCP | None | Stream key | Plain TCP, media ingest |
+| RTMPS | TCP | TLS | Stream key | TLS-wrapped RTMP |
 
 ## Architecture
 
@@ -213,16 +218,17 @@ Upload size: 512 MB
 
 Benchmarks with real servers measuring client send time:
 
-| Protocol | Throughput | Encryption | Notes |
-|----------|------------|------------|-------|
-| WebSocket | 917 MB/s | TLS | Binary frames, minimal overhead |
-| HTTP/1.1 (chunked) | 795 MB/s | TLS | Streaming without Content-Length |
-| HTTP/2 | 674 MB/s | TLS | Multiplexing overhead |
-| HTTP/1.1 | 621 MB/s | TLS | Requires Content-Length |
-| RTMP | 428 MB/s | None | Plain TCP, AccessUnit serialization |
-| WebRTC | 195 MB/s | DTLS | SCTP data channels |
-| HTTP/3 | 192 MB/s | QUIC | Built-in encryption |
-| SRT | 142 MB/s | AES-128 | Reliable UDP with ARQ |
+| Protocol | Throughput | Notes |
+|----------|------------|-------|
+| WebSocket | 917 MB/s | Binary frames, minimal overhead |
+| HTTP/1.1 (chunked) | 795 MB/s | Streaming without Content-Length |
+| RTMP | 750 MB/s | Plain TCP, AccessUnit serialization |
+| HTTP/2 | 674 MB/s | Multiplexing overhead |
+| RTMPS | 662 MB/s | TLS-wrapped RTMP |
+| HTTP/1.1 | 621 MB/s | Requires Content-Length |
+| WebRTC | 195 MB/s | DTLS, SCTP data channels |
+| HTTP/3 | 192 MB/s | QUIC encryption overhead |
+| SRT | 142 MB/s | AES-128, reliable UDP with ARQ |
 
 Note: HTTP/WebSocket protocols measure end-to-end (wait for response). SRT/RTMP/WebRTC measure client send completion.
 

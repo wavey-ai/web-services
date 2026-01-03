@@ -1106,6 +1106,326 @@ async fn test_rtmp_100mb() {
     let _ = shutdown_tx.send(());
 }
 
+async fn setup_rtmps_server(
+    port: u16,
+    upload_size_mb: usize,
+    cert_b64: &str,
+    key_b64: &str,
+) -> (Arc<UploadResponseService>, tokio::sync::watch::Sender<()>) {
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+    let num_slots = upload_size_bytes / (SLOT_SIZE_KB * 1024) + 100;
+
+    let config = UploadResponseConfig {
+        num_streams: 10,
+        slot_size_kb: SLOT_SIZE_KB,
+        slots_per_stream: num_slots,
+        response_timeout_ms: 600_000,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+
+    let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
+    let _watcher_handle = watcher.spawn();
+
+    let worker_service = service.clone();
+    tokio::spawn(async move {
+        run_worker(worker_service).await;
+    });
+
+    let cert_pem = from_base64_raw(cert_b64).expect("decode cert");
+    let key_pem = from_base64_raw(key_b64).expect("decode key");
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let rtmp_ingest = RtmpUploadIngest::new(service.clone());
+    let shutdown_tx = rtmp_ingest
+        .start_tls(addr, &cert_pem, &key_pem)
+        .await
+        .expect("start RTMPS server");
+
+    // Give RTMPS server time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    (service, shutdown_tx)
+}
+
+async fn run_rtmps_upload_test(
+    _service: Arc<UploadResponseService>,
+    port: u16,
+    upload_size_mb: usize,
+) -> (f64, bool) {
+    ensure_rustls_provider();
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+
+    println!("Generating {} MB test data for RTMPS...", upload_size_mb);
+    let gen_start = Instant::now();
+
+    // Generate fake AAC frames (~1KB each)
+    let frame_size = 1000;
+    let num_frames = upload_size_bytes / (7 + frame_size);
+    let frames: Vec<Vec<u8>> = (0..num_frames)
+        .map(|_| generate_fake_aac_frame(frame_size))
+        .collect();
+    let total_bytes: usize = frames.iter().map(|f| f.len()).sum();
+
+    println!(
+        "Generated {} frames ({} bytes) in {:.2}s",
+        num_frames,
+        total_bytes,
+        gen_start.elapsed().as_secs_f64()
+    );
+
+    let addr = format!("127.0.0.1:{}", port);
+
+    println!("Uploading {} MB via RTMPS...", upload_size_mb);
+    let start = Instant::now();
+
+    // Connect via TCP
+    let tcp_stream = match TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("RTMPS connect failed: {}", e);
+            return (0.0, false);
+        }
+    };
+
+    // Wrap with TLS
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+    let mut stream = match connector.connect(server_name, tcp_stream).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("RTMPS TLS handshake failed: {}", e);
+            return (0.0, false);
+        }
+    };
+
+    // RTMP Handshake
+    let mut handshake = Handshake::new(PeerType::Client);
+    let c0_and_c1 = match handshake.generate_outbound_p0_and_p1() {
+        Ok(data) => data,
+        Err(e) => {
+            println!("RTMP handshake generate failed: {:?}", e);
+            return (0.0, false);
+        }
+    };
+
+    if let Err(e) = stream.write_all(&c0_and_c1).await {
+        println!("RTMP handshake write failed: {}", e);
+        return (0.0, false);
+    }
+
+    let mut buffer = [0u8; 4096];
+    loop {
+        let bytes_read = match stream.read(&mut buffer).await {
+            Ok(0) => {
+                println!("RTMPS connection closed during handshake");
+                return (0.0, false);
+            }
+            Ok(n) => n,
+            Err(e) => {
+                println!("RTMPS handshake read failed: {}", e);
+                return (0.0, false);
+            }
+        };
+
+        match handshake.process_bytes(&buffer[..bytes_read]) {
+            Ok(HandshakeProcessResult::InProgress { response_bytes }) => {
+                if let Err(e) = stream.write_all(&response_bytes).await {
+                    println!("RTMPS handshake response failed: {}", e);
+                    return (0.0, false);
+                }
+            }
+            Ok(HandshakeProcessResult::Completed { response_bytes, .. }) => {
+                if !response_bytes.is_empty() {
+                    if let Err(e) = stream.write_all(&response_bytes).await {
+                        println!("RTMPS handshake final response failed: {}", e);
+                        return (0.0, false);
+                    }
+                }
+                break;
+            }
+            Err(e) => {
+                println!("RTMPS handshake process failed: {:?}", e);
+                return (0.0, false);
+            }
+        }
+    }
+
+    // Create client session
+    let config = ClientSessionConfig::new();
+    let (mut session, initial_results) = match ClientSession::new(config) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("RTMPS session create failed: {:?}", e);
+            return (0.0, false);
+        }
+    };
+
+    // Send initial results
+    for result in initial_results {
+        if let ClientSessionResult::OutboundResponse(packet) = result {
+            if let Err(e) = stream.write_all(&packet.bytes).await {
+                println!("RTMPS initial send failed: {}", e);
+                return (0.0, false);
+            }
+        }
+    }
+
+    // Request connection
+    let result = match session.request_connection("live".to_string()) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("RTMPS request_connection failed: {:?}", e);
+            return (0.0, false);
+        }
+    };
+    if let ClientSessionResult::OutboundResponse(packet) = result {
+        if let Err(e) = stream.write_all(&packet.bytes).await {
+            println!("RTMPS connect send failed: {}", e);
+            return (0.0, false);
+        }
+    }
+
+    // Wait for connection accepted and request publishing
+    let mut publishing = false;
+
+    'outer: loop {
+        let bytes_read = match stream.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                println!("RTMPS read failed: {}", e);
+                return (0.0, false);
+            }
+        };
+
+        let results = match session.handle_input(&buffer[..bytes_read]) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("RTMPS handle_input failed: {:?}", e);
+                return (0.0, false);
+            }
+        };
+
+        for result in results {
+            match result {
+                ClientSessionResult::OutboundResponse(packet) => {
+                    if let Err(e) = stream.write_all(&packet.bytes).await {
+                        println!("RTMPS response send failed: {}", e);
+                        return (0.0, false);
+                    }
+                }
+                ClientSessionResult::RaisedEvent(event) => match event {
+                    ClientSessionEvent::ConnectionRequestAccepted => {
+                        let result = match session
+                            .request_publishing("test-stream".to_string(), PublishRequestType::Live)
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                println!("RTMPS request_publishing failed: {:?}", e);
+                                return (0.0, false);
+                            }
+                        };
+                        if let ClientSessionResult::OutboundResponse(packet) = result {
+                            if let Err(e) = stream.write_all(&packet.bytes).await {
+                                println!("RTMPS publish send failed: {}", e);
+                                return (0.0, false);
+                            }
+                        }
+                    }
+                    ClientSessionEvent::PublishRequestAccepted => {
+                        publishing = true;
+                        break 'outer;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    if !publishing {
+        println!("RTMPS publishing not established");
+        return (0.0, false);
+    }
+
+    // Send audio frames
+    let mut timestamp = 0u32;
+    for frame in &frames {
+        let mut audio_data = vec![0xAF, 0x01];
+        audio_data.extend_from_slice(frame);
+
+        let result = match session.publish_audio_data(
+            Bytes::from(audio_data),
+            rml_rtmp::time::RtmpTimestamp::new(timestamp),
+            false,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("RTMPS publish_audio_data failed: {:?}", e);
+                return (0.0, false);
+            }
+        };
+
+        if let ClientSessionResult::OutboundResponse(packet) = result {
+            if let Err(e) = stream.write_all(&packet.bytes).await {
+                println!("RTMPS audio send failed: {}", e);
+                return (0.0, false);
+            }
+        }
+
+        timestamp += 23;
+    }
+
+    let total_elapsed = start.elapsed();
+    let throughput = upload_size_mb as f64 / total_elapsed.as_secs_f64();
+
+    println!(
+        "RTMPS: {:.2}s ({:.1} MB/s)",
+        total_elapsed.as_secs_f64(),
+        throughput
+    );
+    println!("Sent: {} frames ({} bytes)", num_frames, total_bytes);
+
+    let passed = true;
+    if passed {
+        println!("RTMPS PASSED\n");
+    } else {
+        println!("RTMPS FAILED\n");
+    }
+
+    (throughput, passed)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rtmps_100mb() {
+    ensure_rustls_provider();
+
+    let (cert_b64, key_b64) = match load_test_env() {
+        Some(v) => v,
+        None => {
+            eprintln!("Skipping: TLS_CERT_BASE64 and TLS_KEY_BASE64 env vars required");
+            return;
+        }
+    };
+
+    let port = pick_unused_port().expect("pick port");
+    let (service, shutdown_tx) = setup_rtmps_server(port, 100, &cert_b64, &key_b64).await;
+
+    println!("\n=== RTMPS 100MB Upload Test ===");
+    let (throughput, passed) = run_rtmps_upload_test(service, port, 100).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("===============================\n");
+
+    assert!(passed, "RTMPS test failed");
+    let _ = shutdown_tx.send(());
+}
+
 async fn setup_webrtc_server(
     signaling_port: u16,
     upload_size_mb: usize,

@@ -3192,7 +3192,7 @@ dependencies = [
 [[package]]
 name = "rml_amf0"
 version = "0.3.0"
-source = "git+ssh://git@github.com/wavey-ai/rust-media-libs.git#02522b540693a2e2b02eb2d730ed70fd78ebcf36"
+source = "git+https://github.com/wavey-ai/rust-media-libs.git#02522b540693a2e2b02eb2d730ed70fd78ebcf36"
 dependencies = [
  "byteorder",
  "thiserror 1.0.69",
@@ -3201,7 +3201,7 @@ dependencies = [
 [[package]]
 name = "rml_rtmp"
 version = "0.8.0"
-source = "git+ssh://git@github.com/wavey-ai/rust-media-libs.git#02522b540693a2e2b02eb2d730ed70fd78ebcf36"
+source = "git+https://github.com/wavey-ai/rust-media-libs.git#02522b540693a2e2b02eb2d730ed70fd78ebcf36"
 dependencies = [
  "byteorder",
  "bytes",
@@ -3236,8 +3236,11 @@ dependencies = [
  "http-pack",
  "mse_fmp4",
  "rml_rtmp",
+ "rustls 0.23.35",
+ "rustls-pemfile 2.2.0",
  "srt-tokio",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tracing",
  "upload-response",

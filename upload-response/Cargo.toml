@@ -41,8 +41,8 @@ rustls-pemfile = "2"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 # RTMP testing
-rtmp-ingress = { path = "../../rtmp-ingress", features = ["upload-response"] }
-rml_rtmp = { git = "ssh://git@github.com/wavey-ai/rust-media-libs.git" }
+rtmp-ingress = { path = "../../rtmp-ingress", features = ["upload-response", "tls"] }
+rml_rtmp = { git = "https://github.com/wavey-ai/rust-media-libs.git" }
 # WebRTC testing
 matchbox_signaling = { git = "ssh://git@github.com/wavey-ai/matchbox", branch = "feat/graceful-shutdown" }
 futures-timer = "3"
