@@ -10,9 +10,9 @@ A high-performance request/response proxy service that streams requests into a s
 | HTTP/2 | TCP+TLS | Bearer | Multiplexed streams |
 | HTTP/3 | QUIC/UDP | Bearer | Low latency |
 | WebSocket | TCP+TLS | Bearer | Binary frames |
-| WebRTC | UDP (DTLS) | Signaling | Data channels, P2P capable |
-| SRT | UDP | Stream ID | Reliable UDP, media ingest |
-| RTMP | TCP | Stream key | Media ingest, AccessUnits |
+| WebRTC | UDP+DTLS | Signaling | Data channels, P2P capable |
+| SRT | UDP+AES | Stream ID | Reliable UDP, AES-128/256 encryption |
+| RTMP | TCP | Stream key | Plain TCP, media ingest |
 
 ## Architecture
 
@@ -213,16 +213,16 @@ Upload size: 512 MB
 
 Benchmarks with real servers measuring client send time:
 
-| Protocol | Throughput | TLS | Notes |
-|----------|------------|-----|-------|
-| WebSocket | 917 MB/s | Yes | Binary frames, minimal overhead |
-| HTTP/1.1 (chunked) | 795 MB/s | Yes | Streaming without Content-Length |
-| HTTP/2 | 674 MB/s | Yes | Multiplexing overhead |
-| HTTP/1.1 | 621 MB/s | Yes | Requires Content-Length |
-| RTMP | 428 MB/s | No | Plain TCP, AccessUnit serialization |
-| WebRTC | 195 MB/s | Yes | DTLS, SCTP queue speed |
-| HTTP/3 | 192 MB/s | Yes | QUIC encryption overhead |
-| SRT | 149 MB/s | No | Reliable UDP with ARQ |
+| Protocol | Throughput | Encryption | Notes |
+|----------|------------|------------|-------|
+| WebSocket | 917 MB/s | TLS | Binary frames, minimal overhead |
+| HTTP/1.1 (chunked) | 795 MB/s | TLS | Streaming without Content-Length |
+| HTTP/2 | 674 MB/s | TLS | Multiplexing overhead |
+| HTTP/1.1 | 621 MB/s | TLS | Requires Content-Length |
+| RTMP | 428 MB/s | None | Plain TCP, AccessUnit serialization |
+| WebRTC | 195 MB/s | DTLS | SCTP data channels |
+| HTTP/3 | 192 MB/s | QUIC | Built-in encryption |
+| SRT | 142 MB/s | AES-128 | Reliable UDP with ARQ |
 
 Note: HTTP/WebSocket protocols measure end-to-end (wait for response). SRT/RTMP/WebRTC measure client send completion.
 

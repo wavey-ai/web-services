@@ -16,15 +16,36 @@ const READ_TIMEOUT_SECS: u64 = 30;
 /// Auth callback for SRT connections
 /// The stream_id typically contains: "bearer:<token>" or just the stream key
 pub trait SrtAuth: Send + Sync + 'static {
-    fn authenticate(&self, stream_id: Option<&str>) -> bool;
+    /// Returns None to deny, Some(None) to allow without encryption,
+    /// or Some(Some(passphrase)) to allow with encryption
+    fn authenticate(&self, stream_id: Option<&str>) -> Option<Option<String>>;
 }
 
-/// Default auth that allows all connections
+/// Default auth that allows all connections without encryption
 pub struct AllowAll;
 
 impl SrtAuth for AllowAll {
-    fn authenticate(&self, _stream_id: Option<&str>) -> bool {
-        true
+    fn authenticate(&self, _stream_id: Option<&str>) -> Option<Option<String>> {
+        Some(None) // Allow without encryption
+    }
+}
+
+/// Auth that allows all connections with encryption using a fixed passphrase
+pub struct AllowAllEncrypted {
+    passphrase: String,
+}
+
+impl AllowAllEncrypted {
+    pub fn new(passphrase: impl Into<String>) -> Self {
+        Self {
+            passphrase: passphrase.into(),
+        }
+    }
+}
+
+impl SrtAuth for AllowAllEncrypted {
+    fn authenticate(&self, _stream_id: Option<&str>) -> Option<Option<String>> {
+        Some(Some(self.passphrase.clone())) // Allow with encryption
     }
 }
 
@@ -100,10 +121,9 @@ impl<A: SrtAuth> SrtIngest<A> {
 
         let listener = AsyncListener::bind_with_options(addr, options)?
             .with_callback(move |stream_id: Option<&str>| {
-                if auth_clone.authenticate(stream_id) {
-                    ListenerCallbackAction::Allow { passphrase: None }
-                } else {
-                    ListenerCallbackAction::Deny
+                match auth_clone.authenticate(stream_id) {
+                    Some(passphrase) => ListenerCallbackAction::Allow { passphrase },
+                    None => ListenerCallbackAction::Deny,
                 }
             })?;
 

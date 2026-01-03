@@ -26,7 +26,7 @@ mod watcher;
 pub use watcher::ResponseWatcher;
 
 mod srt;
-pub use srt::{AllowAll, SrtAuth, SrtIngest};
+pub use srt::{AllowAll, AllowAllEncrypted, SrtAuth, SrtIngest};
 
 mod webrtc;
 pub use webrtc::{AllowAllWebRtc, WebRtcAuth, WebRtcIngest};

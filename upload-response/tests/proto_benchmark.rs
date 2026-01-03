@@ -7,8 +7,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::time::{interval, Duration};
 use upload_response::{
-    ResponseWatcher, SrtIngest, TailSlot, UploadResponseConfig, UploadResponseRouter,
-    UploadResponseService, WebRtcIngest,
+    AllowAllEncrypted, ResponseWatcher, SrtIngest, TailSlot, UploadResponseConfig,
+    UploadResponseRouter, UploadResponseService, WebRtcIngest,
 };
 use web_service::{H2H3Server, Server, ServerBuilder};
 
@@ -500,9 +500,28 @@ async fn run_srt_upload_test(
     port: u16,
     upload_size_mb: usize,
 ) -> (f64, bool) {
-    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+    run_srt_upload_test_inner(_service, port, upload_size_mb, None).await
+}
 
-    println!("Generating {} MB test data for SRT...", upload_size_mb);
+async fn run_srt_upload_test_encrypted(
+    _service: Arc<UploadResponseService>,
+    port: u16,
+    upload_size_mb: usize,
+    passphrase: &str,
+) -> (f64, bool) {
+    run_srt_upload_test_inner(_service, port, upload_size_mb, Some(passphrase)).await
+}
+
+async fn run_srt_upload_test_inner(
+    _service: Arc<UploadResponseService>,
+    port: u16,
+    upload_size_mb: usize,
+    passphrase: Option<&str>,
+) -> (f64, bool) {
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+    let proto = if passphrase.is_some() { "SRT (encrypted)" } else { "SRT" };
+
+    println!("Generating {} MB test data for {}...", upload_size_mb, proto);
     let gen_start = Instant::now();
     let (data, expected_hash) = generate_test_data(upload_size_bytes);
     println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
@@ -510,10 +529,11 @@ async fn run_srt_upload_test(
     let addr = format!("127.0.0.1:{}", port);
     let connect_options = ConnectOptions {
         stream_id: Some("test-stream".to_string()),
+        passphrase: passphrase.map(|p| p.to_string()),
         ..Default::default()
     };
 
-    println!("Uploading {} MB via SRT...", upload_size_mb);
+    println!("Uploading {} MB via {}...", upload_size_mb, proto);
     let start = Instant::now();
 
     let mut stream = AsyncStream::connect(&addr, &connect_options)
@@ -534,19 +554,20 @@ async fn run_srt_upload_test(
     let throughput = upload_size_mb as f64 / total_elapsed.as_secs_f64();
 
     println!(
-        "SRT: {:.2}s ({:.1} MB/s)",
+        "{}: {:.2}s ({:.1} MB/s)",
+        proto,
         total_elapsed.as_secs_f64(),
         throughput
     );
     println!("Expected: {}", expected_hex);
-    println!("Got:      (SRT upload only - no response yet)");
+    println!("Got:      ({} upload only - no response yet)", proto);
 
     // For now, pass if upload completes without error
     let passed = true;
     if passed {
-        println!("SRT PASSED\n");
+        println!("{} PASSED\n", proto);
     } else {
-        println!("SRT FAILED\n");
+        println!("{} FAILED\n", proto);
     }
 
     (throughput, passed)
@@ -679,6 +700,44 @@ async fn setup_srt_server(
     (service, shutdown_tx)
 }
 
+const SRT_PASSPHRASE: &str = "benchmark-test-passphrase-1234";
+
+async fn setup_srt_server_encrypted(
+    port: u16,
+    upload_size_mb: usize,
+) -> (Arc<UploadResponseService>, tokio::sync::watch::Sender<()>) {
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+    let num_slots = upload_size_bytes / (SLOT_SIZE_KB * 1024) + 100;
+
+    let config = UploadResponseConfig {
+        num_streams: 10,
+        slot_size_kb: SLOT_SIZE_KB,
+        slots_per_stream: num_slots,
+        response_timeout_ms: 600_000,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+
+    let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
+    let _watcher_handle = watcher.spawn();
+
+    let worker_service = service.clone();
+    tokio::spawn(async move {
+        run_worker(worker_service).await;
+    });
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let srt_ingest = SrtIngest::with_auth(
+        service.clone(),
+        AllowAllEncrypted::new(SRT_PASSPHRASE),
+    );
+    let shutdown_tx = srt_ingest.start(addr).await.expect("start SRT server (encrypted)");
+
+    // Give SRT server time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    (service, shutdown_tx)
+}
+
 async fn setup_srt_server_high_throughput(
     port: u16,
     upload_size_mb: usize,
@@ -726,6 +785,20 @@ async fn test_srt_100mb() {
     println!("=============================\n");
 
     assert!(passed, "SRT test failed");
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_srt_encrypted_100mb() {
+    let port = pick_unused_port().expect("pick port");
+    let (service, shutdown_tx) = setup_srt_server_encrypted(port, 100).await;
+
+    println!("\n=== SRT (Encrypted) 100MB Upload Test ===");
+    let (throughput, passed) = run_srt_upload_test_encrypted(service, port, 100, SRT_PASSPHRASE).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("=========================================\n");
+
+    assert!(passed, "SRT (encrypted) test failed");
     let _ = shutdown_tx.send(());
 }
 
