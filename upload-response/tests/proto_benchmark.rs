@@ -131,9 +131,31 @@ async fn run_upload_test(
     upload_size_mb: usize,
     use_http2: bool,
 ) -> (f64, bool) {
+    run_upload_test_inner(port, upload_size_mb, use_http2, false).await
+}
+
+async fn run_upload_test_chunked(
+    port: u16,
+    upload_size_mb: usize,
+) -> (f64, bool) {
+    run_upload_test_inner(port, upload_size_mb, false, true).await
+}
+
+async fn run_upload_test_inner(
+    port: u16,
+    upload_size_mb: usize,
+    use_http2: bool,
+    use_chunked: bool,
+) -> (f64, bool) {
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
 
-    let proto = if use_http2 { "HTTP/2" } else { "HTTP/1.1" };
+    let proto = if use_http2 {
+        "HTTP/2"
+    } else if use_chunked {
+        "HTTP/1.1 (chunked)"
+    } else {
+        "HTTP/1.1"
+    };
     println!("Generating {} MB test data for {}...", upload_size_mb, proto);
     let gen_start = Instant::now();
     let (data, expected_hash) = generate_test_data(upload_size_bytes);
@@ -152,12 +174,32 @@ async fn run_upload_test(
     println!("Uploading {} MB via {}...", upload_size_mb, proto);
     let start = Instant::now();
 
-    let response = client
-        .post(format!("https://localhost:{}/upload", port))
-        .body(data)
-        .send()
-        .await
-        .expect("send request");
+    let response = if use_chunked {
+        // Use streaming body to force chunked transfer encoding
+        use http_body_util::StreamBody;
+
+        let chunk_size = 64 * 1024;
+        let chunks: Vec<_> = data.chunks(chunk_size)
+            .map(|c| Ok::<_, std::io::Error>(hyper::body::Frame::data(Bytes::copy_from_slice(c))))
+            .collect();
+        let stream = futures_util::stream::iter(chunks);
+        let body = StreamBody::new(stream);
+
+        client
+            .post(format!("https://localhost:{}/upload", port))
+            .body(reqwest::Body::wrap(body))
+            .send()
+            .await
+            .expect("send request")
+    } else {
+        // Known size - uses Content-Length
+        client
+            .post(format!("https://localhost:{}/upload", port))
+            .body(data)
+            .send()
+            .await
+            .expect("send request")
+    };
 
     let total_elapsed = start.elapsed();
 
@@ -723,6 +765,7 @@ async fn test_protocol_comparison() {
     println!("========================================\n");
 
     let (h1_throughput, h1_passed) = run_upload_test(port, 512, false).await;
+    let (h1c_throughput, h1c_passed) = run_upload_test_chunked(port, 512).await;
     let (h2_throughput, h2_passed) = run_upload_test(port, 512, true).await;
     let (h3_throughput, h3_passed) = run_h3_upload_test(port, 512, &cert_b64, &key_b64).await;
     let (wss_throughput, wss_passed) = run_wss_upload_test(port, 512, &cert_b64, &key_b64).await;
@@ -730,12 +773,13 @@ async fn test_protocol_comparison() {
     println!("========================================");
     println!("    Results Summary");
     println!("========================================");
-    println!("HTTP/1.1: {:.1} MB/s {}", h1_throughput, if h1_passed { "✓" } else { "✗" });
-    println!("HTTP/2:   {:.1} MB/s {}", h2_throughput, if h2_passed { "✓" } else { "✗" });
-    println!("HTTP/3:   {:.1} MB/s {}", h3_throughput, if h3_passed { "✓" } else { "✗" });
-    println!("WSS:      {:.1} MB/s {}", wss_throughput, if wss_passed { "✓" } else { "✗" });
+    println!("HTTP/1.1:          {:.1} MB/s {}", h1_throughput, if h1_passed { "✓" } else { "✗" });
+    println!("HTTP/1.1 (chunked): {:.1} MB/s {}", h1c_throughput, if h1c_passed { "✓" } else { "✗" });
+    println!("HTTP/2:            {:.1} MB/s {}", h2_throughput, if h2_passed { "✓" } else { "✗" });
+    println!("HTTP/3:            {:.1} MB/s {}", h3_throughput, if h3_passed { "✓" } else { "✗" });
+    println!("WSS:               {:.1} MB/s {}", wss_throughput, if wss_passed { "✓" } else { "✗" });
     println!("========================================\n");
 
-    assert!(h1_passed && h2_passed && h3_passed && wss_passed, "Protocol tests failed");
+    assert!(h1_passed && h1c_passed && h2_passed && h3_passed && wss_passed, "Protocol tests failed");
     let _ = shutdown_tx.send(());
 }

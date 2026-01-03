@@ -169,14 +169,19 @@ End-to-end benchmarks with real HTTP servers (TLS + protocol overhead):
 
 | Protocol | Throughput | Notes |
 |----------|------------|-------|
-| WSS      | 947 MB/s | WebSocket binary frames |
-| HTTP/2   | 671 MB/s | Single stream |
-| HTTP/1.1 | 658 MB/s | Chunked transfer |
-| HTTP/3   | 253 MB/s | QUIC/UDP |
+| WSS      | 910 MB/s | WebSocket binary frames |
+| HTTP/1.1 (chunked) | 780 MB/s | Transfer-Encoding: chunked |
+| HTTP/2   | 663 MB/s | Single stream |
+| HTTP/1.1 | 658 MB/s | Content-Length |
+| HTTP/3   | 228 MB/s | QUIC/UDP |
 
 **Why is WSS fastest?**
 
-WebSocket over TLS has lower per-message overhead than HTTP protocols. Once the connection is established, binary frames have minimal framing (2-14 bytes header vs HTTP's chunked encoding overhead). The bidirectional nature also eliminates request/response round-trip delays.
+WebSocket over TLS has lower per-message overhead than HTTP. Binary frames have minimal framing (2-14 bytes) and the bidirectional nature eliminates request/response round-trip delays.
+
+**Why is chunked faster than Content-Length?**
+
+Streaming with chunked transfer allows the server to process data as it arrives. With Content-Length, there may be more buffering before transmission begins.
 
 **Why is HTTP/3 slower?**
 
