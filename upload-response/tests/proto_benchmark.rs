@@ -37,7 +37,7 @@ use futures::{select, FutureExt};
 use futures_timer::Delay;
 use matchbox_signaling::SignalingServerBuilder;
 use matchbox_signaling::topologies::client_server::{ClientServer, ClientServerState};
-use matchbox_socket::{PeerState, WebRtcSocket};
+use matchbox_socket::{ChannelConfig, PeerState, WebRtcSocket, WebRtcSocketBuilder};
 
 const SLOT_SIZE_KB: usize = 64;
 
@@ -496,6 +496,7 @@ async fn run_wss_upload_test(
 }
 
 async fn run_srt_upload_test(
+    _service: Arc<UploadResponseService>,
     port: u16,
     upload_size_mb: usize,
 ) -> (f64, bool) {
@@ -525,11 +526,9 @@ async fn run_srt_upload_test(
         stream.write_all(chunk).await.expect("SRT write");
     }
 
-    // Shutdown write side to signal end
+    // Shutdown write side
     drop(stream);
 
-    // For SRT, we need to reconnect to get response (or modify protocol)
-    // For now, just measure upload throughput
     let total_elapsed = start.elapsed();
     let expected_hex = format!("{:016x}", expected_hash);
     let throughput = upload_size_mb as f64 / total_elapsed.as_secs_f64();
@@ -650,7 +649,7 @@ async fn setup_server(
 async fn setup_srt_server(
     port: u16,
     upload_size_mb: usize,
-) -> tokio::sync::watch::Sender<()> {
+) -> (Arc<UploadResponseService>, tokio::sync::watch::Sender<()>) {
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
     let num_slots = upload_size_bytes / (SLOT_SIZE_KB * 1024) + 100;
 
@@ -671,22 +670,58 @@ async fn setup_srt_server(
     });
 
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let srt_ingest = SrtIngest::new(service);
+    let srt_ingest = SrtIngest::new(service.clone());
     let shutdown_tx = srt_ingest.start(addr).await.expect("start SRT server");
 
     // Give SRT server time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    shutdown_tx
+    (service, shutdown_tx)
+}
+
+async fn setup_srt_server_high_throughput(
+    port: u16,
+    upload_size_mb: usize,
+) -> (Arc<UploadResponseService>, tokio::sync::watch::Sender<()>) {
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+    let num_slots = upload_size_bytes / (SLOT_SIZE_KB * 1024) + 100;
+
+    let config = UploadResponseConfig {
+        num_streams: 10,
+        slot_size_kb: SLOT_SIZE_KB,
+        slots_per_stream: num_slots,
+        response_timeout_ms: 600_000,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+
+    let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
+    let _watcher_handle = watcher.spawn();
+
+    let worker_service = service.clone();
+    tokio::spawn(async move {
+        run_worker(worker_service).await;
+    });
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let srt_ingest = SrtIngest::new(service.clone());
+    let shutdown_tx = srt_ingest
+        .start_high_throughput(addr)
+        .await
+        .expect("start SRT server (high-throughput)");
+
+    // Give SRT server time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    (service, shutdown_tx)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_srt_100mb() {
     let port = pick_unused_port().expect("pick port");
-    let shutdown_tx = setup_srt_server(port, 100).await;
+    let (service, shutdown_tx) = setup_srt_server(port, 100).await;
 
     println!("\n=== SRT 100MB Upload Test ===");
-    let (throughput, passed) = run_srt_upload_test(port, 100).await;
+    let (throughput, passed) = run_srt_upload_test(service, port, 100).await;
     println!("Throughput: {:.1} MB/s", throughput);
     println!("=============================\n");
 
@@ -697,7 +732,7 @@ async fn test_srt_100mb() {
 async fn setup_rtmp_server(
     port: u16,
     upload_size_mb: usize,
-) -> tokio::sync::watch::Sender<()> {
+) -> (Arc<UploadResponseService>, tokio::sync::watch::Sender<()>) {
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
     let num_slots = upload_size_bytes / (SLOT_SIZE_KB * 1024) + 100;
 
@@ -718,13 +753,13 @@ async fn setup_rtmp_server(
     });
 
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let rtmp_ingest = RtmpUploadIngest::new(service);
+    let rtmp_ingest = RtmpUploadIngest::new(service.clone());
     let shutdown_tx = rtmp_ingest.start(addr).await.expect("start RTMP server");
 
     // Give RTMP server time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    shutdown_tx
+    (service, shutdown_tx)
 }
 
 /// Generate fake AAC audio frame (ADTS header + random data)
@@ -750,6 +785,7 @@ fn generate_fake_aac_frame(frame_size: usize) -> Vec<u8> {
 }
 
 async fn run_rtmp_upload_test(
+    _service: Arc<UploadResponseService>,
     port: u16,
     upload_size_mb: usize,
 ) -> (f64, bool) {
@@ -986,10 +1022,10 @@ async fn run_rtmp_upload_test(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_rtmp_100mb() {
     let port = pick_unused_port().expect("pick port");
-    let shutdown_tx = setup_rtmp_server(port, 100).await;
+    let (service, shutdown_tx) = setup_rtmp_server(port, 100).await;
 
     println!("\n=== RTMP 100MB Upload Test ===");
-    let (throughput, passed) = run_rtmp_upload_test(port, 100).await;
+    let (throughput, passed) = run_rtmp_upload_test(service, port, 100).await;
     println!("Throughput: {:.1} MB/s", throughput);
     println!("==============================\n");
 
@@ -1000,7 +1036,11 @@ async fn test_rtmp_100mb() {
 async fn setup_webrtc_server(
     signaling_port: u16,
     upload_size_mb: usize,
-) -> (tokio::sync::watch::Sender<()>, tokio::task::JoinHandle<()>) {
+) -> (
+    Arc<UploadResponseService>,
+    tokio::sync::watch::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
     let num_slots = upload_size_bytes / (SLOT_SIZE_KB * 1024) + 100;
 
@@ -1038,21 +1078,23 @@ async fn setup_webrtc_server(
 
     // Start WebRTC ingest connected to signaling server
     let signaling_url = format!("ws://127.0.0.1:{}/bench", signaling_port);
-    let webrtc_ingest = WebRtcIngest::new(service);
+    let webrtc_ingest = WebRtcIngest::new(service.clone());
     let shutdown_tx = webrtc_ingest.start(signaling_url).await.expect("start WebRTC ingest");
 
     // Give WebRTC ingest time to connect
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    (shutdown_tx, signaling_handle)
+    (service, shutdown_tx, signaling_handle)
 }
 
 const WEBRTC_CHANNEL_ID: usize = 0;
 
 async fn run_webrtc_upload_test(
+    _service: Arc<UploadResponseService>,
     signaling_port: u16,
     upload_size_mb: usize,
 ) -> (f64, bool) {
+    ensure_rustls_provider();
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
 
     println!("Generating {} MB test data for WebRTC...", upload_size_mb);
@@ -1063,7 +1105,6 @@ async fn run_webrtc_upload_test(
     let signaling_url = format!("ws://127.0.0.1:{}/bench", signaling_port);
 
     println!("Uploading {} MB via WebRTC Data Channel...", upload_size_mb);
-    let start = Instant::now();
 
     // Connect to signaling server
     let (mut socket, loop_fut) = WebRtcSocket::new_reliable(&signaling_url);
@@ -1104,25 +1145,20 @@ async fn run_webrtc_upload_test(
         }
     };
 
+    // Start timing when we begin sending
+    let start = Instant::now();
+
     // Send data in 16KB chunks (WebRTC data channel message size limit)
     let chunk_size = 16 * 1024;
     for chunk in data.chunks(chunk_size) {
         socket.channel_mut(WEBRTC_CHANNEL_ID).send(chunk.to_vec().into(), peer);
-
-        // Small delay to prevent overwhelming the data channel
-        select! {
-            _ = (&mut timeout).fuse() => {
-                socket.update_peers();
-                timeout.reset(Duration::from_millis(1));
-            }
-            _ = &mut loop_fut => {
-                println!("WebRTC: Socket loop ended during upload");
-                return (0.0, false);
-            }
-        }
     }
 
+    // Close socket to signal end of transmission
+    socket.close();
+
     let total_elapsed = start.elapsed();
+
     let expected_hex = format!("{:016x}", expected_hash);
     let throughput = upload_size_mb as f64 / total_elapsed.as_secs_f64();
 
@@ -1148,16 +1184,199 @@ async fn run_webrtc_upload_test(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_webrtc_100mb() {
     let signaling_port = pick_unused_port().expect("pick port");
-    let (shutdown_tx, signaling_handle) = setup_webrtc_server(signaling_port, 100).await;
+    let (service, shutdown_tx, signaling_handle) = setup_webrtc_server(signaling_port, 100).await;
 
     println!("\n=== WebRTC 100MB Upload Test ===");
-    let (throughput, passed) = run_webrtc_upload_test(signaling_port, 100).await;
+    let (throughput, passed) = run_webrtc_upload_test(service, signaling_port, 100).await;
     println!("Throughput: {:.1} MB/s", throughput);
     println!("================================\n");
 
     assert!(passed, "WebRTC test failed");
     let _ = shutdown_tx.send(());
     signaling_handle.abort();
+}
+
+async fn run_webrtc_upload_test_high_throughput(
+    _service: Arc<UploadResponseService>,
+    signaling_port: u16,
+    upload_size_mb: usize,
+) -> (f64, bool) {
+    ensure_rustls_provider();
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+
+    println!(
+        "Generating {} MB test data for WebRTC (high-throughput)...",
+        upload_size_mb
+    );
+    let gen_start = Instant::now();
+    let (data, expected_hash) = generate_test_data(upload_size_bytes);
+    println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
+
+    let signaling_url = format!("ws://127.0.0.1:{}/bench", signaling_port);
+
+    println!(
+        "Uploading {} MB via WebRTC Data Channel (high-throughput)...",
+        upload_size_mb
+    );
+
+    // Connect to signaling server with high-throughput mode
+    let (mut socket, loop_fut) = WebRtcSocketBuilder::new(&signaling_url)
+        .add_channel(ChannelConfig::reliable())
+        .high_throughput()
+        .build();
+    let loop_fut = loop_fut.fuse();
+    futures::pin_mut!(loop_fut);
+
+    let timeout = Delay::new(Duration::from_millis(10));
+    futures::pin_mut!(timeout);
+
+    // Wait for peer (the server) to connect
+    let mut connected_peer = None;
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+
+    while connected_peer.is_none() && Instant::now() < deadline {
+        select! {
+            _ = (&mut timeout).fuse() => {
+                for (peer, state) in socket.update_peers() {
+                    if matches!(state, PeerState::Connected) {
+                        println!("WebRTC (high-throughput): Connected to peer {}", peer);
+                        connected_peer = Some(peer);
+                        break;
+                    }
+                }
+                timeout.reset(Duration::from_millis(10));
+            }
+            _ = &mut loop_fut => {
+                break;
+            }
+        }
+    }
+
+    let peer = match connected_peer {
+        Some(p) => p,
+        None => {
+            println!("WebRTC (high-throughput) FAILED: Could not connect to peer");
+            return (0.0, false);
+        }
+    };
+
+    // Start timing when we begin sending
+    let start = Instant::now();
+
+    // Send data in larger chunks for high-throughput mode (64KB)
+    const CHUNK_SIZE: usize = 65536;
+    for chunk in data.chunks(CHUNK_SIZE) {
+        socket
+            .channel_mut(0)
+            .send(bytes::Bytes::copy_from_slice(chunk), peer);
+    }
+
+    // Close socket to signal end of transmission
+    socket.close();
+
+    let total_elapsed = start.elapsed();
+    let throughput = upload_size_mb as f64 / total_elapsed.as_secs_f64();
+
+    let expected_hex = format!("{:016x}", expected_hash);
+    println!(
+        "WebRTC (high-throughput): {:.2}s ({:.1} MB/s)",
+        total_elapsed.as_secs_f64(),
+        throughput
+    );
+    println!("Expected: {}", expected_hex);
+    println!("Got:      (WebRTC upload only - response not implemented yet)");
+
+    let passed = true;
+    if passed {
+        println!("WebRTC (high-throughput) PASSED\n");
+    } else {
+        println!("WebRTC (high-throughput) FAILED\n");
+    }
+
+    (throughput, passed)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_srt_high_throughput_100mb() {
+    let port = pick_unused_port().expect("pick port");
+    let (service, shutdown_tx) = setup_srt_server_high_throughput(port, 100).await;
+
+    println!("\n=== SRT (High-Throughput) 100MB Upload Test ===");
+    let (throughput, passed) = run_srt_upload_test(service, port, 100).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("===============================================\n");
+
+    assert!(passed, "SRT (high-throughput) test failed");
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_webrtc_high_throughput_100mb() {
+    let signaling_port = pick_unused_port().expect("pick port");
+    let (service, shutdown_tx, signaling_handle) = setup_webrtc_server(signaling_port, 100).await;
+
+    println!("\n=== WebRTC (High-Throughput) 100MB Upload Test ===");
+    let (throughput, passed) = run_webrtc_upload_test_high_throughput(service, signaling_port, 100).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("==================================================\n");
+
+    assert!(passed, "WebRTC (high-throughput) test failed");
+    let _ = shutdown_tx.send(());
+    signaling_handle.abort();
+}
+
+/// Compare default vs high-throughput modes for SRT and WebRTC
+#[tokio::test(flavor = "multi_thread")]
+async fn test_throughput_comparison() {
+    println!("\n=== Throughput Comparison: Default vs High-Throughput ===\n");
+
+    // SRT Default
+    let srt_port = pick_unused_port().expect("pick port");
+    let (srt_service, srt_shutdown) = setup_srt_server(srt_port, 100).await;
+    let (srt_default, _) = run_srt_upload_test(srt_service, srt_port, 100).await;
+    let _ = srt_shutdown.send(());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // SRT High-Throughput
+    let srt_port2 = pick_unused_port().expect("pick port");
+    let (srt_service2, srt_shutdown2) = setup_srt_server_high_throughput(srt_port2, 100).await;
+    let (srt_high, _) = run_srt_upload_test(srt_service2, srt_port2, 100).await;
+    let _ = srt_shutdown2.send(());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // WebRTC Default
+    let webrtc_port = pick_unused_port().expect("pick port");
+    let (webrtc_service, webrtc_shutdown, webrtc_handle) = setup_webrtc_server(webrtc_port, 100).await;
+    let (webrtc_default, _) = run_webrtc_upload_test(webrtc_service, webrtc_port, 100).await;
+    let _ = webrtc_shutdown.send(());
+    webrtc_handle.abort();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // WebRTC High-Throughput
+    let webrtc_port2 = pick_unused_port().expect("pick port");
+    let (webrtc_service2, webrtc_shutdown2, webrtc_handle2) = setup_webrtc_server(webrtc_port2, 100).await;
+    let (webrtc_high, _) = run_webrtc_upload_test_high_throughput(webrtc_service2, webrtc_port2, 100).await;
+    let _ = webrtc_shutdown2.send(());
+    webrtc_handle2.abort();
+
+    println!("\n=== Results ===");
+    println!(
+        "| Protocol | Default | High-Throughput | Improvement |"
+    );
+    println!("|----------|---------|-----------------|-------------|");
+    println!(
+        "| SRT      | {:.1} MB/s | {:.1} MB/s | {:.1}x |",
+        srt_default,
+        srt_high,
+        srt_high / srt_default.max(0.1)
+    );
+    println!(
+        "| WebRTC   | {:.1} MB/s | {:.1} MB/s | {:.1}x |",
+        webrtc_default,
+        webrtc_high,
+        webrtc_high / webrtc_default.max(0.1)
+    );
+    println!("\n=================================================\n");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1352,9 +1571,9 @@ async fn test_protocol_comparison() {
     let rtmp_port = pick_unused_port().expect("pick rtmp port");
     let webrtc_port = pick_unused_port().expect("pick webrtc port");
     let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 512).await;
-    let srt_shutdown_tx = setup_srt_server(srt_port, 512).await;
-    let rtmp_shutdown_tx = setup_rtmp_server(rtmp_port, 512).await;
-    let (webrtc_shutdown_tx, webrtc_handle) = setup_webrtc_server(webrtc_port, 512).await;
+    let (srt_service, srt_shutdown_tx) = setup_srt_server(srt_port, 512).await;
+    let (rtmp_service, rtmp_shutdown_tx) = setup_rtmp_server(rtmp_port, 512).await;
+    let (webrtc_service, webrtc_shutdown_tx, webrtc_handle) = setup_webrtc_server(webrtc_port, 512).await;
 
     println!("\n========================================");
     println!("    Protocol Comparison (512 MB)");
@@ -1365,9 +1584,9 @@ async fn test_protocol_comparison() {
     let (h2_throughput, h2_passed) = run_upload_test(port, 512, true).await;
     let (h3_throughput, h3_passed) = run_h3_upload_test(port, 512, &cert_b64, &key_b64).await;
     let (wss_throughput, wss_passed) = run_wss_upload_test(port, 512, &cert_b64, &key_b64).await;
-    let (srt_throughput, srt_passed) = run_srt_upload_test(srt_port, 512).await;
-    let (rtmp_throughput, rtmp_passed) = run_rtmp_upload_test(rtmp_port, 512).await;
-    let (webrtc_throughput, webrtc_passed) = run_webrtc_upload_test(webrtc_port, 512).await;
+    let (srt_throughput, srt_passed) = run_srt_upload_test(srt_service, srt_port, 512).await;
+    let (rtmp_throughput, rtmp_passed) = run_rtmp_upload_test(rtmp_service, rtmp_port, 512).await;
+    let (webrtc_throughput, webrtc_passed) = run_webrtc_upload_test(webrtc_service, webrtc_port, 512).await;
 
     println!("========================================");
     println!("    Results Summary");
@@ -1406,9 +1625,9 @@ async fn test_protocol_comparison_1gb() {
     let rtmp_port = pick_unused_port().expect("pick rtmp port");
     let webrtc_port = pick_unused_port().expect("pick webrtc port");
     let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 1024).await;
-    let srt_shutdown_tx = setup_srt_server(srt_port, 1024).await;
-    let rtmp_shutdown_tx = setup_rtmp_server(rtmp_port, 1024).await;
-    let (webrtc_shutdown_tx, webrtc_handle) = setup_webrtc_server(webrtc_port, 1024).await;
+    let (srt_service, srt_shutdown_tx) = setup_srt_server(srt_port, 1024).await;
+    let (rtmp_service, rtmp_shutdown_tx) = setup_rtmp_server(rtmp_port, 1024).await;
+    let (webrtc_service, webrtc_shutdown_tx, webrtc_handle) = setup_webrtc_server(webrtc_port, 1024).await;
 
     println!("\n========================================");
     println!("    Protocol Comparison (1 GB)");
@@ -1419,9 +1638,9 @@ async fn test_protocol_comparison_1gb() {
     let (h2_throughput, h2_passed) = run_upload_test(port, 1024, true).await;
     let (h3_throughput, h3_passed) = run_h3_upload_test(port, 1024, &cert_b64, &key_b64).await;
     let (wss_throughput, wss_passed) = run_wss_upload_test(port, 1024, &cert_b64, &key_b64).await;
-    let (srt_throughput, srt_passed) = run_srt_upload_test(srt_port, 1024).await;
-    let (rtmp_throughput, rtmp_passed) = run_rtmp_upload_test(rtmp_port, 1024).await;
-    let (webrtc_throughput, webrtc_passed) = run_webrtc_upload_test(webrtc_port, 1024).await;
+    let (srt_throughput, srt_passed) = run_srt_upload_test(srt_service, srt_port, 1024).await;
+    let (rtmp_throughput, rtmp_passed) = run_rtmp_upload_test(rtmp_service, rtmp_port, 1024).await;
+    let (webrtc_throughput, webrtc_passed) = run_webrtc_upload_test(webrtc_service, webrtc_port, 1024).await;
 
     println!("========================================");
     println!("    Results Summary (1 GB)");

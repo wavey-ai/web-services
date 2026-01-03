@@ -299,6 +299,11 @@ impl UploadResponseService {
         self.next_stream_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Peek at the next stream ID that will be assigned (without incrementing)
+    pub fn peek_next_id(&self) -> u64 {
+        self.next_stream_id.load(Ordering::SeqCst)
+    }
+
     /// Get stream index from stream ID
     fn stream_idx(&self, stream_id: u64) -> usize {
         (stream_id % self.config.num_streams as u64) as usize

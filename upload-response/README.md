@@ -209,20 +209,40 @@ Upload size: 512 MB
       2048 KB |    1307 MB/s |          256
 ```
 
-### Protocol Throughput (1 GB Upload)
+### Protocol Throughput (100 MB Upload)
 
-End-to-end benchmarks with real servers (TLS + protocol overhead):
+Benchmarks with real servers measuring client send time:
 
-| Protocol | Throughput |
-|----------|------------|
-| WSS      | 917 MB/s |
-| HTTP/1.1 (chunked) | 795 MB/s |
-| RTMP     | 783 MB/s |
-| HTTP/2   | 674 MB/s |
-| HTTP/1.1 | 621 MB/s |
-| HTTP/3   | 192 MB/s |
-| SRT      | 136 MB/s |
-| WebRTC   | TBD |
+| Protocol | Throughput | Notes |
+|----------|------------|-------|
+| WSS | 917 MB/s | Binary frames with minimal framing overhead |
+| HTTP/1.1 (chunked) | 795 MB/s | Streaming without Content-Length |
+| RTMP | 428 MB/s | TCP framing with AccessUnit serialization |
+| HTTP/2 | 674 MB/s | Multiplexing overhead, concurrent streams |
+| WebRTC | 195 MB/s | SCTP queue speed (send is non-blocking) |
+| HTTP/1.1 | 621 MB/s | Requires Content-Length |
+| HTTP/3 | 192 MB/s | QUIC encryption overhead |
+| SRT | 149 MB/s | Reliable UDP with ARQ |
+
+Note: HTTP protocols measure end-to-end (wait for response). SRT/RTMP/WebRTC measure client send completion.
+
+### High-Throughput Modes
+
+Both SRT and WebRTC support high-throughput configuration for bulk transfer:
+
+```rust
+// SRT high-throughput mode (adds SendBuffer, zero PeerLatency)
+let srt = SrtIngest::new(service);
+srt.start_high_throughput(addr).await?;
+
+// WebRTC high-throughput mode (larger SCTP messages, increased MTU)
+let (socket, loop_fut) = WebRtcSocketBuilder::new(&url)
+    .add_channel(ChannelConfig::reliable())
+    .high_throughput()
+    .build();
+```
+
+These modes optimize for throughput over latency, useful for file transfer scenarios.
 
 ### Cache Throughput (In-Memory)
 

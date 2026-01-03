@@ -19,7 +19,7 @@ hyper = { version = "1.6", features = ["full"] }
 srt = { git = "https://github.com/wavey-ai/av-rs.git", features = ["async"] }
 
 # WebRTC Data Channels
-matchbox_socket = { git = "ssh://git@github.com/wavey-ai/matchbox" }
+matchbox_socket = { git = "ssh://git@github.com/wavey-ai/matchbox", branch = "feat/graceful-shutdown" }
 futures-timer = "3"
 futures = "0.3"
 
@@ -44,5 +44,5 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 rtmp-ingress = { path = "../../rtmp-ingress", features = ["upload-response"] }
 rml_rtmp = { git = "ssh://git@github.com/wavey-ai/rust-media-libs.git" }
 # WebRTC testing
-matchbox_signaling = { git = "ssh://git@github.com/wavey-ai/matchbox" }
+matchbox_signaling = { git = "ssh://git@github.com/wavey-ai/matchbox", branch = "feat/graceful-shutdown" }
 futures-timer = "3"

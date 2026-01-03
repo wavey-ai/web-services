@@ -57,26 +57,55 @@ impl<A: SrtAuth> SrtIngest<A> {
         self,
         addr: SocketAddr,
     ) -> Result<watch::Sender<()>, Box<dyn std::error::Error + Send + Sync>> {
+        self.start_with_options(addr, false).await
+    }
+
+    /// Start the SRT listener with high-throughput mode
+    /// High-throughput mode adds larger send buffer and zero peer latency for bulk transfer
+    pub async fn start_high_throughput(
+        self,
+        addr: SocketAddr,
+    ) -> Result<watch::Sender<()>, Box<dyn std::error::Error + Send + Sync>> {
+        self.start_with_options(addr, true).await
+    }
+
+    async fn start_with_options(
+        self,
+        addr: SocketAddr,
+        high_throughput: bool,
+    ) -> Result<watch::Sender<()>, Box<dyn std::error::Error + Send + Sync>> {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(());
         let service = self.service;
         let auth = self.auth;
 
         let auth_clone = Arc::clone(&auth);
-        let listener = AsyncListener::bind_with_options(
-            addr,
-            [
+
+        let options: Vec<ListenerOption> = if high_throughput {
+            // High-throughput mode: maximize buffer sizes and minimize latency
+            vec![
                 ListenerOption::TimestampBasedPacketDeliveryMode(false),
                 ListenerOption::TooLatePacketDrop(false),
                 ListenerOption::ReceiveBufferSize(36400000),
-            ],
-        )?
-        .with_callback(move |stream_id: Option<&str>| {
-            if auth_clone.authenticate(stream_id) {
-                ListenerCallbackAction::Allow { passphrase: None }
-            } else {
-                ListenerCallbackAction::Deny
-            }
-        })?;
+                ListenerOption::SendBufferSize(36400000),
+                ListenerOption::PeerLatency(0),
+            ]
+        } else {
+            // Default mode: optimized for live media with some reliability
+            vec![
+                ListenerOption::TimestampBasedPacketDeliveryMode(false),
+                ListenerOption::TooLatePacketDrop(false),
+                ListenerOption::ReceiveBufferSize(36400000),
+            ]
+        };
+
+        let listener = AsyncListener::bind_with_options(addr, options)?
+            .with_callback(move |stream_id: Option<&str>| {
+                if auth_clone.authenticate(stream_id) {
+                    ListenerCallbackAction::Allow { passphrase: None }
+                } else {
+                    ListenerCallbackAction::Deny
+                }
+            })?;
 
         info!("SRT ingest server listening on {}", addr);
 
