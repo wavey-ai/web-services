@@ -4,15 +4,15 @@ A high-performance request/response proxy service that streams requests into a s
 
 ## Supported Protocols
 
-| Protocol | Transport | Auth | Notes |
-|----------|-----------|------|-------|
-| HTTP/1.1 | TCP+TLS | Bearer | Content-Length or chunked |
-| HTTP/2 | TCP+TLS | Bearer | Multiplexed streams |
-| HTTP/3 | QUIC/UDP | Bearer | Low latency |
-| WebSocket | TCP+TLS | Bearer | Binary frames |
-| WebRTC | UDP+DTLS | Signaling | Data channels, P2P capable |
-| SRT | UDP+AES | Stream ID | Reliable UDP, AES-128/256 encryption |
-| RTMP | TCP | Stream key | Plain TCP, media ingest |
+| Protocol | Transport | Encryption | Auth | Notes |
+|----------|-----------|------------|------|-------|
+| HTTP/1.1 | TCP | TLS | Bearer | Content-Length or chunked |
+| HTTP/2 | TCP | TLS | Bearer | Multiplexed streams |
+| HTTP/3 | UDP | QUIC | Bearer | Low latency |
+| WebSocket | TCP | TLS | Bearer | Binary frames |
+| WebRTC | UDP | DTLS | Signaling | Data channels, P2P capable |
+| SRT | UDP | AES-128 | Stream ID | Reliable UDP, media ingest |
+| RTMP | TCP | None | Stream key | Media ingest, AccessUnits |
 
 ## Architecture
 
