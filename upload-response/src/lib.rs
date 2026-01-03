@@ -25,6 +25,13 @@ use web_service::{
 mod watcher;
 pub use watcher::ResponseWatcher;
 
+mod srt;
+pub use srt::{AllowAll, SrtAuth, SrtIngest};
+
+// For RTMP support, use rtmp-ingress with the "upload-response" feature:
+// rtmp-ingress = { ..., features = ["upload-response"] }
+// use rtmp_ingress::upload::{RtmpUploadIngest, RtmpAuth, AllowAll};
+
 /// End-of-stream marker - empty slot
 const END_MARKER: &[u8] = b"";
 

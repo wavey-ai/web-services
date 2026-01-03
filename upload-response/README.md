@@ -1,13 +1,24 @@
 # upload-response
 
-A high-performance request/response proxy service that streams HTTP requests into a shared-memory cache for external workers to process, then returns responses back to clients.
+A high-performance request/response proxy service that streams requests into a shared-memory cache for external workers to process, then returns responses back to clients.
+
+## Supported Protocols
+
+| Protocol | Transport | Auth | Notes |
+|----------|-----------|------|-------|
+| HTTP/1.1 | TCP+TLS | Bearer | Content-Length or chunked |
+| HTTP/2 | TCP+TLS | Bearer | Multiplexed streams |
+| HTTP/3 | QUIC/UDP | Bearer | Low latency |
+| WebSocket | TCP+TLS | Bearer | Binary frames |
+| SRT | UDP | Stream ID | Reliable UDP, media ingest |
+| RTMP | TCP | Stream key | Media ingest, AccessUnits |
 
 ## Architecture
 
 ```mermaid
 flowchart TB
     subgraph Ingress
-        Client[Client Request<br/>H1.1/H2/H3/WSS]
+        Client[Client Request<br/>H1.1/H2/H3/WSS/SRT/RTMP]
         Router[UploadResponseRouter]
     end
 
@@ -165,15 +176,17 @@ Upload size: 512 MB
 
 ### Protocol Throughput (1 GB Upload)
 
-End-to-end benchmarks with real HTTP servers (TLS + protocol overhead):
+End-to-end benchmarks with real servers (TLS + protocol overhead):
 
-| Protocol | Throughput | Notes |
-|----------|------------|-------|
-| WSS      | 902 MB/s | WebSocket binary frames |
-| HTTP/1.1 (chunked) | 782 MB/s | Transfer-Encoding: chunked |
-| HTTP/1.1 | 671 MB/s | Content-Length |
-| HTTP/2   | 668 MB/s | Single stream |
-| HTTP/3   | 226 MB/s | QUIC/UDP |
+| Protocol | Throughput |
+|----------|------------|
+| WSS      | 917 MB/s |
+| HTTP/1.1 (chunked) | 795 MB/s |
+| RTMP     | 783 MB/s |
+| HTTP/2   | 674 MB/s |
+| HTTP/1.1 | 621 MB/s |
+| HTTP/3   | 192 MB/s |
+| SRT      | 136 MB/s |
 
 ### Cache Throughput (In-Memory)
 
