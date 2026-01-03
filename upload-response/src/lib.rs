@@ -1,0 +1,606 @@
+use async_trait::async_trait;
+use bytes::Bytes;
+use http::{Request, StatusCode};
+use http_pack::stream::{
+    decode_frame, encode_frame, StreamFrame, StreamHeaders,
+    StreamRequestHeaders, StreamResponseHeaders,
+};
+use playlists::chunk_cache::ChunkCache;
+use playlists::Options;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::{oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::time::{timeout, Duration};
+use tracing::{debug, error, warn};
+use web_service::{
+    BodyStream, HandlerResponse, HandlerResult, Router, ServerError, StreamWriter,
+    WebSocketHandler, WebTransportHandler,
+};
+
+mod watcher;
+pub use watcher::ResponseWatcher;
+
+/// End-of-stream marker - empty slot
+const END_MARKER: &[u8] = b"";
+
+/// Configuration for the upload-response service
+#[derive(Debug, Clone)]
+pub struct UploadResponseConfig {
+    /// Maximum number of concurrent streams
+    pub num_streams: usize,
+    /// Buffer size per slot in KB
+    pub slot_size_kb: usize,
+    /// Maximum slots per stream (headers + body chunks + end)
+    pub slots_per_stream: usize,
+    /// Maximum time to wait for a response in milliseconds
+    pub response_timeout_ms: u64,
+}
+
+impl UploadResponseConfig {
+    /// Slot capacity in bytes
+    pub fn slot_bytes(&self) -> usize {
+        self.slot_size_kb * 1024
+    }
+}
+
+impl Default for UploadResponseConfig {
+    fn default() -> Self {
+        Self {
+            num_streams: 100,
+            slot_size_kb: 64,         // 64KB per slot (sweet spot for throughput)
+            slots_per_stream: 16384,  // ~1GB max per request at 64KB slots
+            response_timeout_ms: 30000,
+        }
+    }
+}
+
+/// Response type sent through oneshot channels
+pub type ResponseResult = Result<(StatusCode, Bytes), String>;
+
+/// Main service for handling upload-response lifecycle.
+///
+/// Format per stream (playlist):
+/// - Slot 1: HPKS Headers frame (method, path, headers)
+/// - Slot 2..N-1: Raw body bytes (no framing overhead)
+/// - Slot N: END marker
+pub struct UploadResponseService {
+    request_cache: Arc<ChunkCache>,
+    response_cache: Arc<ChunkCache>,
+    slot_semaphore: Arc<Semaphore>,
+    next_stream_id: AtomicU64,
+    response_channels: Arc<RwLock<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
+    config: UploadResponseConfig,
+}
+
+impl UploadResponseService {
+    /// Create a new upload-response service with the given configuration
+    pub fn new(config: UploadResponseConfig) -> Self {
+        let mut options = Options::default();
+        options.num_playlists = config.num_streams;
+        options.max_segments = 1;
+        options.max_parts_per_segment = config.slots_per_stream;
+        options.buffer_size_kb = config.slot_size_kb;
+
+        let request_cache = Arc::new(ChunkCache::new(options));
+        let response_cache = Arc::new(ChunkCache::new(options));
+        let slot_semaphore = Arc::new(Semaphore::new(config.num_streams));
+
+        Self {
+            request_cache,
+            response_cache,
+            slot_semaphore,
+            next_stream_id: AtomicU64::new(1),
+            response_channels: Arc::new(RwLock::new(HashMap::new())),
+            config,
+        }
+    }
+
+    /// Get a reference to the request cache for external consumers
+    pub fn request_cache(&self) -> Arc<ChunkCache> {
+        Arc::clone(&self.request_cache)
+    }
+
+    /// Get a reference to the response cache for external consumers
+    pub fn response_cache(&self) -> Arc<ChunkCache> {
+        Arc::clone(&self.response_cache)
+    }
+
+    /// Get the configuration
+    pub fn config(&self) -> &UploadResponseConfig {
+        &self.config
+    }
+
+    /// Get the response channels map for the watcher
+    pub fn response_channels(&self) -> Arc<RwLock<HashMap<u64, oneshot::Sender<ResponseResult>>>> {
+        Arc::clone(&self.response_channels)
+    }
+
+    /// Acquire a stream slot, blocking if at capacity
+    pub async fn acquire_stream(&self) -> Result<OwnedSemaphorePermit, String> {
+        self.slot_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "streams closed".to_string())
+    }
+
+    /// Get the next sequential stream ID
+    pub fn next_id(&self) -> u64 {
+        self.next_stream_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Get stream index from stream ID
+    fn stream_idx(&self, stream_id: u64) -> usize {
+        (stream_id % self.config.num_streams as u64) as usize
+    }
+
+    /// Write HPKS headers frame to slot 1 of request stream
+    pub async fn write_request_headers(&self, stream_id: u64, headers: StreamHeaders) -> Result<(), String> {
+        let stream_idx = self.stream_idx(stream_id);
+        let encoded = encode_frame(&StreamFrame::Headers(headers));
+        self.request_cache
+            .add(stream_idx, 1, Bytes::from(encoded))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Append raw body bytes to request stream (slots 2+)
+    pub async fn append_request_body(&self, stream_id: u64, data: Bytes) -> Result<(), String> {
+        let stream_idx = self.stream_idx(stream_id);
+        self.request_cache
+            .append(stream_idx, data)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Write end marker to request stream
+    pub async fn end_request(&self, stream_id: u64) -> Result<(), String> {
+        let stream_idx = self.stream_idx(stream_id);
+        self.request_cache
+            .append(stream_idx, Bytes::from_static(END_MARKER))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Write HPKS headers frame to slot 1 of response stream
+    pub async fn write_response_headers(&self, stream_id: u64, headers: StreamHeaders) -> Result<(), String> {
+        let stream_idx = self.stream_idx(stream_id);
+        let encoded = encode_frame(&StreamFrame::Headers(headers));
+        self.response_cache
+            .add(stream_idx, 1, Bytes::from(encoded))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Append raw body bytes to response stream (slots 2+)
+    pub async fn append_response_body(&self, stream_id: u64, data: Bytes) -> Result<(), String> {
+        let stream_idx = self.stream_idx(stream_id);
+        self.response_cache
+            .append(stream_idx, data)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Write end marker to response stream
+    pub async fn end_response(&self, stream_id: u64) -> Result<(), String> {
+        let stream_idx = self.stream_idx(stream_id);
+        self.response_cache
+            .append(stream_idx, Bytes::from_static(END_MARKER))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Get last slot index for a request stream
+    pub fn request_last(&self, stream_id: u64) -> Option<usize> {
+        let stream_idx = self.stream_idx(stream_id);
+        self.request_cache.last(stream_idx)
+    }
+
+    /// Get raw bytes from request stream slot
+    pub async fn request_get(&self, stream_id: u64, slot_id: usize) -> Option<Bytes> {
+        let stream_idx = self.stream_idx(stream_id);
+        let (bytes, _hash) = self.request_cache.get(stream_idx, slot_id).await?;
+        Some(bytes)
+    }
+
+    /// Get last slot index for a response stream
+    pub fn response_last(&self, stream_id: u64) -> Option<usize> {
+        let stream_idx = self.stream_idx(stream_id);
+        self.response_cache.last(stream_idx)
+    }
+
+    /// Get raw bytes from response stream slot
+    pub async fn response_get(&self, stream_id: u64, slot_id: usize) -> Option<Bytes> {
+        let stream_idx = self.stream_idx(stream_id);
+        let (bytes, _hash) = self.response_cache.get(stream_idx, slot_id).await?;
+        Some(bytes)
+    }
+
+    /// Check if slot is the end marker (empty)
+    pub fn is_end_marker(data: &[u8]) -> bool {
+        data.is_empty()
+    }
+
+    /// Register a response channel for a given stream ID
+    pub async fn register_response(&self, stream_id: u64) -> oneshot::Receiver<ResponseResult> {
+        let (tx, rx) = oneshot::channel();
+        let mut channels = self.response_channels.write().await;
+        channels.insert(stream_id, tx);
+        debug!(stream_id, "Registered response channel");
+        rx
+    }
+
+    /// Complete a response for a given stream ID (called by watcher or external consumer)
+    pub async fn complete_response(&self, stream_id: u64, result: ResponseResult) {
+        let tx = {
+            let mut channels = self.response_channels.write().await;
+            channels.remove(&stream_id)
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(result);
+            debug!(stream_id, "Completed response");
+        } else {
+            warn!(stream_id, "No response channel found");
+        }
+    }
+
+    /// Drop a response channel without completing (e.g., on timeout)
+    pub async fn drop_response_channel(&self, stream_id: u64) {
+        let mut channels = self.response_channels.write().await;
+        channels.remove(&stream_id);
+    }
+}
+
+/// Router implementation for upload-response
+pub struct UploadResponseRouter {
+    service: Arc<UploadResponseService>,
+}
+
+impl UploadResponseRouter {
+    /// Create a new router with the given service
+    pub fn new(service: Arc<UploadResponseService>) -> Self {
+        Self { service }
+    }
+
+    /// Get a reference to the underlying service
+    pub fn service(&self) -> Arc<UploadResponseService> {
+        Arc::clone(&self.service)
+    }
+
+    /// Stream a request into the cache and wait for response
+    ///
+    /// Format:
+    /// - Slot 1: HPKS headers frame
+    /// - Slot 2..N-1: Raw body bytes
+    /// - Slot N: END marker
+    async fn stream_request(
+        &self,
+        req: Request<()>,
+        mut body: Option<BodyStream>,
+    ) -> HandlerResult<HandlerResponse> {
+        // Acquire stream (blocks if at capacity)
+        let _permit = self
+            .service
+            .acquire_stream()
+            .await
+            .map_err(|e| ServerError::Config(e))?;
+
+        // Get next stream ID
+        let stream_id = self.service.next_id();
+        debug!(stream_id, uri = %req.uri(), "Streaming request");
+
+        // Slot 1: HPKS headers frame
+        let headers = StreamHeaders::from_request(stream_id, &req)
+            .map_err(|e| ServerError::Config(e.to_string()))?;
+        self.service
+            .write_request_headers(stream_id, headers)
+            .await
+            .map_err(|e| ServerError::Config(e))?;
+
+        // Slots 2+: Raw body bytes - write immediately as data arrives
+        if let Some(ref mut body_stream) = body {
+            use futures_util::StreamExt;
+
+            let slot_bytes = self.service.config.slot_bytes();
+
+            while let Some(chunk) = body_stream.next().await {
+                let chunk = chunk?;
+                if chunk.is_empty() {
+                    continue;
+                }
+
+                // If chunk fits in a slot, write immediately
+                if chunk.len() <= slot_bytes {
+                    self.service
+                        .append_request_body(stream_id, chunk)
+                        .await
+                        .map_err(|e| ServerError::Config(e))?;
+                } else {
+                    // Chunk too large - split into slot-sized pieces
+                    let mut remaining = chunk;
+                    while !remaining.is_empty() {
+                        let take = remaining.len().min(slot_bytes);
+                        let data = remaining.split_to(take);
+                        self.service
+                            .append_request_body(stream_id, data)
+                            .await
+                            .map_err(|e| ServerError::Config(e))?;
+                    }
+                }
+            }
+        }
+
+        // Final slot: END marker
+        self.service
+            .end_request(stream_id)
+            .await
+            .map_err(|e| ServerError::Config(e))?;
+
+        debug!(stream_id, "Request complete, waiting for response");
+
+        // Register response channel and wait
+        let rx = self.service.register_response(stream_id).await;
+
+        let timeout_duration = Duration::from_millis(self.service.config.response_timeout_ms);
+        match timeout(timeout_duration, rx).await {
+            Ok(Ok(Ok((status, body)))) => {
+                debug!(stream_id, ?status, "Received response");
+                Ok(HandlerResponse {
+                    status,
+                    body: Some(body),
+                    ..Default::default()
+                })
+            }
+            Ok(Ok(Err(e))) => {
+                error!(stream_id, error = %e, "Response error");
+                self.service.drop_response_channel(stream_id).await;
+                Err(ServerError::Config(e))
+            }
+            Ok(Err(_)) => {
+                error!(stream_id, "Response channel closed");
+                self.service.drop_response_channel(stream_id).await;
+                Err(ServerError::Config("response channel closed".to_string()))
+            }
+            Err(_) => {
+                error!(stream_id, "Response timeout");
+                self.service.drop_response_channel(stream_id).await;
+                Err(ServerError::Config("response timeout".to_string()))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Router for UploadResponseRouter {
+    async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
+        self.stream_request(req, None).await
+    }
+
+    async fn route_body(
+        &self,
+        req: Request<()>,
+        body: BodyStream,
+    ) -> HandlerResult<HandlerResponse> {
+        self.stream_request(req, Some(body)).await
+    }
+
+    fn has_body_handler(&self, _path: &str) -> bool {
+        true
+    }
+
+    fn is_streaming(&self, _path: &str) -> bool {
+        false
+    }
+
+    async fn route_stream(
+        &self,
+        _req: Request<()>,
+        _stream_writer: Box<dyn StreamWriter>,
+    ) -> HandlerResult<()> {
+        Err(ServerError::Config(
+            "streaming responses not supported".to_string(),
+        ))
+    }
+
+    fn webtransport_handler(&self) -> Option<&dyn WebTransportHandler> {
+        None
+    }
+
+    fn websocket_handler(&self, _path: &str) -> Option<&dyn WebSocketHandler> {
+        None
+    }
+}
+
+/// Re-export for external consumers
+pub use http_pack::stream::{decode_frame as decode_hpks_frame, encode_frame as encode_hpks_frame};
+
+/// Slot content for workers tailing a request stream.
+#[derive(Debug, Clone)]
+pub enum TailSlot {
+    /// Slot 1: Parsed request headers (method, path, headers)
+    Headers(StreamRequestHeaders),
+    /// Slots 2..N-1: Raw body bytes (zero-copy from cache)
+    Body(Bytes),
+    /// Final slot: End marker
+    End,
+}
+
+impl UploadResponseService {
+    /// Tail a request stream slot by slot.
+    ///
+    /// - Slot 1: Returns parsed headers
+    /// - Slots 2..N-1: Returns raw body bytes (zero-copy)
+    /// - Final slot: Returns End when END marker encountered
+    pub async fn tail_request(&self, stream_id: u64, slot_id: usize) -> Option<TailSlot> {
+        let bytes = self.request_get(stream_id, slot_id).await?;
+
+        if slot_id == 1 {
+            // First slot is HPKS headers frame
+            let frame = decode_frame(&bytes).ok()?;
+            if let StreamFrame::Headers(StreamHeaders::Request(req)) = frame {
+                Some(TailSlot::Headers(req))
+            } else {
+                None
+            }
+        } else if Self::is_end_marker(&bytes) {
+            Some(TailSlot::End)
+        } else {
+            // Raw body bytes - zero-copy
+            Some(TailSlot::Body(bytes))
+        }
+    }
+
+    /// Tail a response stream slot by slot.
+    pub async fn tail_response(&self, stream_id: u64, slot_id: usize) -> Option<TailSlot> {
+        let bytes = self.response_get(stream_id, slot_id).await?;
+
+        if slot_id == 1 {
+            // First slot is HPKS headers frame - use get_response_headers() instead
+            None
+        } else if Self::is_end_marker(&bytes) {
+            Some(TailSlot::End)
+        } else {
+            Some(TailSlot::Body(bytes))
+        }
+    }
+
+    /// Parse response headers from slot 1
+    pub async fn get_response_headers(&self, stream_id: u64) -> Option<StreamResponseHeaders> {
+        let bytes = self.response_get(stream_id, 1).await?;
+        let frame = decode_frame(&bytes).ok()?;
+        if let StreamFrame::Headers(StreamHeaders::Response(resp)) = frame {
+            Some(resp)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_service_creation() {
+        let config = UploadResponseConfig::default();
+        let service = UploadResponseService::new(config);
+        assert!(service.next_id() >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_stream_acquisition() {
+        let config = UploadResponseConfig {
+            num_streams: 2,
+            ..Default::default()
+        };
+        let service = UploadResponseService::new(config);
+
+        let _permit1 = service.acquire_stream().await.unwrap();
+        let _permit2 = service.acquire_stream().await.unwrap();
+
+        // Third acquisition should block
+        let result = timeout(Duration::from_millis(10), service.acquire_stream()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stream_format() {
+        let config = UploadResponseConfig::default();
+        let service = UploadResponseService::new(config);
+
+        let stream_id = 1u64;
+
+        // Slot 1: HPKS headers frame
+        let headers = StreamHeaders::Request(StreamRequestHeaders {
+            stream_id,
+            version: http_pack::HttpVersion::Http11,
+            method: b"POST".to_vec(),
+            scheme: None,
+            authority: Some(b"example.com".to_vec()),
+            path: b"/upload".to_vec(),
+            headers: vec![],
+        });
+        service.write_request_headers(stream_id, headers).await.unwrap();
+
+        // Slot 2: Raw body bytes
+        service.append_request_body(stream_id, Bytes::from("hello")).await.unwrap();
+
+        // Slot 3: More raw body bytes
+        service.append_request_body(stream_id, Bytes::from(" world")).await.unwrap();
+
+        // Slot 4: END marker
+        service.end_request(stream_id).await.unwrap();
+
+        // Verify slot contents
+        let slot1 = service.request_get(stream_id, 1).await.unwrap();
+        assert!(slot1.starts_with(b"HPKS")); // HPKS magic
+
+        let slot2 = service.request_get(stream_id, 2).await.unwrap();
+        assert_eq!(slot2, Bytes::from("hello"));
+
+        let slot3 = service.request_get(stream_id, 3).await.unwrap();
+        assert_eq!(slot3, Bytes::from(" world"));
+
+        let slot4 = service.request_get(stream_id, 4).await.unwrap();
+        assert!(UploadResponseService::is_end_marker(&slot4));
+    }
+
+    #[tokio::test]
+    async fn test_tail_request() {
+        let config = UploadResponseConfig::default();
+        let service = UploadResponseService::new(config);
+
+        let stream_id = 1u64;
+
+        // Write stream
+        let headers = StreamHeaders::Request(StreamRequestHeaders {
+            stream_id,
+            version: http_pack::HttpVersion::Http11,
+            method: b"POST".to_vec(),
+            scheme: None,
+            authority: Some(b"example.com".to_vec()),
+            path: b"/upload".to_vec(),
+            headers: vec![],
+        });
+        service.write_request_headers(stream_id, headers).await.unwrap();
+        service.append_request_body(stream_id, Bytes::from("hello world")).await.unwrap();
+        service.end_request(stream_id).await.unwrap();
+
+        // Tail the stream
+        let slot1 = service.tail_request(stream_id, 1).await.unwrap();
+        if let TailSlot::Headers(h) = slot1 {
+            assert_eq!(h.method, b"POST");
+            assert_eq!(h.path, b"/upload");
+        } else {
+            panic!("Expected headers");
+        }
+
+        let slot2 = service.tail_request(stream_id, 2).await.unwrap();
+        if let TailSlot::Body(data) = slot2 {
+            assert_eq!(data, Bytes::from("hello world"));
+        } else {
+            panic!("Expected body");
+        }
+
+        let slot3 = service.tail_request(stream_id, 3).await.unwrap();
+        assert!(matches!(slot3, TailSlot::End));
+    }
+
+    #[tokio::test]
+    async fn test_response_channel_roundtrip() {
+        let config = UploadResponseConfig::default();
+        let service = Arc::new(UploadResponseService::new(config));
+
+        let stream_id = service.next_id();
+        let rx = service.register_response(stream_id).await;
+
+        service
+            .complete_response(stream_id, Ok((StatusCode::OK, Bytes::from("ok"))))
+            .await;
+
+        let (status, body) = rx.await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, Bytes::from("ok"));
+    }
+}

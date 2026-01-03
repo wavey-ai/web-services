@@ -1,0 +1,18 @@
+[package]
+name = "upload-response"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+web-service = { path = "../web-service/" }
+playlists = { path = "../../playlists" }
+http-pack = { path = "../../http-pack", default-features = false }
+tokio = { version = "1.45", features = ["full"] }
+bytes = "1.5"
+async-trait = "0.1.88"
+http = "1"
+tracing = "0.1.40"
+futures-util = "0.3"
+
+[dev-dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh64"] }

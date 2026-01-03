@@ -1,5 +1,5 @@
 [workspace]
-members = ["web-service", "hls", "chunks"]
+members = ["web-service", "hls", "chunks", "upload-response"]
 resolver = "3"
 
 [profile.release]
