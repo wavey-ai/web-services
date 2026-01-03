@@ -10,6 +10,7 @@ A high-performance request/response proxy service that streams requests into a s
 | HTTP/2 | TCP+TLS | Bearer | Multiplexed streams |
 | HTTP/3 | QUIC/UDP | Bearer | Low latency |
 | WebSocket | TCP+TLS | Bearer | Binary frames |
+| WebRTC | UDP (DTLS) | Signaling | Data channels, P2P capable |
 | SRT | UDP | Stream ID | Reliable UDP, media ingest |
 | RTMP | TCP | Stream key | Media ingest, AccessUnits |
 
@@ -18,7 +19,7 @@ A high-performance request/response proxy service that streams requests into a s
 ```mermaid
 flowchart TB
     subgraph Ingress
-        Client[Client Request<br/>H1.1/H2/H3/WSS/SRT/RTMP]
+        Client[Client Request<br/>H1.1/H2/H3/WSS/WebRTC/SRT/RTMP]
         Router[UploadResponseRouter]
     end
 
@@ -221,6 +222,7 @@ End-to-end benchmarks with real servers (TLS + protocol overhead):
 | HTTP/1.1 | 621 MB/s |
 | HTTP/3   | 192 MB/s |
 | SRT      | 136 MB/s |
+| WebRTC   | TBD |
 
 ### Cache Throughput (In-Memory)
 
