@@ -4,42 +4,48 @@ A high-performance request/response proxy service that streams HTTP requests int
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    subgraph Ingress
+        Client[Client Request<br/>H1.1/H2/H3]
+        Router[UploadResponseRouter]
+    end
+
+    subgraph Cache["Shared Memory Cache"]
+        ReqCache[(Request ChunkCache<br/>Slot 1: HPKS Headers<br/>Slot 2..N: Body bytes<br/>Slot N+1: END marker)]
+        RespCache[(Response ChunkCache<br/>Slot 1: HPKS Headers<br/>Slot 2..N: Body bytes<br/>Slot N+1: END marker)]
+    end
+
+    subgraph Workers["Worker Pool"]
+        W1[Worker 1<br/>register_reader]
+        W2[Worker 2<br/>register_reader]
+        W3[Worker 3<br/>register_reader]
+        Writer[Response Writer<br/>try_claim_response]
+    end
+
+    subgraph Egress
+        Watcher[ResponseWatcher]
+        Response[Client Response]
+    end
+
+    Client --> Router
+    Router -->|"write slots"| ReqCache
+    ReqCache -->|"tail_request<br/>(multi-reader)"| W1
+    ReqCache -->|"tail_request<br/>(multi-reader)"| W2
+    ReqCache -->|"tail_request<br/>(multi-reader)"| W3
+    W1 -.->|"processing"| Writer
+    W2 -.->|"processing"| Writer
+    W3 -.->|"processing"| Writer
+    Writer -->|"write slots<br/>(exclusive)"| RespCache
+    RespCache --> Watcher
+    Watcher --> Response
 ```
-Client Request (H1.1/H2/H3)
-       │
-       ▼
-┌─────────────────────────┐
-│  UploadResponseRouter   │
-│  (implements Router)    │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│  Request ChunkCache     │  ◄── Worker tails slots
-│  ┌─────┬─────┬─────┐    │
-│  │Slot1│Slot2│...  │    │
-│  │HPKS │Body │Body │    │
-│  │Hdrs │Bytes│Bytes│    │
-│  └─────┴─────┴─────┘    │
-└─────────────────────────┘
-            │
-            │ Worker processes request
-            ▼
-┌─────────────────────────┐
-│  Response ChunkCache    │  ◄── Worker writes response
-│  ┌─────┬─────┬─────┐    │
-│  │Slot1│Slot2│Empty│    │
-│  │HPKS │Body │(END)│    │
-│  │Hdrs │Bytes│     │    │
-│  └─────┴─────┴─────┘    │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│  ResponseWatcher        │
-│  (delivers to client)   │
-└─────────────────────────┘
-```
+
+### Worker Coordination
+
+- **Multiple Readers**: Any number of workers can register as readers via `register_reader(stream_id, worker_id)`
+- **Single Writer**: Only one worker can claim response write access via `try_claim_response(stream_id, worker_id)`
+- **Lock-free Reads**: Reader count is tracked with atomic counters for fast `has_readers()` checks
 
 ## Stream Format
 

@@ -70,6 +70,12 @@ pub struct UploadResponseService {
     slot_semaphore: Arc<Semaphore>,
     next_stream_id: AtomicU64,
     response_channels: Arc<RwLock<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
+    /// Per-stream worker count: how many workers are currently reading/processing
+    stream_worker_counts: Vec<AtomicU64>,
+    /// Per-stream worker sets: which worker IDs are reading/processing each stream
+    stream_workers: Arc<RwLock<Vec<std::collections::HashSet<String>>>>,
+    /// Per-stream response claim: None = unclaimed, Some(worker_id) = exclusive write access
+    response_claims: Arc<RwLock<Vec<Option<String>>>>,
     config: UploadResponseConfig,
 }
 
@@ -86,14 +92,163 @@ impl UploadResponseService {
         let response_cache = Arc::new(ChunkCache::new(options));
         let slot_semaphore = Arc::new(Semaphore::new(config.num_streams));
 
+        // Initialize per-stream worker counts
+        let stream_worker_counts: Vec<AtomicU64> = (0..config.num_streams)
+            .map(|_| AtomicU64::new(0))
+            .collect();
+
+        // Initialize per-stream worker sets (for readers)
+        let stream_workers: Vec<std::collections::HashSet<String>> = (0..config.num_streams)
+            .map(|_| std::collections::HashSet::new())
+            .collect();
+
+        // Initialize per-stream response claims (for exclusive writer)
+        let response_claims: Vec<Option<String>> = (0..config.num_streams)
+            .map(|_| None)
+            .collect();
+
         Self {
             request_cache,
             response_cache,
             slot_semaphore,
             next_stream_id: AtomicU64::new(1),
             response_channels: Arc::new(RwLock::new(HashMap::new())),
+            stream_worker_counts,
+            stream_workers: Arc::new(RwLock::new(stream_workers)),
+            response_claims: Arc::new(RwLock::new(response_claims)),
             config,
         }
+    }
+
+    // ==================== Reader Registration (Multiple Workers) ====================
+
+    /// Register a worker as reading/processing a stream.
+    ///
+    /// Multiple workers can register on the same stream for reading.
+    /// Returns `true` if this worker was newly registered.
+    /// Returns `false` if this worker was already registered on this stream.
+    pub async fn register_reader(&self, stream_id: u64, worker_id: &str) -> bool {
+        let stream_idx = self.stream_idx(stream_id);
+        let mut workers = self.stream_workers.write().await;
+        let inserted = workers[stream_idx].insert(worker_id.to_string());
+        if inserted {
+            self.stream_worker_counts[stream_idx].fetch_add(1, Ordering::SeqCst);
+            debug!(stream_id, worker_id, "Reader registered");
+        }
+        inserted
+    }
+
+    /// Unregister a reader worker from a stream.
+    ///
+    /// Returns `true` if the worker was registered and is now removed.
+    /// Returns `false` if the worker was not registered on this stream.
+    pub async fn unregister_reader(&self, stream_id: u64, worker_id: &str) -> bool {
+        let stream_idx = self.stream_idx(stream_id);
+        let mut workers = self.stream_workers.write().await;
+        let removed = workers[stream_idx].remove(worker_id);
+        if removed {
+            self.stream_worker_counts[stream_idx].fetch_sub(1, Ordering::SeqCst);
+            debug!(stream_id, worker_id, "Reader unregistered");
+        }
+        removed
+    }
+
+    /// Get the number of readers currently processing a stream (lock-free).
+    pub fn reader_count(&self, stream_id: u64) -> u64 {
+        let stream_idx = self.stream_idx(stream_id);
+        self.stream_worker_counts[stream_idx].load(Ordering::SeqCst)
+    }
+
+    /// Check if any readers are processing a stream (lock-free).
+    pub fn has_readers(&self, stream_id: u64) -> bool {
+        self.reader_count(stream_id) > 0
+    }
+
+    /// Check if a specific reader is registered on a stream.
+    pub async fn is_reader_registered(&self, stream_id: u64, worker_id: &str) -> bool {
+        let stream_idx = self.stream_idx(stream_id);
+        let workers = self.stream_workers.read().await;
+        workers[stream_idx].contains(worker_id)
+    }
+
+    /// Get all reader worker IDs currently processing a stream.
+    pub async fn get_readers(&self, stream_id: u64) -> Vec<String> {
+        let stream_idx = self.stream_idx(stream_id);
+        let workers = self.stream_workers.read().await;
+        workers[stream_idx].iter().cloned().collect()
+    }
+
+    /// Clear all readers from a stream (for cleanup/recovery).
+    pub async fn clear_readers(&self, stream_id: u64) {
+        let stream_idx = self.stream_idx(stream_id);
+        let mut workers = self.stream_workers.write().await;
+        workers[stream_idx].clear();
+        self.stream_worker_counts[stream_idx].store(0, Ordering::SeqCst);
+        debug!(stream_id, "All readers cleared");
+    }
+
+    // ==================== Response Writer Claim (Exclusive) ====================
+
+    /// Try to claim exclusive write access to a stream's response.
+    ///
+    /// Only one worker can hold the response claim at a time.
+    /// Returns `true` if the claim succeeded (response was unclaimed).
+    /// Returns `false` if another worker already claimed this response.
+    pub async fn try_claim_response(&self, stream_id: u64, worker_id: &str) -> bool {
+        let stream_idx = self.stream_idx(stream_id);
+        let mut claims = self.response_claims.write().await;
+        if claims[stream_idx].is_none() {
+            claims[stream_idx] = Some(worker_id.to_string());
+            debug!(stream_id, worker_id, "Response claimed");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Release a previously claimed response.
+    ///
+    /// Returns `true` if released successfully (caller was the owner).
+    /// Returns `false` if the response was not claimed by this worker.
+    pub async fn release_response(&self, stream_id: u64, worker_id: &str) -> bool {
+        let stream_idx = self.stream_idx(stream_id);
+        let mut claims = self.response_claims.write().await;
+        if claims[stream_idx].as_deref() == Some(worker_id) {
+            claims[stream_idx] = None;
+            debug!(stream_id, worker_id, "Response released");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Force-release a response regardless of owner (for cleanup/recovery).
+    pub async fn force_release_response(&self, stream_id: u64) {
+        let stream_idx = self.stream_idx(stream_id);
+        let mut claims = self.response_claims.write().await;
+        claims[stream_idx] = None;
+        debug!(stream_id, "Response force-released");
+    }
+
+    /// Get the worker ID that currently holds the response claim, if any.
+    pub async fn response_owner(&self, stream_id: u64) -> Option<String> {
+        let stream_idx = self.stream_idx(stream_id);
+        let claims = self.response_claims.read().await;
+        claims[stream_idx].clone()
+    }
+
+    /// Check if the response is claimed by a specific worker.
+    pub async fn is_response_claimed_by(&self, stream_id: u64, worker_id: &str) -> bool {
+        let stream_idx = self.stream_idx(stream_id);
+        let claims = self.response_claims.read().await;
+        claims[stream_idx].as_deref() == Some(worker_id)
+    }
+
+    /// Check if the response is currently claimed by anyone.
+    pub async fn is_response_claimed(&self, stream_id: u64) -> bool {
+        let stream_idx = self.stream_idx(stream_id);
+        let claims = self.response_claims.read().await;
+        claims[stream_idx].is_some()
     }
 
     /// Get a reference to the request cache for external consumers
@@ -602,5 +757,122 @@ mod tests {
         let (status, body) = rx.await.unwrap().unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, Bytes::from("ok"));
+    }
+
+    #[tokio::test]
+    async fn test_reader_registration() {
+        let config = UploadResponseConfig {
+            num_streams: 10,
+            ..Default::default()
+        };
+        let service = UploadResponseService::new(config);
+
+        let stream_id = 1u64;
+
+        // Initially no readers
+        assert_eq!(service.reader_count(stream_id), 0);
+        assert!(!service.has_readers(stream_id));
+
+        // Register multiple readers
+        assert!(service.register_reader(stream_id, "worker-1").await);
+        assert!(service.register_reader(stream_id, "worker-2").await);
+        assert!(service.register_reader(stream_id, "worker-3").await);
+
+        assert_eq!(service.reader_count(stream_id), 3);
+        assert!(service.has_readers(stream_id));
+        assert!(service.is_reader_registered(stream_id, "worker-1").await);
+        assert!(service.is_reader_registered(stream_id, "worker-2").await);
+
+        // Duplicate registration returns false
+        assert!(!service.register_reader(stream_id, "worker-1").await);
+        assert_eq!(service.reader_count(stream_id), 3);
+
+        // Unregister one reader
+        assert!(service.unregister_reader(stream_id, "worker-2").await);
+        assert_eq!(service.reader_count(stream_id), 2);
+        assert!(!service.is_reader_registered(stream_id, "worker-2").await);
+
+        // Unregister non-existent returns false
+        assert!(!service.unregister_reader(stream_id, "worker-2").await);
+
+        // Clear all readers
+        service.clear_readers(stream_id).await;
+        assert_eq!(service.reader_count(stream_id), 0);
+    }
+
+    #[tokio::test]
+    async fn test_response_claim() {
+        let config = UploadResponseConfig {
+            num_streams: 10,
+            ..Default::default()
+        };
+        let service = UploadResponseService::new(config);
+
+        let stream_id = 1u64;
+
+        // Initially unclaimed
+        assert!(service.response_owner(stream_id).await.is_none());
+        assert!(!service.is_response_claimed(stream_id).await);
+
+        // Worker 1 claims successfully
+        assert!(service.try_claim_response(stream_id, "writer-1").await);
+        assert_eq!(service.response_owner(stream_id).await, Some("writer-1".to_string()));
+        assert!(service.is_response_claimed_by(stream_id, "writer-1").await);
+        assert!(!service.is_response_claimed_by(stream_id, "writer-2").await);
+
+        // Worker 2 cannot claim (already claimed)
+        assert!(!service.try_claim_response(stream_id, "writer-2").await);
+        assert_eq!(service.response_owner(stream_id).await, Some("writer-1".to_string()));
+
+        // Worker 2 cannot release (not owner)
+        assert!(!service.release_response(stream_id, "writer-2").await);
+        assert_eq!(service.response_owner(stream_id).await, Some("writer-1".to_string()));
+
+        // Worker 1 releases successfully
+        assert!(service.release_response(stream_id, "writer-1").await);
+        assert!(service.response_owner(stream_id).await.is_none());
+
+        // Now worker 2 can claim
+        assert!(service.try_claim_response(stream_id, "writer-2").await);
+        assert_eq!(service.response_owner(stream_id).await, Some("writer-2".to_string()));
+
+        // Force release works regardless of owner
+        service.force_release_response(stream_id).await;
+        assert!(service.response_owner(stream_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_response_claim() {
+        use std::sync::atomic::AtomicUsize;
+
+        let config = UploadResponseConfig {
+            num_streams: 10,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new(config));
+
+        let stream_id = 1u64;
+        let claim_count = Arc::new(AtomicUsize::new(0));
+
+        // Spawn 10 workers trying to claim the same response
+        let mut handles = vec![];
+        for i in 0..10 {
+            let svc = Arc::clone(&service);
+            let count = Arc::clone(&claim_count);
+            let worker_id = format!("worker-{}", i);
+            handles.push(tokio::spawn(async move {
+                if svc.try_claim_response(stream_id, &worker_id).await {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Exactly one worker should have claimed it
+        assert_eq!(claim_count.load(Ordering::SeqCst), 1);
+        assert!(service.response_owner(stream_id).await.is_some());
     }
 }
