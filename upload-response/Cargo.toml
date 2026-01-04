@@ -3,6 +3,13 @@ name = "upload-response"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["tcp"]
+srt = ["dep:srt"]
+rist = ["dep:rist"]
+webrtc = ["dep:matchbox_socket", "dep:futures-timer", "dep:futures"]
+tcp = []
+
 [dependencies]
 web-service = { path = "../web-service/" }
 playlists = { path = "../../playlists" }
@@ -16,12 +23,13 @@ futures-util = "0.3"
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 hyper-util = { version = "0.1", features = ["full"] }
 hyper = { version = "1.6", features = ["full"] }
-srt = { git = "https://github.com/wavey-ai/av-rs.git", features = ["async"] }
+srt = { git = "https://github.com/wavey-ai/av-rs.git", features = ["async"], optional = true }
+rist = { path = "../../rist-rs/rist", features = ["tokio"], optional = true }
 
-# WebRTC Data Channels
-matchbox_socket = { git = "ssh://git@github.com/wavey-ai/matchbox", branch = "feat/graceful-shutdown" }
-futures-timer = "3"
-futures = "0.3"
+# WebRTC Data Channels (optional)
+matchbox_socket = { git = "https://github.com/wavey-ai/matchbox", branch = "feat/graceful-shutdown", optional = true }
+futures-timer = { version = "3", optional = true }
+futures = { version = "0.3", optional = true }
 
 # TCP+TLS
 tokio-rustls = "0.26"
@@ -30,6 +38,7 @@ rustls-pemfile = "2"
 
 [dev-dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+base64 = "0.22"
 reqwest = { version = "0.12", features = ["rustls-tls", "http2", "stream"] }
 portpicker = "0.1"
 http-body-util = "0.1"
@@ -49,5 +58,5 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 rtmp-ingress = { path = "../../rtmp-ingress", features = ["upload-response", "tls"] }
 rml_rtmp = { git = "https://github.com/wavey-ai/rust-media-libs.git" }
 # WebRTC testing
-matchbox_signaling = { git = "ssh://git@github.com/wavey-ai/matchbox", branch = "feat/graceful-shutdown" }
+matchbox_signaling = { git = "https://github.com/wavey-ai/matchbox", branch = "feat/graceful-shutdown" }
 futures-timer = "3"

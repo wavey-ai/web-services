@@ -25,10 +25,19 @@ use web_service::{
 mod watcher;
 pub use watcher::ResponseWatcher;
 
+#[cfg(feature = "srt")]
 mod srt;
+#[cfg(feature = "srt")]
 pub use srt::{AllowAll, AllowAllEncrypted, SrtAuth, SrtIngest};
 
+#[cfg(feature = "rist")]
+mod rist;
+#[cfg(feature = "rist")]
+pub use rist::{AllowAllRist, RistAuth, RistIngest};
+
+#[cfg(feature = "webrtc")]
 mod webrtc;
+#[cfg(feature = "webrtc")]
 pub use webrtc::{AllowAllWebRtc, WebRtcAuth, WebRtcIngest};
 
 mod tcp;

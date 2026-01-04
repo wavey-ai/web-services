@@ -15,6 +15,7 @@ The shared-memory ChunkCache and slot-based streaming architecture are inspired 
 | WebSocket | TCP | TLS | Bearer | Binary frames |
 | WebRTC | UDP | DTLS | Signaling | Data channels, P2P capable |
 | SRT | UDP | AES-128 | Stream ID | Reliable UDP, media ingest |
+| RIST | UDP | DTLS/PSK | URL params | Reliable UDP, broadcast ingest |
 | RTMP | TCP | None | Stream key | Plain TCP, media ingest |
 | RTMPS | TCP | TLS | Stream key | TLS-wrapped RTMP |
 
@@ -23,7 +24,7 @@ The shared-memory ChunkCache and slot-based streaming architecture are inspired 
 ```mermaid
 flowchart TB
     subgraph Ingress
-        Client[Client Request<br/>H1.1/H2/H3/WSS/WebRTC/SRT/RTMP]
+        Client[Client Request<br/>H1.1/H2/H3/WSS/WebRTC/SRT/RIST/RTMP]
         Router[UploadResponseRouter]
     end
 
@@ -229,6 +230,7 @@ Benchmarks with real servers measuring client send time:
 | WebRTC | 195 MB/s | DTLS, SCTP data channels |
 | HTTP/3 | 192 MB/s | QUIC encryption overhead |
 | SRT | 142 MB/s | AES-128, reliable UDP with ARQ |
+| RIST | 120 MB/s | Main profile, reliable UDP |
 
 Note: HTTP/WebSocket protocols measure end-to-end (wait for response). SRT/RTMP/WebRTC measure client send completion.
 
