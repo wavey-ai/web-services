@@ -36,7 +36,7 @@ h3 = "0.0.8"
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"
 h3-datagram = "0.0.2"
-playlists = { path = "../../playlists" }
+playlists = { git = "https://github.com/wavey-ai/playlists.git" }
 tls-helpers = { git = "https://github.com/wavey-ai/tls-helpers.git" }
 xmpegts = { git = "https://github.com/wavey-ai/xiu" }
 async-trait = "0.1.88"
@@ -48,7 +48,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 url = { version = "2", features = ["serde"] }
-http-pack = { path = "../../http-pack" }
+http-pack = { git = "https://github.com/wavey-ai/http-pack.git" }
 rustls-pemfile = "2"
 
 [dev-dependencies]
