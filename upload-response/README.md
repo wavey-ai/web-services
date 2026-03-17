@@ -18,6 +18,7 @@ The shared-memory ChunkCache and slot-based streaming architecture are inspired 
 | RIST | UDP | DTLS/PSK | URL params | Reliable UDP, broadcast ingest |
 | RTMP | TCP | None | Stream key | Plain TCP, media ingest |
 | RTMPS | TCP | TLS | Stream key | TLS-wrapped RTMP |
+| UDP+FEC | UDP | None | None | RaptorQ FEC, lowest-latency reliable delivery |
 
 ## Architecture
 
@@ -77,6 +78,39 @@ Each request/response stream uses a simple slot-based format:
 - **HPKS**: HTTP-pack streaming format for headers
 - **Body slots**: Raw bytes, zero-copy from cache
 - **End marker**: Empty slot signals stream completion
+
+### UDP+FEC Payload Format
+
+UDP+FEC (feature `udp-fec`) uses [RaptorQ](https://www.rfc-editor.org/rfc/rfc6330) forward error correction over plain UDP. Each datagram carries a 12-byte wire header followed by a serialised RaptorQ `EncodingPacket`:
+
+```
+0               4               8              12
+├───────────────┼───────────────┼───────────────┤
+│   block_id    │transfer_length│src_syms│sym_sz │  header (12 bytes)
+└───────────────┴───────────────┴───────────────┘
+│          EncodingPacket bytes …               │  variable
+```
+
+| Field | Size | Description |
+|-------|------|-------------|
+| `block_id` | u32 LE | Monotonically increasing block counter |
+| `transfer_length` | u32 LE | Total source bytes in this block |
+| `src_syms` | u16 LE | K — source symbols per block |
+| `sym_sz` | u16 LE | T — symbol size in bytes (default 1316) |
+
+Defaults: K=4, T=1316, R=1 repair symbol → recovers any single datagram loss per block with ~80 ms latency overhead at 48 kHz/960-sample frames.
+
+```rust
+use upload_response::{UdpFecIngest, UdpFecSender};
+
+// Sender
+let mut sender = UdpFecSender::new(target_addr).await?;
+sender.send(&audio_frame).await?;
+
+// Receiver (ingest server)
+let ingest = UdpFecIngest::new(service.clone());
+let shutdown_tx = ingest.start(bind_addr).await?;
+```
 
 ### RTMP Payload Format
 
@@ -214,25 +248,45 @@ Upload size: 512 MB
       2048 KB |    1307 MB/s |          256
 ```
 
-### Protocol Throughput (100 MB Upload)
+### Protocol Throughput
 
-Benchmarks with real servers measuring client send time:
+Benchmarked on Apple Silicon (M-series), `--release`, 512 MB upload:
 
 | Protocol | Throughput | Notes |
 |----------|------------|-------|
-| TCP | 978 MB/s | Raw TLS, minimal overhead |
-| WebSocket | 917 MB/s | Binary frames |
-| HTTP/1.1 (chunked) | 795 MB/s | Streaming without Content-Length |
-| RTMP | 750 MB/s | Plain TCP, AccessUnit serialization |
-| HTTP/2 | 674 MB/s | Multiplexing overhead |
-| RTMPS | 662 MB/s | TLS-wrapped RTMP |
-| HTTP/1.1 | 621 MB/s | Requires Content-Length |
-| WebRTC | 195 MB/s | DTLS, SCTP data channels |
-| HTTP/3 | 192 MB/s | QUIC encryption overhead |
-| SRT | 142 MB/s | AES-128, reliable UDP with ARQ |
-| RIST | 120 MB/s | Main profile, reliable UDP |
+| WebSocket | 1244 MB/s | Binary frames |
+| HTTP/1.1 (chunked) | 1053 MB/s | Streaming without Content-Length |
+| HTTP/2 | 798 MB/s | Multiplexed streams |
+| RTMP | 604 MB/s | Plain TCP, AccessUnit serialization |
+| WebRTC | 580 MB/s | DTLS, SCTP data channels |
+| HTTP/1.1 | 551 MB/s | Requires Content-Length |
+| HTTP/3 | 199 MB/s | QUIC encryption overhead |
+| SRT | 125 MB/s | AES-128, reliable UDP with ARQ |
+| RIST | 105 MB/s | Main profile, reliable UDP |
+| UDP+FEC | 49 MB/s | RaptorQ FEC encode/decode bound; fixed-latency reliable delivery |
 
-Note: HTTP/WebSocket protocols measure end-to-end (wait for response). SRT/RTMP/WebRTC measure client send completion.
+Note: HTTP/WebSocket protocols measure end-to-end (wait for response). SRT/RTMP/WebRTC/UDP+FEC measure client send completion.
+
+### UDP+FEC Throughput
+
+UDP+FEC is optimised for **latency**, not bulk throughput. The RaptorQ codec dominates at high data rates. For audio use-cases (small frames, ~20 ms cadence) the encode overhead is negligible.
+
+```
+========================================
+    UDP+FEC (RaptorQ) Benchmark  (--release, loopback)
+========================================
+UDP+FEC 100 MB:          49.2 MB/s ✓
+UDP+FEC loss-recovery:   23.8 MB/s ✓   (20% packet loss, 2 repair symbols)
+========================================
+```
+
+Tune K and R to balance latency vs redundancy:
+
+| K (src syms) | R (repair) | Block latency @ 48 kHz/960 | Recovers |
+|---|---|---|---|
+| 4 | 1 | ~80 ms | any 1 loss per 5 packets |
+| 2 | 1 | ~40 ms | any 1 loss per 3 packets |
+| 1 | 1 | ~20 ms | any 1 loss per 2 packets |
 
 ### High-Throughput Modes
 
@@ -294,6 +348,9 @@ cargo test -p upload-response --release -- --nocapture
 # Specific benchmark tests
 cargo test -p upload-response --release test_slot_size_benchmark -- --nocapture
 cargo test -p upload-response --release test_gigabyte_upload_benchmark -- --nocapture
+
+# UDP+FEC benchmark (requires udp-fec feature; --release for accurate throughput)
+cargo test -p upload-response --release --features "srt,rist,webrtc,tcp,udp-fec" test_udp_fec_benchmark -- --nocapture
 ```
 
 ## Dependencies
@@ -301,3 +358,4 @@ cargo test -p upload-response --release test_gigabyte_upload_benchmark -- --noca
 - `web-service` - HTTP server traits (Router, StreamWriter)
 - `playlists` - ChunkCache shared-memory ring buffer
 - `http-pack` - HPKS streaming HTTP format
+- `raptorq` *(optional, feature `udp-fec`)* - RaptorQ FEC codec

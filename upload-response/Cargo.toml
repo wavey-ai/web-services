@@ -9,6 +9,7 @@ srt = ["dep:srt"]
 rist = ["dep:rist"]
 webrtc = ["dep:matchbox_socket", "dep:futures-timer", "dep:futures"]
 tcp = []
+udp-fec = ["dep:raptorq"]
 
 [dependencies]
 web-service = { path = "../web-service/" }
@@ -24,6 +25,7 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 hyper-util = { version = "0.1", features = ["full"] }
 hyper = { version = "1.6", features = ["full"] }
 srt = { git = "https://github.com/wavey-ai/av-rs.git", features = ["async"], optional = true }
+raptorq = { version = "2", optional = true }
 rist = { path = "../../rist-rs/rist", features = ["tokio"], optional = true }
 
 # WebRTC Data Channels (optional)

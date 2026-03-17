@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "access-unit"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0215e41d6f07cabff62f495445aca5a6d50d497989b7b2718563750b319103ef"
+checksum = "089654a0182818690a0efe33f1c8fde8d0cee83a1dd043b6d358525857d1b169"
 dependencies = [
  "bytes",
 ]
@@ -640,6 +640,23 @@ checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 [[package]]
 name = "bytesio"
 version = "0.3.3"
+source = "git+ssh://git@github.com/wavey-ai/xiu#bb094ea076ae758d7b62642ab403fd2e94db027b"
+dependencies = [
+ "async-trait",
+ "byteorder",
+ "bytes",
+ "failure",
+ "futures",
+ "log",
+ "rand 0.3.23",
+ "tokio",
+ "tokio-stream",
+ "tokio-util 0.6.10",
+]
+
+[[package]]
+name = "bytesio"
+version = "0.3.3"
 source = "git+https://github.com/wavey-ai/xiu#bb094ea076ae758d7b62642ab403fd2e94db027b"
 dependencies = [
  "async-trait",
@@ -752,12 +769,12 @@ dependencies = [
  "async-trait",
  "bytes",
  "env_logger",
- "h3 0.0.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "h3",
  "h3-datagram",
  "h3-quinn",
  "h3-webtransport",
  "http",
- "playlists",
+ "playlists 0.1.3",
  "regex",
  "structopt",
  "tokio",
@@ -1441,7 +1458,7 @@ dependencies = [
 [[package]]
 name = "gatekeeper"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/gatekeeper.git#d901af098990bd27620782adf4c11702b0660caf"
+source = "git+ssh://git@github.com/wavey-ai/gatekeeper.git#d901af098990bd27620782adf4c11702b0660caf"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1615,26 +1632,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "h3"
-version = "0.0.8"
-source = "git+https://github.com/hyperium/h3.git#0e54a16df76102809ad99b03663b559dfc203917"
-dependencies = [
- "bytes",
- "fastrand",
- "futures-util",
- "http",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
 name = "h3-datagram"
 version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d2c9f77921668673721ae40f17c729fc48b9e38a663858097cea547484fdf0f"
 dependencies = [
  "bytes",
- "h3 0.0.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "h3",
  "pin-project-lite",
 ]
 
@@ -1646,7 +1650,7 @@ checksum = "8b2e732c8d91a74731663ac8479ab505042fbf547b9a207213ab7fbcbfc4f8b4"
 dependencies = [
  "bytes",
  "futures",
- "h3 0.0.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "h3",
  "h3-datagram",
  "quinn",
  "tokio",
@@ -1661,7 +1665,7 @@ checksum = "2d91a50fd582a5d67b1f756fba3cd9c66367ff4f23e1017c882f664d63b350a7"
 dependencies = [
  "bytes",
  "futures-util",
- "h3 0.0.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "h3",
  "h3-datagram",
  "http",
  "pin-project-lite",
@@ -1733,14 +1737,14 @@ dependencies = [
  "bytes",
  "env_logger",
  "futures-util",
- "h3 0.0.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "h3",
  "h3-datagram",
  "h3-quinn",
  "h3-webtransport",
  "http",
  "hyper",
  "hyper-util",
- "playlists",
+ "playlists 0.1.3",
  "regex",
  "structopt",
  "tokio",
@@ -1748,7 +1752,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "web-service",
- "xmpegts",
+ "xmpegts 0.2.0 (git+https://github.com/wavey-ai/xiu)",
 ]
 
 [[package]]
@@ -1799,7 +1803,22 @@ name = "http-pack"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "h3 0.0.8 (git+https://github.com/hyperium/h3.git)",
+ "h3",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httparse",
+ "message-packetizer",
+ "serde",
+]
+
+[[package]]
+name = "http-pack"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/http-pack.git#4381ecaeb649dd9b34698fe9350fee4deb744a6b"
+dependencies = [
+ "bytes",
+ "h3",
  "http",
  "http-body",
  "http-body-util",
@@ -2344,6 +2363,8 @@ dependencies = [
 [[package]]
 name = "message-packetizer"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9be79722528933c355e5eabe3d7ff8a08a1a0f7da00463cbba05e6bdd632647"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2411,7 +2432,7 @@ dependencies = [
 [[package]]
 name = "mse_fmp4"
 version = "0.2.0"
-source = "git+https://github.com/wavey-ai/mse_fmp4.git#2227e1ff102f4372395c671dc46750774dd6c360"
+source = "git+ssh://git@github.com/wavey-ai/mse_fmp4.git#2227e1ff102f4372395c671dc46750774dd6c360"
 dependencies = [
  "byteorder",
  "bytes",
@@ -2731,14 +2752,30 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "playlists"
-version = "0.1.0"
+version = "0.1.3"
 dependencies = [
  "access-unit",
  "bytes",
  "chrono",
  "flate2",
  "thiserror 1.0.69",
- "tls-helpers 0.1.6",
+ "tls-helpers 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "playlists"
+version = "0.1.3"
+source = "git+https://github.com/wavey-ai/playlists.git#a069d9ec7bd97f1b96a6b435541be8304fc680a4"
+dependencies = [
+ "access-unit",
+ "bytes",
+ "chrono",
+ "flate2",
+ "thiserror 1.0.69",
+ "tls-helpers 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio",
  "tracing",
  "xxhash-rust",
@@ -3061,6 +3098,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "raptorq"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
+
+[[package]]
 name = "rcgen"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3254,7 +3297,7 @@ dependencies = [
  "chrono",
  "futures",
  "gatekeeper",
- "http-pack",
+ "http-pack 0.1.0",
  "mse_fmp4",
  "rml_rtmp",
  "rustls 0.23.35",
@@ -3265,7 +3308,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "upload-response",
- "xmpegts",
+ "xmpegts 0.2.0 (git+ssh://git@github.com/wavey-ai/xiu)",
 ]
 
 [[package]]
@@ -4093,6 +4136,20 @@ dependencies = [
 [[package]]
 name = "tls-helpers"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83865f41768d6c4608fd739e8984e334a3a59f074fcb348ef0be7e5048dc9c9c"
+dependencies = [
+ "base64 0.22.1",
+ "rustls 0.23.35",
+ "rustls-pemfile 2.2.0",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
+name = "tls-helpers"
+version = "0.2.0"
 source = "git+https://github.com/wavey-ai/tls-helpers.git#83ed1898513321379b19f6311045164323212b31"
 dependencies = [
  "base64 0.22.1",
@@ -4499,18 +4556,19 @@ dependencies = [
  "futures",
  "futures-timer",
  "futures-util",
- "h3 0.0.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "h3",
  "h3-quinn",
  "http",
  "http-body-util",
- "http-pack",
+ "http-pack 0.1.0",
  "hyper",
  "hyper-util",
  "matchbox_signaling",
  "matchbox_socket",
- "playlists",
+ "playlists 0.1.3",
  "portpicker",
  "quinn",
+ "raptorq",
  "reqwest",
  "rist",
  "rml_rtmp",
@@ -4519,7 +4577,7 @@ dependencies = [
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
  "srt",
- "tls-helpers 0.2.0",
+ "tls-helpers 0.2.0 (git+https://github.com/wavey-ai/tls-helpers.git)",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.27.0",
@@ -4730,17 +4788,17 @@ dependencies = [
  "futures-util",
  "gen-id 0.3.0 (git+https://github.com/wavey-ai/gen-id.git)",
  "h2",
- "h3 0.0.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "h3",
  "h3-datagram",
  "h3-quinn",
  "h3-webtransport",
  "http",
  "http-body-util",
- "http-pack",
+ "http-pack 0.1.0 (git+https://github.com/wavey-ai/http-pack.git)",
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "playlists",
+ "playlists 0.1.3 (git+https://github.com/wavey-ai/playlists.git)",
  "portpicker",
  "quinn",
  "regex",
@@ -4753,7 +4811,7 @@ dependencies = [
  "sha2",
  "structopt",
  "thiserror 2.0.16",
- "tls-helpers 0.2.0",
+ "tls-helpers 0.2.0 (git+https://github.com/wavey-ai/tls-helpers.git)",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.27.0",
@@ -4761,7 +4819,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "webpki-roots 0.26.11",
- "xmpegts",
+ "xmpegts 0.2.0 (git+https://github.com/wavey-ai/xiu)",
  "xxhash-rust",
 ]
 
@@ -5318,11 +5376,22 @@ dependencies = [
 [[package]]
 name = "xmpegts"
 version = "0.2.0"
+source = "git+ssh://git@github.com/wavey-ai/xiu#bb094ea076ae758d7b62642ab403fd2e94db027b"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "bytesio 0.3.3 (git+ssh://git@github.com/wavey-ai/xiu)",
+ "failure",
+]
+
+[[package]]
+name = "xmpegts"
+version = "0.2.0"
 source = "git+https://github.com/wavey-ai/xiu#bb094ea076ae758d7b62642ab403fd2e94db027b"
 dependencies = [
  "byteorder",
  "bytes",
- "bytesio",
+ "bytesio 0.3.3 (git+https://github.com/wavey-ai/xiu)",
  "failure",
 ]
 

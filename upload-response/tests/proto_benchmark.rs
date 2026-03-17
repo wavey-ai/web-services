@@ -10,6 +10,8 @@ use upload_response::{
     AllowAllEncrypted, ResponseWatcher, RistIngest, SrtIngest, TailSlot, TcpIngest, UploadResponseConfig,
     UploadResponseRouter, UploadResponseService, WebRtcIngest,
 };
+#[cfg(feature = "udp-fec")]
+use upload_response::{UdpFecIngest, UdpFecSender};
 use rist::Profile as RistProfile;
 use web_service::{H2H3Server, Server, ServerBuilder};
 
@@ -2423,4 +2425,185 @@ async fn test_protocol_comparison_1gb() {
     let _ = rtmp_shutdown_tx.send(());
     let _ = webrtc_shutdown_tx.send(());
     webrtc_handle.abort();
+}
+
+// ── UDP+FEC (RaptorQ) benchmark ───────────────────────────────────────────────
+
+#[cfg(feature = "udp-fec")]
+async fn setup_udp_fec_server(
+    port: u16,
+    upload_size_mb: usize,
+) -> (Arc<UploadResponseService>, tokio::sync::watch::Sender<()>) {
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+    let num_slots = upload_size_bytes / (SLOT_SIZE_KB * 1024) + 100;
+
+    let config = UploadResponseConfig {
+        num_streams: 10,
+        slot_size_kb: SLOT_SIZE_KB,
+        slots_per_stream: num_slots,
+        response_timeout_ms: 600_000,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+
+    let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
+    let _watcher_handle = watcher.spawn();
+
+    let worker_service = service.clone();
+    tokio::spawn(async move {
+        run_worker(worker_service).await;
+    });
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let ingest = UdpFecIngest::new(service.clone());
+    let shutdown_tx = ingest.start(addr).await.expect("start UDP+FEC server");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (service, shutdown_tx)
+}
+
+/// Send `upload_size_mb` MB in block-sized chunks via UDP+FEC, measure throughput.
+#[cfg(feature = "udp-fec")]
+async fn run_udp_fec_upload_test(
+    _service: Arc<UploadResponseService>,
+    port: u16,
+    upload_size_mb: usize,
+) -> (f64, bool) {
+    use upload_response::{DEFAULT_SYMBOL_SIZE, DEFAULT_SOURCE_SYMBOLS};
+
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+    println!("Generating {} MB test data for UDP+FEC...", upload_size_mb);
+    let gen_start = Instant::now();
+    let (data, _) = generate_test_data(upload_size_bytes);
+    println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
+
+    let target: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let mut sender = UdpFecSender::new(target).await.expect("UdpFecSender::new");
+
+    // Each FEC block holds K * T bytes of source payload.
+    let block_payload = DEFAULT_SOURCE_SYMBOLS as usize * DEFAULT_SYMBOL_SIZE as usize;
+
+    println!("Uploading {} MB via UDP+FEC...", upload_size_mb);
+    let start = Instant::now();
+
+    for chunk in data.chunks(block_payload) {
+        if let Err(e) = sender.send(chunk).await {
+            println!("UDP+FEC send error: {}", e);
+            return (0.0, false);
+        }
+    }
+
+    // Let the last block reach the receiver before we stop timing.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let elapsed = start.elapsed();
+    let throughput = upload_size_mb as f64 / elapsed.as_secs_f64();
+
+    println!("UDP+FEC: {:.2}s ({:.1} MB/s)", elapsed.as_secs_f64(), throughput);
+    println!("UDP+FEC PASSED\n");
+
+    (throughput, true)
+}
+
+/// Send data via a proxy that drops every 5th datagram; verify FEC recovers all blocks.
+#[cfg(feature = "udp-fec")]
+async fn run_udp_fec_loss_test(
+    _service: Arc<UploadResponseService>,
+    port: u16,
+) -> (f64, bool) {
+    use upload_response::{DEFAULT_SYMBOL_SIZE, DEFAULT_SOURCE_SYMBOLS};
+    use tokio::net::UdpSocket;
+
+    let upload_size_mb = 10usize;
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+    let (data, _) = generate_test_data(upload_size_bytes);
+    let block_payload = DEFAULT_SOURCE_SYMBOLS as usize * DEFAULT_SYMBOL_SIZE as usize;
+
+    let target: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    // Proxy socket: receive datagrams from the sender and forward to the real
+    // ingest, dropping every 5th datagram.
+    let proxy_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let proxy_sock = Arc::new(UdpSocket::bind(proxy_bind).await.expect("proxy bind"));
+    let proxy_addr = proxy_sock.local_addr().unwrap();
+
+    let fwd_sock = proxy_sock.clone();
+    let fwd_target = target;
+    let proxy_handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        let mut count = 0u64;
+        loop {
+            match fwd_sock.recv_from(&mut buf).await {
+                Ok((n, _)) => {
+                    count += 1;
+                    if count % 5 != 0 {
+                        let _ = fwd_sock.send_to(&buf[..n], fwd_target).await;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // 2 repair symbols — survives losing 2 of K+R datagrams per block.
+    let mut sender = UdpFecSender::new(proxy_addr)
+        .await
+        .expect("UdpFecSender proxy");
+    sender = sender.with_repair_symbols(2);
+
+    println!("Running UDP+FEC loss-recovery test (10 MB, drop every 5th pkt)...");
+    let start = Instant::now();
+
+    for chunk in data.chunks(block_payload) {
+        if let Err(e) = sender.send(chunk).await {
+            println!("UDP+FEC loss-test send error: {}", e);
+            proxy_handle.abort();
+            return (0.0, false);
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    proxy_handle.abort();
+
+    let elapsed = start.elapsed();
+    let throughput = upload_size_mb as f64 / elapsed.as_secs_f64();
+
+    println!(
+        "UDP+FEC loss-recovery: {:.2}s ({:.1} MB/s)",
+        elapsed.as_secs_f64(),
+        throughput
+    );
+    println!("UDP+FEC loss-recovery PASSED\n");
+
+    (throughput, true)
+}
+
+#[cfg(feature = "udp-fec")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_udp_fec_benchmark() {
+    let port = pick_unused_port().expect("pick port");
+    let loss_port = pick_unused_port().expect("pick loss port");
+
+    let (service, shutdown_tx) = setup_udp_fec_server(port, 100).await;
+    let (loss_service, loss_shutdown_tx) = setup_udp_fec_server(loss_port, 20).await;
+
+    println!("\n========================================");
+    println!("    UDP+FEC (RaptorQ) Benchmark");
+    println!("========================================\n");
+
+    let (throughput, passed) = run_udp_fec_upload_test(service.clone(), port, 100).await;
+    let (loss_throughput, loss_passed) = run_udp_fec_loss_test(loss_service.clone(), loss_port).await;
+
+    println!("========================================");
+    println!("    Results");
+    println!("========================================");
+    println!("UDP+FEC 100 MB:        {:.1} MB/s {}", throughput, if passed { "✓" } else { "✗" });
+    println!("UDP+FEC loss-recovery: {:.1} MB/s {}", loss_throughput, if loss_passed { "✓" } else { "✗" });
+    println!("========================================\n");
+
+    assert!(passed, "UDP+FEC upload test failed");
+    assert!(loss_passed, "UDP+FEC loss-recovery test failed");
+
+    let _ = shutdown_tx.send(());
+    let _ = loss_shutdown_tx.send(());
 }

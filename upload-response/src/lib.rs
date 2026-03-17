@@ -43,6 +43,14 @@ pub use webrtc::{AllowAllWebRtc, WebRtcAuth, WebRtcIngest};
 mod tcp;
 pub use tcp::{AllowAllTcp, RequireClientCert, TcpAuth, TcpIngest};
 
+#[cfg(feature = "udp-fec")]
+mod udp_fec;
+#[cfg(feature = "udp-fec")]
+pub use udp_fec::{
+    UdpFecIngest, UdpFecSender, DEFAULT_REPAIR_SYMBOLS, DEFAULT_SOURCE_SYMBOLS,
+    DEFAULT_SYMBOL_SIZE, HEADER_LEN,
+};
+
 // For RTMP support, use rtmp-ingress with the "upload-response" feature:
 // rtmp-ingress = { ..., features = ["upload-response"] }
 // use rtmp_ingress::upload::{RtmpUploadIngest, RtmpAuth, AllowAll};
