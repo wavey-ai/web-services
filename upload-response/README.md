@@ -248,6 +248,33 @@ Upload size: 512 MB
       2048 KB |    1307 MB/s |          256
 ```
 
+### Protocol Latency
+
+Latency characteristics for streaming/real-time delivery (e.g. audio frames). This ranking is essentially the inverse of the throughput table.
+
+| Protocol | Latency Source | Worst-case one-way latency |
+|----------|---------------|---------------------------|
+| UDP+FEC | FEC block fill time only — no retransmit | **~20–80 ms** (tunable via K) |
+| Raw UDP | Single network hop | ~1 ms (no loss recovery) |
+| WebRTC | DTLS + SCTP + NACK retransmit | ~50–150 ms |
+| SRT | ARQ retransmit on loss adds ≥1 RTT | ~120–200 ms |
+| RIST | Same retransmit model as SRT | ~100–200 ms |
+| TCP/TLS | Head-of-line blocking, Nagle algorithm | unpredictable |
+| HTTP/1.1 | TCP HOL + framing overhead | worse than TCP |
+| HTTP/2 | Stream multiplexing + HOL at TCP layer | worse than TCP |
+| HTTP/3 | Per-stream HOL solved, but QUIC adds crypto RTT | ~50–100 ms |
+
+SRT and RIST trade latency for reliability via retransmission — a lost packet always costs at minimum one additional RTT. UDP+FEC pays its latency cost upfront and **deterministically**: worst-case latency is fixed at block-fill time regardless of packet loss, with zero retransmit jitter.
+
+For small audio frames at 48 kHz / 960 samples (~20 ms per frame), setting K=1 gives a fixed ~20 ms overhead with single-packet loss recovery (R=1):
+
+```rust
+let sender = UdpFecSender::new(target)
+    .await?
+    .with_source_symbols(1)   // K=1: one frame per FEC block
+    .with_repair_symbols(1);  // R=1: recovers any single datagram loss
+```
+
 ### Protocol Throughput
 
 Benchmarked on Apple Silicon (M-series), `--release`, 512 MB upload:
