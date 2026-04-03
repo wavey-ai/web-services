@@ -24,10 +24,10 @@
 
 The workspace still depends on several Wavey Git repositories outside crates.io, but Cargo fetches them directly over HTTPS. On a fresh machine, the first build may need network access for repositories such as:
 
-- `https://github.com/wavey-ai/playlists.git`
-- `https://github.com/wavey-ai/http-pack.git`
-- `https://github.com/wavey-ai/rist-rs.git`
-- `https://github.com/wavey-ai/rtmp-ingress.git`
+- [`playlists`](https://github.com/wavey-ai/playlists)
+- [`http-pack`](https://github.com/wavey-ai/http-pack)
+- [`rist-rs`](https://github.com/wavey-ai/rist-rs)
+- [`rtmp-ingress`](https://github.com/wavey-ai/rtmp-ingress)
 
 ## Common Commands
 
@@ -128,7 +128,7 @@ Each request and response stream uses a simple slot-based format:
 | 2..N-1 | Raw body bytes with no framing overhead |
 | N | Empty slot end marker |
 
-- `HPKS` is the `http-pack` streaming format for headers.
+- `HPKS` is the [`http-pack`](https://github.com/wavey-ai/http-pack) streaming format for headers.
 - Body slots are raw bytes and can be read zero-copy from the cache.
 - An empty slot signals stream completion.
 
@@ -183,7 +183,7 @@ RTMP streams serialize access units, parsed video or audio frames, to the cache:
 | `data_len` | 4 bytes | Payload length, big-endian |
 | `data` | N bytes | Video uses Annex-B NALUs, audio uses AAC plus ADTS |
 
-Use `rtmp-ingress` with the `upload-response` feature:
+Use [`rtmp-ingress`](https://github.com/wavey-ai/rtmp-ingress) with the `upload-response` feature:
 
 ```rust
 use rtmp_ingress::upload::{deserialize_access_unit, RtmpUploadIngest};
@@ -442,6 +442,6 @@ cargo test -p upload-response --release --features "srt,rist,webrtc,tcp,udp-fec"
 ### Dependencies
 
 - `web-service` provides server traits such as `Router` and `StreamWriter`.
-- `playlists` provides the shared-memory `ChunkCache`.
-- `http-pack` provides the HPKS framing used for headers.
+- [`playlists`](https://github.com/wavey-ai/playlists) provides the shared-memory `ChunkCache`.
+- [`http-pack`](https://github.com/wavey-ai/http-pack) provides the HPKS framing used for headers.
 - `raptorq` is optional and only needed for `udp-fec`.
