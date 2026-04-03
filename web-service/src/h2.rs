@@ -1,24 +1,25 @@
 use crate::{
     config::ServerConfig,
     error::{H2Error, ServerError, ServerResult},
-    traits::{BodyStream, HandlerResponse, Router},
+    traits::{BodyStream, HandlerResponse, Router, StreamWriter},
 };
 use bytes::Bytes;
+use futures_util::stream::unfold;
 use http::header::{HeaderName, HeaderValue};
 use http::{Response, StatusCode};
-use http_body_util::BodyExt;
-use http_body_util::Full;
-use hyper::body::Incoming;
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::upgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::tls_acceptor_from_base64;
 use tokio::net::{TcpListener, TcpSocket};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::{
     tungstenite::{handshake::derive_accept_key, protocol::Role},
     WebSocketStream,
@@ -28,6 +29,52 @@ use tracing::{error, info};
 pub struct Http2Server {
     config: ServerConfig,
     router: Arc<dyn Router>,
+}
+
+type H2ResponseBody = BoxBody<Bytes, Infallible>;
+
+struct H2StreamWriter {
+    response_tx: Option<oneshot::Sender<Result<Response<()>, ServerError>>>,
+    data_tx: Option<mpsc::Sender<Bytes>>,
+}
+
+impl H2StreamWriter {
+    fn new(
+        response_tx: oneshot::Sender<Result<Response<()>, ServerError>>,
+        data_tx: mpsc::Sender<Bytes>,
+    ) -> Self {
+        Self {
+            response_tx: Some(response_tx),
+            data_tx: Some(data_tx),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamWriter for H2StreamWriter {
+    async fn send_response(&mut self, response: Response<()>) -> Result<(), ServerError> {
+        let tx = self
+            .response_tx
+            .take()
+            .ok_or_else(|| ServerError::Config("stream response already sent".into()))?;
+        tx.send(Ok(response))
+            .map_err(|_| ServerError::Config("failed to send stream response head".into()))
+    }
+
+    async fn send_data(&mut self, data: Bytes) -> Result<(), ServerError> {
+        let tx = self
+            .data_tx
+            .as_ref()
+            .ok_or_else(|| ServerError::Config("stream already finished".into()))?;
+        tx.send(data)
+            .await
+            .map_err(|_| ServerError::Config("failed to send stream body chunk".into()))
+    }
+
+    async fn finish(&mut self) -> Result<(), ServerError> {
+        self.data_tx.take();
+        Ok(())
+    }
 }
 
 impl Http2Server {
@@ -139,14 +186,14 @@ async fn handle_h2_request(
     req: http::Request<Incoming>,
     router: Arc<dyn Router>,
     enable_websocket: bool,
-) -> Result<Response<Full<Bytes>>, H2Error> {
+) -> Result<Response<H2ResponseBody>, H2Error> {
     if enable_websocket && is_websocket_upgrade(&req) {
         if let Some(key) = req.headers().get("sec-websocket-key") {
             let has_handler = router.websocket_handler(req.uri().path()).is_some();
             if !has_handler {
                 return Ok(Response::builder()
                     .status(StatusCode::NOT_FOUND)
-                    .body(Full::new(Bytes::new()))
+                    .body(Full::new(Bytes::new()).boxed())
                     .map_err(|e| H2Error::Router(ServerError::Http(e)))?);
             }
 
@@ -217,7 +264,7 @@ async fn handle_h2_request(
                     HeaderName::from_static("sec-websocket-accept"),
                     HeaderValue::from_str(&accept_key)?,
                 )
-                .body(Full::new(Bytes::new()))
+                .body(Full::new(Bytes::new()).boxed())
                 .map_err(|e| H2Error::Router(ServerError::Http(e)))?;
 
             return Ok(response);
@@ -226,27 +273,25 @@ async fn handle_h2_request(
 
     let (parts, body) = req.into_parts();
     let path = parts.uri.path().to_string();
+    if router.has_body_stream_handler(&path) {
+        let stream = incoming_body_stream(body);
+        let req = http::Request::from_parts(parts, ());
+        return handle_h2_body_stream(req, stream, router).await;
+    }
+
+    if router.is_streaming(&path) {
+        let req = http::Request::from_parts(parts, ());
+        return handle_h2_stream(req, router).await;
+    }
+
     if router.has_body_handler(&path) {
-        use futures_util::stream::unfold;
-        let stream: BodyStream = Box::pin(unfold(body, |mut b: Incoming| async move {
-            match b.frame().await {
-                Some(Ok(frame)) => {
-                    let data = frame
-                        .into_data()
-                        .map(Bytes::from)
-                        .unwrap_or_else(|_| Bytes::new());
-                    Some((Ok(data), b))
-                }
-                Some(Err(e)) => Some((Err(ServerError::Handler(Box::new(e))), b)),
-                None => None,
-            }
-        }));
+        let stream = incoming_body_stream(body);
         let req = http::Request::from_parts(parts, ());
         let handler_response = router
             .route_body(req, stream)
             .await
             .map_err(H2Error::Router)?;
-        return build_response(handler_response);
+        return build_buffered_response(handler_response);
     }
 
     let mut body = body;
@@ -258,11 +303,77 @@ async fn handle_h2_request(
 
     let req = http::Request::from_parts(parts, ());
     let handler_response = router.route(req).await.map_err(H2Error::Router)?;
-    build_response(handler_response)
+    build_buffered_response(handler_response)
 }
 
-fn build_response(handler_response: HandlerResponse) -> Result<Response<Full<Bytes>>, H2Error> {
-    let mut response = Response::new(Full::from(handler_response.body.unwrap_or_else(Bytes::new)));
+fn incoming_body_stream(body: Incoming) -> BodyStream {
+    Box::pin(unfold(body, |mut b: Incoming| async move {
+        match b.frame().await {
+            Some(Ok(frame)) => {
+                let data = frame
+                    .into_data()
+                    .map(Bytes::from)
+                    .unwrap_or_else(|_| Bytes::new());
+                Some((Ok(data), b))
+            }
+            Some(Err(e)) => Some((Err(ServerError::Handler(Box::new(e))), b)),
+            None => None,
+        }
+    }))
+}
+
+async fn handle_h2_stream(
+    req: http::Request<()>,
+    router: Arc<dyn Router>,
+) -> Result<Response<H2ResponseBody>, H2Error> {
+    let (response_tx, response_rx) = oneshot::channel();
+    let (data_tx, data_rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        let writer = H2StreamWriter::new(response_tx, data_tx);
+        if let Err(err) = router.route_stream(req, Box::new(writer)).await {
+            error!("streaming handler error: {}", err);
+        }
+    });
+    await_h2_stream_response(response_rx, data_rx).await
+}
+
+async fn handle_h2_body_stream(
+    req: http::Request<()>,
+    body: BodyStream,
+    router: Arc<dyn Router>,
+) -> Result<Response<H2ResponseBody>, H2Error> {
+    let (response_tx, response_rx) = oneshot::channel();
+    let (data_tx, data_rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        let writer = H2StreamWriter::new(response_tx, data_tx);
+        if let Err(err) = router.route_body_stream(req, body, Box::new(writer)).await {
+            error!("streaming body handler error: {}", err);
+        }
+    });
+    await_h2_stream_response(response_rx, data_rx).await
+}
+
+async fn await_h2_stream_response(
+    response_rx: oneshot::Receiver<Result<Response<()>, ServerError>>,
+    data_rx: mpsc::Receiver<Bytes>,
+) -> Result<Response<H2ResponseBody>, H2Error> {
+    let response = match response_rx.await {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => return Err(H2Error::Router(err)),
+        Err(_) => {
+            return Err(H2Error::Router(ServerError::Config(
+                "stream handler finished before sending response".into(),
+            )));
+        }
+    };
+    build_streaming_response(response, data_rx)
+}
+
+fn build_buffered_response(
+    handler_response: HandlerResponse,
+) -> Result<Response<H2ResponseBody>, H2Error> {
+    let mut response =
+        Response::new(Full::from(handler_response.body.unwrap_or_else(Bytes::new)).boxed());
     *response.status_mut() = handler_response.status;
 
     if let Some(ct) = handler_response.content_type {
@@ -288,7 +399,22 @@ fn build_response(handler_response: HandlerResponse) -> Result<Response<Full<Byt
     Ok(response)
 }
 
-fn add_cors_headers(res: &mut Response<Full<Bytes>>) {
+fn build_streaming_response(
+    response_head: Response<()>,
+    data_rx: mpsc::Receiver<Bytes>,
+) -> Result<Response<H2ResponseBody>, H2Error> {
+    let (parts, ()) = response_head.into_parts();
+    let body_stream = unfold(data_rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|chunk| (Ok::<Frame<Bytes>, Infallible>(Frame::data(chunk)), rx))
+    });
+    let mut response = Response::from_parts(parts, StreamBody::new(body_stream).boxed());
+    add_cors_headers(&mut response);
+    Ok(response)
+}
+
+fn add_cors_headers<B>(res: &mut Response<B>) {
     res.headers_mut().insert(
         HeaderName::from_static("access-control-allow-origin"),
         HeaderValue::from_static("*"),

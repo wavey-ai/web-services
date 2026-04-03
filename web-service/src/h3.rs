@@ -38,7 +38,8 @@ impl StreamWriter for H3StreamWriter {
 
     async fn send_data(&mut self, data: Bytes) -> Result<(), ServerError> {
         if data.len() <= H3_MAX_DATA_CHUNK {
-            return self.stream
+            return self
+                .stream
                 .send_data(data)
                 .await
                 .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))));
@@ -251,7 +252,9 @@ async fn handle_h3_connection(
                 let router = Arc::clone(&router);
                 let path = req.uri().path().to_string();
                 tokio::spawn(async move {
-                    if router.is_streaming(&path) {
+                    if router.has_body_stream_handler(&path) {
+                        let _ = handle_h3_body_stream_request(req, stream, router).await;
+                    } else if router.is_streaming(&path) {
                         let writer = H3StreamWriter { stream };
                         let _ = router.route_stream(req, Box::new(writer)).await;
                     } else {
@@ -266,6 +269,42 @@ async fn handle_h3_connection(
     Ok(())
 }
 
+async fn handle_h3_body_stream_request(
+    req: http::Request<()>,
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    router: Arc<dyn Router>,
+) -> Result<(), H3Error> {
+    let shared_stream = Arc::new(Mutex::new(stream));
+    let body_stream: BodyStream =
+        Box::pin(unfold(Arc::clone(&shared_stream), |shared| async move {
+            let recv = {
+                let mut guard = shared.lock().await;
+                guard.recv_data().await
+            };
+            match recv {
+                Ok(Some(mut chunk)) => {
+                    let data = chunk.copy_to_bytes(chunk.remaining());
+                    Some((Ok(data), shared))
+                }
+                Ok(None) => None,
+                Err(e) => Some((Err(ServerError::Handler(Box::new(e))), shared)),
+            }
+        }));
+    let writer = H3SharedStreamWriter {
+        stream: Arc::clone(&shared_stream),
+    };
+    router
+        .route_body_stream(req, body_stream, Box::new(writer))
+        .await
+        .map_err(H3Error::Router)?;
+    let mut guard = shared_stream.lock().await;
+    guard
+        .finish()
+        .await
+        .map_err(|e| H3Error::Transport(e.to_string()))?;
+    Ok(())
+}
+
 async fn handle_h3_request(
     req: http::Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
@@ -274,9 +313,8 @@ async fn handle_h3_request(
     let path = req.uri().path().to_string();
     if router.has_body_handler(&path) {
         let shared_stream = Arc::new(Mutex::new(stream));
-        let body_stream: BodyStream = Box::pin(unfold(
-            Arc::clone(&shared_stream),
-            |shared| async move {
+        let body_stream: BodyStream =
+            Box::pin(unfold(Arc::clone(&shared_stream), |shared| async move {
                 let recv = {
                     let mut guard = shared.lock().await;
                     guard.recv_data().await
@@ -289,8 +327,7 @@ async fn handle_h3_request(
                     Ok(None) => None,
                     Err(e) => Some((Err(ServerError::Handler(Box::new(e))), shared)),
                 }
-            },
-        ));
+            }));
         let handler_response = router
             .route_body(req, body_stream)
             .await

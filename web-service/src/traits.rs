@@ -125,8 +125,38 @@ pub trait Router: Send + Sync + 'static {
         false
     }
 
+    /// Check if a combined streaming request/response handler exists for this path.
+    fn has_body_stream_handler(&self, _path: &str) -> bool {
+        false
+    }
+
     /// Check if this is a streaming endpoint
     fn is_streaming(&self, path: &str) -> bool;
+
+    /// Route a request that needs both a streaming request body and a streaming response.
+    async fn route_body_stream(
+        &self,
+        req: Request<()>,
+        body: BodyStream,
+        mut stream_writer: Box<dyn StreamWriter>,
+    ) -> HandlerResult<()> {
+        let handler_response = self.route_body(req, body).await?;
+        let mut response = Response::builder().status(handler_response.status);
+        if let Some(content_type) = handler_response.content_type {
+            response = response.header("content-type", content_type);
+        }
+        if let Some(etag) = handler_response.etag {
+            response = response.header("etag", etag.to_string());
+        }
+        for (key, value) in handler_response.headers {
+            response = response.header(&key, &value);
+        }
+        stream_writer.send_response(response.body(())?).await?;
+        if let Some(body) = handler_response.body {
+            stream_writer.send_data(body).await?;
+        }
+        stream_writer.finish().await
+    }
 
     /// Route a streaming request
     async fn route_stream(

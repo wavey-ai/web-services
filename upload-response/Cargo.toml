@@ -13,8 +13,8 @@ udp-fec = ["dep:raptorq"]
 
 [dependencies]
 web-service = { path = "../web-service/" }
-playlists = { path = "../../playlists" }
-http-pack = { path = "../../http-pack", default-features = false }
+playlists = { git = "https://github.com/wavey-ai/playlists.git" }
+http-pack = { git = "https://github.com/wavey-ai/http-pack.git", default-features = false }
 tokio = { version = "1.45", features = ["full"] }
 bytes = "1.5"
 async-trait = "0.1.88"
@@ -26,7 +26,7 @@ hyper-util = { version = "0.1", features = ["full"] }
 hyper = { version = "1.6", features = ["full"] }
 srt = { git = "https://github.com/wavey-ai/av-rs.git", features = ["async"], optional = true }
 raptorq = { version = "2", optional = true }
-rist = { path = "../../rist-rs/rist", features = ["tokio"], optional = true }
+rist = { git = "https://github.com/wavey-ai/rist-rs.git", features = ["tokio"], optional = true }
 
 # WebRTC Data Channels (optional)
 matchbox_socket = { git = "https://github.com/wavey-ai/matchbox", branch = "feat/graceful-shutdown", optional = true }
@@ -57,7 +57,7 @@ rustls-pemfile = "2"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 # RTMP testing
-rtmp-ingress = { path = "../../rtmp-ingress", features = ["upload-response", "tls"] }
+rtmp-ingress = { git = "https://github.com/wavey-ai/rtmp-ingress.git", features = ["upload-response", "tls"] }
 rml_rtmp = { git = "https://github.com/wavey-ai/rust-media-libs.git" }
 # WebRTC testing
 matchbox_signaling = { git = "https://github.com/wavey-ai/matchbox", branch = "feat/graceful-shutdown" }

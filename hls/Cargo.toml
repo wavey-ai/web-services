@@ -19,7 +19,7 @@ h3 = "0.0.8"
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"
 h3-datagram = "0.0.2"
-playlists = { path = "../../playlists" }
+playlists = { git = "https://github.com/wavey-ai/playlists.git" }
 tokio-tungstenite = "0.27"
 futures-util = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
