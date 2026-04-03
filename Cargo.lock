@@ -640,23 +640,6 @@ checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 [[package]]
 name = "bytesio"
 version = "0.3.3"
-source = "git+ssh://git@github.com/wavey-ai/xiu#bb094ea076ae758d7b62642ab403fd2e94db027b"
-dependencies = [
- "async-trait",
- "byteorder",
- "bytes",
- "failure",
- "futures",
- "log",
- "rand 0.3.23",
- "tokio",
- "tokio-stream",
- "tokio-util 0.6.10",
-]
-
-[[package]]
-name = "bytesio"
-version = "0.3.3"
 source = "git+https://github.com/wavey-ai/xiu#bb094ea076ae758d7b62642ab403fd2e94db027b"
 dependencies = [
  "async-trait",
@@ -774,7 +757,7 @@ dependencies = [
  "h3-quinn",
  "h3-webtransport",
  "http",
- "playlists 0.1.3",
+ "playlists",
  "regex",
  "structopt",
  "tokio",
@@ -1458,7 +1441,7 @@ dependencies = [
 [[package]]
 name = "gatekeeper"
 version = "0.1.0"
-source = "git+ssh://git@github.com/wavey-ai/gatekeeper.git#d901af098990bd27620782adf4c11702b0660caf"
+source = "git+https://github.com/wavey-ai/gatekeeper.git#d901af098990bd27620782adf4c11702b0660caf"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1744,7 +1727,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "playlists 0.1.3",
+ "playlists",
  "regex",
  "structopt",
  "tokio",
@@ -1752,7 +1735,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "web-service",
- "xmpegts 0.2.0 (git+https://github.com/wavey-ai/xiu)",
+ "xmpegts",
 ]
 
 [[package]]
@@ -1796,20 +1779,6 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
-]
-
-[[package]]
-name = "http-pack"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "h3",
- "http",
- "http-body",
- "http-body-util",
- "httparse",
- "message-packetizer",
- "serde",
 ]
 
 [[package]]
@@ -2432,7 +2401,7 @@ dependencies = [
 [[package]]
 name = "mse_fmp4"
 version = "0.2.0"
-source = "git+ssh://git@github.com/wavey-ai/mse_fmp4.git#2227e1ff102f4372395c671dc46750774dd6c360"
+source = "git+https://github.com/wavey-ai/mse_fmp4.git#2227e1ff102f4372395c671dc46750774dd6c360"
 dependencies = [
  "byteorder",
  "bytes",
@@ -2749,21 +2718,6 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
-
-[[package]]
-name = "playlists"
-version = "0.1.3"
-dependencies = [
- "access-unit",
- "bytes",
- "chrono",
- "flate2",
- "thiserror 1.0.69",
- "tls-helpers 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "tokio",
- "tracing",
- "xxhash-rust",
-]
 
 [[package]]
 name = "playlists"
@@ -3238,6 +3192,7 @@ dependencies = [
 [[package]]
 name = "rist"
 version = "0.1.0"
+source = "git+https://github.com/wavey-ai/rist-rs.git#a78bba46a184cf3614e3c5a92f8da4771369a057"
 dependencies = [
  "libc",
  "rist-sys",
@@ -3248,6 +3203,7 @@ dependencies = [
 [[package]]
 name = "rist-sys"
 version = "0.1.0"
+source = "git+https://github.com/wavey-ai/rist-rs.git#a78bba46a184cf3614e3c5a92f8da4771369a057"
 dependencies = [
  "bindgen 0.70.1",
  "pkg-config",
@@ -3291,13 +3247,14 @@ dependencies = [
 [[package]]
 name = "rtmp-ingress"
 version = "0.1.0"
+source = "git+https://github.com/wavey-ai/rtmp-ingress.git#86d71346fb5492454b1ce15619d8d2f462e716c5"
 dependencies = [
  "access-unit",
  "bytes",
  "chrono",
  "futures",
  "gatekeeper",
- "http-pack 0.1.0",
+ "http-pack",
  "mse_fmp4",
  "rml_rtmp",
  "rustls 0.23.35",
@@ -3308,7 +3265,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "upload-response",
- "xmpegts 0.2.0 (git+ssh://git@github.com/wavey-ai/xiu)",
+ "xmpegts",
 ]
 
 [[package]]
@@ -4560,12 +4517,12 @@ dependencies = [
  "h3-quinn",
  "http",
  "http-body-util",
- "http-pack 0.1.0",
+ "http-pack",
  "hyper",
  "hyper-util",
  "matchbox_signaling",
  "matchbox_socket",
- "playlists 0.1.3",
+ "playlists",
  "portpicker",
  "quinn",
  "raptorq",
@@ -4794,11 +4751,11 @@ dependencies = [
  "h3-webtransport",
  "http",
  "http-body-util",
- "http-pack 0.1.0 (git+https://github.com/wavey-ai/http-pack.git)",
+ "http-pack",
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "playlists 0.1.3 (git+https://github.com/wavey-ai/playlists.git)",
+ "playlists",
  "portpicker",
  "quinn",
  "regex",
@@ -4819,7 +4776,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "webpki-roots 0.26.11",
- "xmpegts 0.2.0 (git+https://github.com/wavey-ai/xiu)",
+ "xmpegts",
  "xxhash-rust",
 ]
 
@@ -5376,22 +5333,11 @@ dependencies = [
 [[package]]
 name = "xmpegts"
 version = "0.2.0"
-source = "git+ssh://git@github.com/wavey-ai/xiu#bb094ea076ae758d7b62642ab403fd2e94db027b"
-dependencies = [
- "byteorder",
- "bytes",
- "bytesio 0.3.3 (git+ssh://git@github.com/wavey-ai/xiu)",
- "failure",
-]
-
-[[package]]
-name = "xmpegts"
-version = "0.2.0"
 source = "git+https://github.com/wavey-ai/xiu#bb094ea076ae758d7b62642ab403fd2e94db027b"
 dependencies = [
  "byteorder",
  "bytes",
- "bytesio 0.3.3 (git+https://github.com/wavey-ai/xiu)",
+ "bytesio",
  "failure",
 ]
 

@@ -2,6 +2,9 @@
 members = ["web-service", "hls", "chunks", "upload-response"]
 resolver = "3"
 
+[patch."https://github.com/wavey-ai/web-services.git"]
+upload-response = { path = "upload-response" }
+
 [profile.release]
 opt-level = 3
 strip = true
