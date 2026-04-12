@@ -117,6 +117,29 @@ flowchart TB
 - Multiple readers can register on the same stream via `register_reader(stream_id, worker_id)`.
 - Only one worker can claim response write access via `try_claim_response(stream_id, worker_id)`.
 - Reader presence checks are fast because `has_readers()` is backed by atomic counters.
+- Active streams now have explicit slot ownership. Ingress allocates a real slot, workers discover active `stream_id`s from the service, and slot reuse is safe after the previous stream closes.
+
+### Internal Cache API
+
+For split CPU ingress and GPU worker deployments, `UploadResponseRouter` now exposes a private HTTP/2-friendly control/data plane under `/_upload_response`. The endpoints use the ingress-owned `stream_id`, and raw slot payloads stay binary.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/_upload_response/streams` | List active streams and their slot/reader/claim state |
+| `GET` | `/_upload_response/streams/{stream_id}` | Read metadata for a single active stream |
+| `GET` | `/_upload_response/streams/{stream_id}/request/last` | Get the latest request slot id |
+| `GET` | `/_upload_response/streams/{stream_id}/request/slots/{slot_id}` | Read a raw request slot |
+| `GET` | `/_upload_response/streams/{stream_id}/response/last` | Get the latest response slot id |
+| `GET` | `/_upload_response/streams/{stream_id}/response/slots/{slot_id}` | Read a raw response slot |
+| `PUT` | `/_upload_response/streams/{stream_id}/readers/{worker_id}` | Register a reader |
+| `DELETE` | `/_upload_response/streams/{stream_id}/readers/{worker_id}` | Unregister a reader |
+| `PUT` | `/_upload_response/streams/{stream_id}/response/claim/{worker_id}` | Claim exclusive response write access |
+| `DELETE` | `/_upload_response/streams/{stream_id}/response/claim/{worker_id}` | Release a response claim |
+| `PUT` | `/_upload_response/streams/{stream_id}/response/headers` | Write a raw HPKS response headers frame |
+| `PUT` | `/_upload_response/streams/{stream_id}/response/body` | Append raw response body bytes |
+| `PUT` | `/_upload_response/streams/{stream_id}/response/end` | Finish the response stream |
+
+This is the intended `v1` control plane for k8s pod splits: CPU ingress/transcode pods own the client connection and cache, while GPU workers read request slots and write response slots back over internal H2. If we need a hotter data plane later, the same semantics can move to raw TCP/TLS with `HPKS` framing.
 
 ### Stream Format
 

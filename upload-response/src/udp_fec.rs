@@ -30,11 +30,11 @@
 //! the overhead is ≈ 80 ms and the transport can recover from any single
 //! datagram loss per group of 5 without retransmission.  Tune K/R to taste.
 
-use crate::UploadResponseService;
+use crate::{UploadResponseService, UploadStream};
 use bytes::Bytes;
 use http_pack::stream::{StreamHeaders, StreamRequestHeaders};
 use http_pack::{HeaderField, HttpVersion};
-use raptorq::{Decoder, EncodingPacket, Encoder, ObjectTransmissionInformation};
+use raptorq::{Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -90,10 +90,7 @@ impl WireHeader {
     }
 
     fn oti(&self) -> ObjectTransmissionInformation {
-        ObjectTransmissionInformation::with_defaults(
-            self.transfer_length as u64,
-            self.sym_sz,
-        )
+        ObjectTransmissionInformation::with_defaults(self.transfer_length as u64, self.sym_sz)
     }
 }
 
@@ -219,7 +216,7 @@ impl UdpFecIngest {
 
         tokio::spawn(async move {
             // Each unique (peer_addr) gets its own stream slot in the service.
-            let mut peer_streams: HashMap<SocketAddr, u64> = HashMap::new();
+            let mut peer_streams: HashMap<SocketAddr, UploadStream> = HashMap::new();
             // Per-block FEC state, keyed by (peer_addr, block_id).
             let mut blocks: HashMap<(SocketAddr, u32), BlockState> = HashMap::new();
 
@@ -262,7 +259,7 @@ async fn handle_datagram(
     buf: &[u8],
     peer: SocketAddr,
     service: &Arc<UploadResponseService>,
-    peer_streams: &mut HashMap<SocketAddr, u64>,
+    peer_streams: &mut HashMap<SocketAddr, UploadStream>,
     blocks: &mut HashMap<(SocketAddr, u32), BlockState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let hdr = match WireHeader::decode(buf) {
@@ -273,14 +270,14 @@ async fn handle_datagram(
     let packet = EncodingPacket::deserialize(&buf[HEADER_LEN..]);
 
     // Ensure this peer has a stream slot.
-    let stream_id = if let Some(&id) = peer_streams.get(&peer) {
-        id
+    let stream_id = if let Some(stream) = peer_streams.get(&peer) {
+        stream.stream_id()
     } else {
-        let _permit = service
-            .acquire_stream()
+        let stream = service
+            .open_stream()
             .await
-            .map_err(|e| format!("acquire_stream: {e}"))?;
-        let id = service.next_id();
+            .map_err(|e| format!("open_stream: {e}"))?;
+        let id = stream.stream_id();
 
         let headers = StreamHeaders::Request(StreamRequestHeaders {
             stream_id: id,
@@ -299,7 +296,7 @@ async fn handle_datagram(
             .await
             .map_err(|e| format!("write_request_headers: {e}"))?;
 
-        peer_streams.insert(peer, id);
+        peer_streams.insert(peer, stream);
         debug!(stream_id = id, peer = %peer, "UDP+FEC new stream");
         id
     };

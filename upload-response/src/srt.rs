@@ -119,13 +119,12 @@ impl<A: SrtAuth> SrtIngest<A> {
             ]
         };
 
-        let listener = AsyncListener::bind_with_options(addr, options)?
-            .with_callback(move |stream_id: Option<&str>| {
-                match auth_clone.authenticate(stream_id) {
-                    Some(passphrase) => ListenerCallbackAction::Allow { passphrase },
-                    None => ListenerCallbackAction::Deny,
-                }
-            })?;
+        let listener = AsyncListener::bind_with_options(addr, options)?.with_callback(
+            move |stream_id: Option<&str>| match auth_clone.authenticate(stream_id) {
+                Some(passphrase) => ListenerCallbackAction::Allow { passphrase },
+                None => ListenerCallbackAction::Deny,
+            },
+        )?;
 
         info!("SRT ingest server listening on {}", addr);
 
@@ -164,13 +163,12 @@ async fn handle_srt_connection(
     peer_addr: SocketAddr,
     service: Arc<UploadResponseService>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Acquire stream slot
-    let _permit = service
-        .acquire_stream()
+    let upload_stream = service
+        .open_stream()
         .await
-        .map_err(|e| format!("Failed to acquire stream: {}", e))?;
-
-    let stream_id = service.next_id();
+        .map_err(|e| format!("Failed to open stream: {}", e))?;
+    let stream_id = upload_stream.stream_id();
+    let rx = service.register_response(stream_id).await;
     let srt_stream_id = stream.id().cloned().unwrap_or_default();
 
     debug!(
@@ -211,7 +209,12 @@ async fn handle_srt_connection(
 
     // Read SRT packets and write to request cache
     loop {
-        match timeout(Duration::from_secs(READ_TIMEOUT_SECS), stream.read(&mut buf)).await {
+        match timeout(
+            Duration::from_secs(READ_TIMEOUT_SECS),
+            stream.read(&mut buf),
+        )
+        .await
+        {
             Ok(Ok(0)) => {
                 // Connection closed
                 debug!(stream_id, "SRT connection closed by peer");
@@ -256,30 +259,32 @@ async fn handle_srt_connection(
 
     debug!(stream_id, "SRT request complete, waiting for response");
 
-    // Wait for response and stream it back
-    let rx = service.register_response(stream_id).await;
     let timeout_duration = Duration::from_millis(service.config.response_timeout_ms);
-
-    match timeout(timeout_duration, rx).await {
-        Ok(Ok(Ok((status, body)))) => {
-            debug!(stream_id, ?status, len = body.len(), "Sending SRT response");
-            if let Err(e) = stream.write_all(&body).await {
+    let result = match timeout(timeout_duration, rx).await {
+        Ok(Ok(Ok(cached))) => {
+            debug!(stream_id, status = ?cached.status, len = cached.body.len(), "Sending SRT response");
+            if let Err(e) = stream.write_all(&cached.body).await {
                 error!(stream_id, error = %e, "Failed to send SRT response");
             }
+            Ok(())
         }
         Ok(Ok(Err(e))) => {
             error!(stream_id, error = %e, "Response error");
             service.drop_response_channel(stream_id).await;
+            Ok(())
         }
         Ok(Err(_)) => {
             error!(stream_id, "Response channel closed");
             service.drop_response_channel(stream_id).await;
+            Ok(())
         }
         Err(_) => {
             error!(stream_id, "Response timeout");
             service.drop_response_channel(stream_id).await;
+            Ok(())
         }
-    }
+    };
 
-    Ok(())
+    upload_stream.close().await;
+    result
 }

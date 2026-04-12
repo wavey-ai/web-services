@@ -209,13 +209,12 @@ async fn handle_tcp_connection<S>(
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    // Acquire stream slot
-    let _permit = service
-        .acquire_stream()
+    let upload_stream = service
+        .open_stream()
         .await
-        .map_err(|e| format!("Failed to acquire stream: {}", e))?;
-
-    let stream_id = service.next_id();
+        .map_err(|e| format!("Failed to open stream: {}", e))?;
+    let stream_id = upload_stream.stream_id();
+    let rx = service.register_response(stream_id).await;
 
     debug!(
         stream_id,
@@ -248,7 +247,12 @@ where
 
     // Read data and write to cache
     loop {
-        match timeout(Duration::from_secs(READ_TIMEOUT_SECS), stream.read(&mut buf)).await {
+        match timeout(
+            Duration::from_secs(READ_TIMEOUT_SECS),
+            stream.read(&mut buf),
+        )
+        .await
+        {
             Ok(Ok(0)) => {
                 debug!(stream_id, "TCP connection closed by peer");
                 break;
@@ -292,31 +296,32 @@ where
 
     debug!(stream_id, "TCP request complete, waiting for response");
 
-    // Wait for response
-    let rx = service.register_response(stream_id).await;
     let timeout_duration = Duration::from_millis(service.config.response_timeout_ms);
-
-    match timeout(timeout_duration, rx).await {
-        Ok(Ok(Ok((_status, body)))) => {
-            debug!(stream_id, len = body.len(), "Sending TCP response");
-            // Send response length + body
-            let len_bytes = (body.len() as u32).to_be_bytes();
+    let result = match timeout(timeout_duration, rx).await {
+        Ok(Ok(Ok(cached))) => {
+            debug!(stream_id, status = ?cached.status, len = cached.body.len(), "Sending TCP response");
+            let len_bytes = (cached.body.len() as u32).to_be_bytes();
             stream.write_all(&len_bytes).await?;
-            stream.write_all(&body).await?;
+            stream.write_all(&cached.body).await?;
+            Ok(())
         }
         Ok(Ok(Err(e))) => {
             error!(stream_id, error = %e, "Response error");
             service.drop_response_channel(stream_id).await;
+            Ok(())
         }
         Ok(Err(_)) => {
             error!(stream_id, "Response channel closed");
             service.drop_response_channel(stream_id).await;
+            Ok(())
         }
         Err(_) => {
             error!(stream_id, "Response timeout");
             service.drop_response_channel(stream_id).await;
+            Ok(())
         }
-    }
+    };
 
-    Ok(())
+    upload_stream.close().await;
+    result
 }

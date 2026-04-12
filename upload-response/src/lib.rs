@@ -1,22 +1,22 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use http::{Request, StatusCode};
 use http_pack::stream::{
-    decode_frame, encode_frame, StreamFrame, StreamHeaders,
-    StreamRequestHeaders, StreamResponseHeaders,
+    decode_frame, encode_frame, StreamFrame, StreamHeaders, StreamRequestHeaders,
+    StreamResponseHeaders,
 };
+use hyper_util::rt::TokioIo;
 use playlists::chunk_cache::ChunkCache;
 use playlists::Options;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use tokio::sync::{oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::{timeout, Duration};
-use tracing::{debug, error, warn};
-use futures_util::{SinkExt, StreamExt};
-use hyper_util::rt::TokioIo;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+use tracing::{debug, error, warn};
 use web_service::{
     BodyStream, HandlerResponse, HandlerResult, Router, ServerError, StreamWriter,
     WebSocketHandler, WebTransportHandler,
@@ -82,15 +82,83 @@ impl Default for UploadResponseConfig {
     fn default() -> Self {
         Self {
             num_streams: 100,
-            slot_size_kb: 64,         // 64KB per slot (sweet spot for throughput)
-            slots_per_stream: 16384,  // ~1GB max per request at 64KB slots
+            slot_size_kb: 64,        // 64KB per slot (sweet spot for throughput)
+            slots_per_stream: 16384, // ~1GB max per request at 64KB slots
             response_timeout_ms: 30000,
         }
     }
 }
 
 /// Response type sent through oneshot channels
-pub type ResponseResult = Result<(StatusCode, Bytes), String>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedResponse {
+    pub status: StatusCode,
+    pub body: Bytes,
+    pub headers: Vec<(String, String)>,
+}
+
+pub type ResponseResult = Result<CachedResponse, String>;
+
+/// Snapshot of an active stream slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveStreamSlot {
+    pub stream_id: u64,
+    pub stream_idx: usize,
+}
+
+/// Metadata returned by the internal cache API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveStreamInfo {
+    pub stream_id: u64,
+    pub stream_idx: usize,
+    pub request_last: usize,
+    pub response_last: usize,
+    pub reader_count: u64,
+    pub response_owner: Option<String>,
+}
+
+/// RAII handle for an active upload-response stream.
+pub struct UploadStream {
+    service: Arc<UploadResponseService>,
+    stream_id: u64,
+    stream_idx: usize,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl UploadStream {
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    pub fn stream_idx(&self) -> usize {
+        self.stream_idx
+    }
+
+    pub async fn close(mut self) {
+        self.service.close_stream(self.stream_id).await;
+        drop(self.permit.take());
+    }
+}
+
+impl Drop for UploadStream {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+
+        let service = Arc::clone(&self.service);
+        let stream_id = self.stream_id;
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                service.close_stream(stream_id).await;
+                drop(permit);
+            });
+        } else {
+            drop(permit);
+        }
+    }
+}
 
 /// Main service for handling upload-response lifecycle.
 ///
@@ -103,9 +171,14 @@ pub struct UploadResponseService {
     response_cache: Arc<ChunkCache>,
     slot_semaphore: Arc<Semaphore>,
     next_stream_id: AtomicU64,
+    stream_to_slot: StdRwLock<HashMap<u64, usize>>,
+    free_slots: StdMutex<Vec<usize>>,
+    slot_stream_ids: Vec<AtomicU64>,
     response_channels: Arc<RwLock<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     /// Per-stream worker count: how many workers are currently reading/processing
     stream_worker_counts: Vec<AtomicU64>,
+    request_started: Vec<AtomicBool>,
+    response_started: Vec<AtomicBool>,
     /// Per-stream worker sets: which worker IDs are reading/processing each stream
     stream_workers: Arc<RwLock<Vec<std::collections::HashSet<String>>>>,
     /// Per-stream response claim: None = unclaimed, Some(worker_id) = exclusive write access
@@ -125,11 +198,15 @@ impl UploadResponseService {
         let request_cache = Arc::new(ChunkCache::new(options));
         let response_cache = Arc::new(ChunkCache::new(options));
         let slot_semaphore = Arc::new(Semaphore::new(config.num_streams));
+        let free_slots: Vec<usize> = (0..config.num_streams).rev().collect();
 
         // Initialize per-stream worker counts
-        let stream_worker_counts: Vec<AtomicU64> = (0..config.num_streams)
-            .map(|_| AtomicU64::new(0))
-            .collect();
+        let stream_worker_counts: Vec<AtomicU64> =
+            (0..config.num_streams).map(|_| AtomicU64::new(0)).collect();
+        let request_started: Vec<AtomicBool> =
+            (0..config.num_streams).map(|_| AtomicBool::new(false)).collect();
+        let response_started: Vec<AtomicBool> =
+            (0..config.num_streams).map(|_| AtomicBool::new(false)).collect();
 
         // Initialize per-stream worker sets (for readers)
         let stream_workers: Vec<std::collections::HashSet<String>> = (0..config.num_streams)
@@ -137,21 +214,142 @@ impl UploadResponseService {
             .collect();
 
         // Initialize per-stream response claims (for exclusive writer)
-        let response_claims: Vec<Option<String>> = (0..config.num_streams)
-            .map(|_| None)
-            .collect();
+        let response_claims: Vec<Option<String>> = (0..config.num_streams).map(|_| None).collect();
 
         Self {
             request_cache,
             response_cache,
             slot_semaphore,
             next_stream_id: AtomicU64::new(1),
+            stream_to_slot: StdRwLock::new(HashMap::new()),
+            free_slots: StdMutex::new(free_slots),
+            slot_stream_ids: (0..config.num_streams).map(|_| AtomicU64::new(0)).collect(),
             response_channels: Arc::new(RwLock::new(HashMap::new())),
             stream_worker_counts,
+            request_started,
+            response_started,
             stream_workers: Arc::new(RwLock::new(stream_workers)),
             response_claims: Arc::new(RwLock::new(response_claims)),
             config,
         }
+    }
+
+    fn allocate_slot(&self) -> Option<usize> {
+        self.free_slots.lock().ok()?.pop()
+    }
+
+    fn release_slot(&self, stream_idx: usize) {
+        if let Ok(mut free_slots) = self.free_slots.lock() {
+            free_slots.push(stream_idx);
+        }
+    }
+
+    fn stream_idx(&self, stream_id: u64) -> Option<usize> {
+        self.stream_to_slot
+            .read()
+            .ok()
+            .and_then(|slots| slots.get(&stream_id).copied())
+    }
+
+    pub fn slot_stream_id(&self, stream_idx: usize) -> Option<u64> {
+        let stream_id = self.slot_stream_ids[stream_idx].load(Ordering::Acquire);
+        (stream_id != 0).then_some(stream_id)
+    }
+
+    pub fn active_stream_slots(&self) -> Vec<ActiveStreamSlot> {
+        self.slot_stream_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(stream_idx, stream_id)| {
+                let stream_id = stream_id.load(Ordering::Acquire);
+                (stream_id != 0).then_some(ActiveStreamSlot {
+                    stream_id,
+                    stream_idx,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn active_streams(&self) -> Vec<ActiveStreamInfo> {
+        let claims = self.response_claims.read().await;
+        self.active_stream_slots()
+            .into_iter()
+            .map(|slot| ActiveStreamInfo {
+                stream_id: slot.stream_id,
+                stream_idx: slot.stream_idx,
+                request_last: self.request_cache.last(slot.stream_idx).unwrap_or(0),
+                response_last: self.response_cache.last(slot.stream_idx).unwrap_or(0),
+                reader_count: self.stream_worker_counts[slot.stream_idx].load(Ordering::SeqCst),
+                response_owner: claims[slot.stream_idx].clone(),
+            })
+            .collect()
+    }
+
+    async fn clear_slot_state(&self, stream_idx: usize) {
+        {
+            let mut workers = self.stream_workers.write().await;
+            workers[stream_idx].clear();
+        }
+        self.stream_worker_counts[stream_idx].store(0, Ordering::SeqCst);
+        self.request_started[stream_idx].store(false, Ordering::SeqCst);
+        self.response_started[stream_idx].store(false, Ordering::SeqCst);
+        {
+            let mut claims = self.response_claims.write().await;
+            claims[stream_idx] = None;
+        }
+    }
+
+    pub async fn close_stream(&self, stream_id: u64) {
+        let stream_idx = {
+            let mut stream_to_slot = match self.stream_to_slot.write() {
+                Ok(stream_to_slot) => stream_to_slot,
+                Err(_) => return,
+            };
+            match stream_to_slot.remove(&stream_id) {
+                Some(stream_idx) => stream_idx,
+                None => return,
+            }
+        };
+
+        self.slot_stream_ids[stream_idx].store(0, Ordering::Release);
+        self.clear_slot_state(stream_idx).await;
+        self.drop_response_channel(stream_id).await;
+        self.release_slot(stream_idx);
+        debug!(stream_id, stream_idx, "Stream closed");
+    }
+
+    pub async fn open_stream(self: &Arc<Self>) -> Result<UploadStream, String> {
+        let permit = self
+            .slot_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "streams closed".to_string())?;
+
+        let stream_idx = self
+            .allocate_slot()
+            .ok_or_else(|| "no free slot available".to_string())?;
+        let stream_id = self.next_stream_id.fetch_add(1, Ordering::SeqCst);
+
+        self.clear_slot_state(stream_idx).await;
+
+        {
+            let mut stream_to_slot = self
+                .stream_to_slot
+                .write()
+                .map_err(|_| "stream slot registry poisoned".to_string())?;
+            stream_to_slot.insert(stream_id, stream_idx);
+        }
+        self.slot_stream_ids[stream_idx].store(stream_id, Ordering::Release);
+
+        debug!(stream_id, stream_idx, "Stream opened");
+
+        Ok(UploadStream {
+            service: Arc::clone(self),
+            stream_id,
+            stream_idx,
+            permit: Some(permit),
+        })
     }
 
     // ==================== Reader Registration (Multiple Workers) ====================
@@ -162,7 +360,9 @@ impl UploadResponseService {
     /// Returns `true` if this worker was newly registered.
     /// Returns `false` if this worker was already registered on this stream.
     pub async fn register_reader(&self, stream_id: u64, worker_id: &str) -> bool {
-        let stream_idx = self.stream_idx(stream_id);
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
         let mut workers = self.stream_workers.write().await;
         let inserted = workers[stream_idx].insert(worker_id.to_string());
         if inserted {
@@ -177,7 +377,9 @@ impl UploadResponseService {
     /// Returns `true` if the worker was registered and is now removed.
     /// Returns `false` if the worker was not registered on this stream.
     pub async fn unregister_reader(&self, stream_id: u64, worker_id: &str) -> bool {
-        let stream_idx = self.stream_idx(stream_id);
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
         let mut workers = self.stream_workers.write().await;
         let removed = workers[stream_idx].remove(worker_id);
         if removed {
@@ -189,8 +391,9 @@ impl UploadResponseService {
 
     /// Get the number of readers currently processing a stream (lock-free).
     pub fn reader_count(&self, stream_id: u64) -> u64 {
-        let stream_idx = self.stream_idx(stream_id);
-        self.stream_worker_counts[stream_idx].load(Ordering::SeqCst)
+        self.stream_idx(stream_id)
+            .map(|stream_idx| self.stream_worker_counts[stream_idx].load(Ordering::SeqCst))
+            .unwrap_or(0)
     }
 
     /// Check if any readers are processing a stream (lock-free).
@@ -200,21 +403,27 @@ impl UploadResponseService {
 
     /// Check if a specific reader is registered on a stream.
     pub async fn is_reader_registered(&self, stream_id: u64, worker_id: &str) -> bool {
-        let stream_idx = self.stream_idx(stream_id);
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
         let workers = self.stream_workers.read().await;
         workers[stream_idx].contains(worker_id)
     }
 
     /// Get all reader worker IDs currently processing a stream.
     pub async fn get_readers(&self, stream_id: u64) -> Vec<String> {
-        let stream_idx = self.stream_idx(stream_id);
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return Vec::new();
+        };
         let workers = self.stream_workers.read().await;
         workers[stream_idx].iter().cloned().collect()
     }
 
     /// Clear all readers from a stream (for cleanup/recovery).
     pub async fn clear_readers(&self, stream_id: u64) {
-        let stream_idx = self.stream_idx(stream_id);
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return;
+        };
         let mut workers = self.stream_workers.write().await;
         workers[stream_idx].clear();
         self.stream_worker_counts[stream_idx].store(0, Ordering::SeqCst);
@@ -229,7 +438,9 @@ impl UploadResponseService {
     /// Returns `true` if the claim succeeded (response was unclaimed).
     /// Returns `false` if another worker already claimed this response.
     pub async fn try_claim_response(&self, stream_id: u64, worker_id: &str) -> bool {
-        let stream_idx = self.stream_idx(stream_id);
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
         let mut claims = self.response_claims.write().await;
         if claims[stream_idx].is_none() {
             claims[stream_idx] = Some(worker_id.to_string());
@@ -245,7 +456,9 @@ impl UploadResponseService {
     /// Returns `true` if released successfully (caller was the owner).
     /// Returns `false` if the response was not claimed by this worker.
     pub async fn release_response(&self, stream_id: u64, worker_id: &str) -> bool {
-        let stream_idx = self.stream_idx(stream_id);
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
         let mut claims = self.response_claims.write().await;
         if claims[stream_idx].as_deref() == Some(worker_id) {
             claims[stream_idx] = None;
@@ -258,7 +471,9 @@ impl UploadResponseService {
 
     /// Force-release a response regardless of owner (for cleanup/recovery).
     pub async fn force_release_response(&self, stream_id: u64) {
-        let stream_idx = self.stream_idx(stream_id);
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return;
+        };
         let mut claims = self.response_claims.write().await;
         claims[stream_idx] = None;
         debug!(stream_id, "Response force-released");
@@ -266,21 +481,25 @@ impl UploadResponseService {
 
     /// Get the worker ID that currently holds the response claim, if any.
     pub async fn response_owner(&self, stream_id: u64) -> Option<String> {
-        let stream_idx = self.stream_idx(stream_id);
+        let stream_idx = self.stream_idx(stream_id)?;
         let claims = self.response_claims.read().await;
         claims[stream_idx].clone()
     }
 
     /// Check if the response is claimed by a specific worker.
     pub async fn is_response_claimed_by(&self, stream_id: u64, worker_id: &str) -> bool {
-        let stream_idx = self.stream_idx(stream_id);
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
         let claims = self.response_claims.read().await;
         claims[stream_idx].as_deref() == Some(worker_id)
     }
 
     /// Check if the response is currently claimed by anyone.
     pub async fn is_response_claimed(&self, stream_id: u64) -> bool {
-        let stream_idx = self.stream_idx(stream_id);
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
         let claims = self.response_claims.read().await;
         claims[stream_idx].is_some()
     }
@@ -324,24 +543,35 @@ impl UploadResponseService {
         self.next_stream_id.load(Ordering::SeqCst)
     }
 
-    /// Get stream index from stream ID
-    fn stream_idx(&self, stream_id: u64) -> usize {
-        (stream_id % self.config.num_streams as u64) as usize
-    }
-
     /// Write HPKS headers frame to slot 1 of request stream
-    pub async fn write_request_headers(&self, stream_id: u64, headers: StreamHeaders) -> Result<(), String> {
-        let stream_idx = self.stream_idx(stream_id);
+    pub async fn write_request_headers(
+        &self,
+        stream_id: u64,
+        headers: StreamHeaders,
+    ) -> Result<(), String> {
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
         let encoded = encode_frame(&StreamFrame::Headers(headers));
         self.request_cache
             .add(stream_idx, 1, Bytes::from(encoded))
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        self.request_started[stream_idx].store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Append raw body bytes to request stream (slots 2+)
     pub async fn append_request_body(&self, stream_id: u64, data: Bytes) -> Result<(), String> {
-        let stream_idx = self.stream_idx(stream_id);
+        if data.is_empty() {
+            return Err("request body chunks cannot be empty".to_string());
+        }
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        if !self.request_started[stream_idx].load(Ordering::SeqCst) {
+            return Err(format!("request headers not written for stream: {stream_id}"));
+        }
         self.request_cache
             .append(stream_idx, data)
             .await
@@ -350,7 +580,12 @@ impl UploadResponseService {
 
     /// Write end marker to request stream
     pub async fn end_request(&self, stream_id: u64) -> Result<(), String> {
-        let stream_idx = self.stream_idx(stream_id);
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        if !self.request_started[stream_idx].load(Ordering::SeqCst) {
+            return Err(format!("request headers not written for stream: {stream_id}"));
+        }
         self.request_cache
             .append(stream_idx, Bytes::from_static(END_MARKER))
             .await
@@ -358,18 +593,34 @@ impl UploadResponseService {
     }
 
     /// Write HPKS headers frame to slot 1 of response stream
-    pub async fn write_response_headers(&self, stream_id: u64, headers: StreamHeaders) -> Result<(), String> {
-        let stream_idx = self.stream_idx(stream_id);
+    pub async fn write_response_headers(
+        &self,
+        stream_id: u64,
+        headers: StreamHeaders,
+    ) -> Result<(), String> {
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
         let encoded = encode_frame(&StreamFrame::Headers(headers));
         self.response_cache
             .add(stream_idx, 1, Bytes::from(encoded))
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        self.response_started[stream_idx].store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Append raw body bytes to response stream (slots 2+)
     pub async fn append_response_body(&self, stream_id: u64, data: Bytes) -> Result<(), String> {
-        let stream_idx = self.stream_idx(stream_id);
+        if data.is_empty() {
+            return Err("response body chunks cannot be empty".to_string());
+        }
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        if !self.response_started[stream_idx].load(Ordering::SeqCst) {
+            return Err(format!("response headers not written for stream: {stream_id}"));
+        }
         self.response_cache
             .append(stream_idx, data)
             .await
@@ -378,35 +629,84 @@ impl UploadResponseService {
 
     /// Write end marker to response stream
     pub async fn end_response(&self, stream_id: u64) -> Result<(), String> {
-        let stream_idx = self.stream_idx(stream_id);
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        if !self.response_started[stream_idx].load(Ordering::SeqCst) {
+            return Err(format!("response headers not written for stream: {stream_id}"));
+        }
         self.response_cache
             .append(stream_idx, Bytes::from_static(END_MARKER))
             .await
             .map_err(|e| e.to_string())
     }
 
+    pub async fn write_handler_response(
+        &self,
+        stream_id: u64,
+        response: HandlerResponse,
+    ) -> Result<(), String> {
+        let mut builder = http::Response::builder().status(response.status);
+        if let Some(content_type) = &response.content_type {
+            builder = builder.header(http::header::CONTENT_TYPE, content_type);
+        }
+        if let Some(etag) = response.etag {
+            builder = builder.header(http::header::ETAG, etag.to_string());
+        }
+        for (name, value) in &response.headers {
+            builder = builder.header(name, value);
+        }
+
+        let response_head = builder
+            .body(())
+            .map_err(|error| format!("failed to build response: {error}"))?;
+        let headers = StreamHeaders::from_response(stream_id, &response_head)
+            .map_err(|error| format!("failed to encode response headers: {error}"))?;
+        self.write_response_headers(stream_id, headers).await?;
+
+        if let Some(body) = response.body {
+            if !body.is_empty() {
+                self.append_response_body(stream_id, body).await?;
+            }
+        }
+
+        self.end_response(stream_id).await
+    }
+
     /// Get last slot index for a request stream
     pub fn request_last(&self, stream_id: u64) -> Option<usize> {
-        let stream_idx = self.stream_idx(stream_id);
+        let stream_idx = self.stream_idx(stream_id)?;
+        if !self.request_started[stream_idx].load(Ordering::SeqCst) {
+            return Some(0);
+        }
         self.request_cache.last(stream_idx)
     }
 
     /// Get raw bytes from request stream slot
     pub async fn request_get(&self, stream_id: u64, slot_id: usize) -> Option<Bytes> {
-        let stream_idx = self.stream_idx(stream_id);
+        let stream_idx = self.stream_idx(stream_id)?;
+        if !self.request_started[stream_idx].load(Ordering::SeqCst) {
+            return None;
+        }
         let (bytes, _hash) = self.request_cache.get(stream_idx, slot_id).await?;
         Some(bytes)
     }
 
     /// Get last slot index for a response stream
     pub fn response_last(&self, stream_id: u64) -> Option<usize> {
-        let stream_idx = self.stream_idx(stream_id);
+        let stream_idx = self.stream_idx(stream_id)?;
+        if !self.response_started[stream_idx].load(Ordering::SeqCst) {
+            return Some(0);
+        }
         self.response_cache.last(stream_idx)
     }
 
     /// Get raw bytes from response stream slot
     pub async fn response_get(&self, stream_id: u64, slot_id: usize) -> Option<Bytes> {
-        let stream_idx = self.stream_idx(stream_id);
+        let stream_idx = self.stream_idx(stream_id)?;
+        if !self.response_started[stream_idx].load(Ordering::SeqCst) {
+            return None;
+        }
         let (bytes, _hash) = self.response_cache.get(stream_idx, slot_id).await?;
         Some(bytes)
     }
@@ -456,7 +756,10 @@ impl UploadResponseRouter {
     /// Create a new router with the given service
     pub fn new(service: Arc<UploadResponseService>) -> Self {
         let ws_handler = UploadResponseWsHandler::new(Arc::clone(&service));
-        Self { service, ws_handler }
+        Self {
+            service,
+            ws_handler,
+        }
     }
 
     /// Get a reference to the underlying service
@@ -464,88 +767,283 @@ impl UploadResponseRouter {
         Arc::clone(&self.service)
     }
 
-    /// Stream a request into the cache and wait for response
-    ///
-    /// Format:
-    /// - Slot 1: HPKS headers frame
-    /// - Slot 2..N-1: Raw body bytes
-    /// - Slot N: END marker
-    async fn stream_request(
-        &self,
-        req: Request<()>,
-        mut body: Option<BodyStream>,
-    ) -> HandlerResult<HandlerResponse> {
-        // Acquire stream (blocks if at capacity)
-        let _permit = self
-            .service
-            .acquire_stream()
-            .await
-            .map_err(|e| ServerError::Config(e))?;
+    fn is_internal_path(path: &str) -> bool {
+        path == "/_upload_response/streams" || path.starts_with("/_upload_response/streams/")
+    }
 
-        // Get next stream ID
-        let stream_id = self.service.next_id();
-        debug!(stream_id, uri = %req.uri(), "Streaming request");
+    fn text_response(status: StatusCode, body: impl Into<String>) -> HandlerResponse {
+        HandlerResponse {
+            status,
+            body: Some(Bytes::from(body.into())),
+            content_type: Some("text/plain; charset=utf-8".to_string()),
+            ..Default::default()
+        }
+    }
 
-        // Slot 1: HPKS headers frame
-        let headers = StreamHeaders::from_request(stream_id, &req)
-            .map_err(|e| ServerError::Config(e.to_string()))?;
-        self.service
-            .write_request_headers(stream_id, headers)
-            .await
-            .map_err(|e| ServerError::Config(e))?;
+    fn binary_response(status: StatusCode, body: Bytes, slot_type: Option<&str>) -> HandlerResponse {
+        let mut headers = Vec::new();
+        if let Some(slot_type) = slot_type {
+            headers.push(("x-upload-response-slot-type".to_string(), slot_type.to_string()));
+        }
+        HandlerResponse {
+            status,
+            body: Some(body),
+            content_type: Some("application/octet-stream".to_string()),
+            headers,
+            ..Default::default()
+        }
+    }
 
-        // Slots 2+: Raw body bytes - write immediately as data arrives
-        if let Some(ref mut body_stream) = body {
-            use futures_util::StreamExt;
+    async fn collect_body(mut body: Option<BodyStream>) -> Result<Bytes, ServerError> {
+        let Some(ref mut body_stream) = body else {
+            return Ok(Bytes::new());
+        };
 
-            let slot_bytes = self.service.config.slot_bytes();
-
-            while let Some(chunk) = body_stream.next().await {
-                let chunk = chunk?;
-                if chunk.is_empty() {
-                    continue;
-                }
-
-                // If chunk fits in a slot, write immediately
-                if chunk.len() <= slot_bytes {
-                    self.service
-                        .append_request_body(stream_id, chunk)
-                        .await
-                        .map_err(|e| ServerError::Config(e))?;
-                } else {
-                    // Chunk too large - split into slot-sized pieces
-                    let mut remaining = chunk;
-                    while !remaining.is_empty() {
-                        let take = remaining.len().min(slot_bytes);
-                        let data = remaining.split_to(take);
-                        self.service
-                            .append_request_body(stream_id, data)
-                            .await
-                            .map_err(|e| ServerError::Config(e))?;
-                    }
-                }
-            }
+        let mut collected = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            let chunk = chunk?;
+            collected.extend_from_slice(&chunk);
         }
 
-        // Final slot: END marker
-        self.service
-            .end_request(stream_id)
-            .await
-            .map_err(|e| ServerError::Config(e))?;
+        Ok(Bytes::from(collected))
+    }
 
-        debug!(stream_id, "Request complete, waiting for response");
+    fn parse_u64_component(value: &str, name: &str) -> Result<u64, ServerError> {
+        value
+            .parse::<u64>()
+            .map_err(|_| ServerError::Config(format!("invalid {name}: {value}")))
+    }
 
-        // Register response channel and wait
-        let rx = self.service.register_response(stream_id).await;
+    fn parse_usize_component(value: &str, name: &str) -> Result<usize, ServerError> {
+        value
+            .parse::<usize>()
+            .map_err(|_| ServerError::Config(format!("invalid {name}: {value}")))
+    }
 
+    fn format_stream_info(info: &ActiveStreamInfo) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            info.stream_id,
+            info.stream_idx,
+            info.request_last,
+            info.response_last,
+            info.reader_count,
+            info.response_owner.as_deref().unwrap_or("-")
+        )
+    }
+
+    async fn route_internal(
+        &self,
+        req: Request<()>,
+        body: Option<BodyStream>,
+    ) -> HandlerResult<HandlerResponse> {
+        let method = req.method().clone();
+        let path_parts: Vec<&str> = req.uri().path().split('/').filter(|part| !part.is_empty()).collect();
+
+        match (method.as_str(), path_parts.as_slice()) {
+            ("GET", ["_upload_response", "streams"]) => {
+                let mut lines = vec!["stream_id\tstream_idx\trequest_last\tresponse_last\treaders\tresponse_owner".to_string()];
+                for info in self.service.active_streams().await {
+                    lines.push(Self::format_stream_info(&info));
+                }
+                Ok(Self::text_response(StatusCode::OK, lines.join("\n")))
+            }
+            ("GET", ["_upload_response", "streams", stream_id]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                match self
+                    .service
+                    .active_streams()
+                    .await
+                    .into_iter()
+                    .find(|info| info.stream_id == stream_id)
+                {
+                    Some(info) => Ok(Self::text_response(StatusCode::OK, Self::format_stream_info(&info))),
+                    None => Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found")),
+                }
+            }
+            ("GET", ["_upload_response", "streams", stream_id, "request", "last"]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                match self.service.request_last(stream_id) {
+                    Some(last) => Ok(Self::text_response(StatusCode::OK, last.to_string())),
+                    None => Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found")),
+                }
+            }
+            ("GET", ["_upload_response", "streams", stream_id, "response", "last"]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                match self.service.response_last(stream_id) {
+                    Some(last) => Ok(Self::text_response(StatusCode::OK, last.to_string())),
+                    None => Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found")),
+                }
+            }
+            ("GET", ["_upload_response", "streams", stream_id, "request", "slots", slot_id]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                let slot_id = Self::parse_usize_component(slot_id, "slot_id")?;
+                match self.service.request_get(stream_id, slot_id).await {
+                    Some(bytes) => {
+                        let slot_type = if slot_id == 1 {
+                            Some("headers")
+                        } else if UploadResponseService::is_end_marker(&bytes) {
+                            Some("end")
+                        } else {
+                            Some("body")
+                        };
+                        Ok(Self::binary_response(StatusCode::OK, bytes, slot_type))
+                    }
+                    None => Ok(Self::text_response(StatusCode::NOT_FOUND, "slot not found")),
+                }
+            }
+            ("GET", ["_upload_response", "streams", stream_id, "response", "slots", slot_id]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                let slot_id = Self::parse_usize_component(slot_id, "slot_id")?;
+                match self.service.response_get(stream_id, slot_id).await {
+                    Some(bytes) => {
+                        let slot_type = if slot_id == 1 {
+                            Some("headers")
+                        } else if UploadResponseService::is_end_marker(&bytes) {
+                            Some("end")
+                        } else {
+                            Some("body")
+                        };
+                        Ok(Self::binary_response(StatusCode::OK, bytes, slot_type))
+                    }
+                    None => Ok(Self::text_response(StatusCode::NOT_FOUND, "slot not found")),
+                }
+            }
+            ("PUT", ["_upload_response", "streams", stream_id, "readers", worker_id]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                }
+                let inserted = self.service.register_reader(stream_id, worker_id).await;
+                let status = if inserted {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NO_CONTENT
+                };
+                Ok(Self::text_response(status, "ok"))
+            }
+            ("DELETE", ["_upload_response", "streams", stream_id, "readers", worker_id]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                }
+                let removed = self.service.unregister_reader(stream_id, worker_id).await;
+                let status = if removed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NO_CONTENT
+                };
+                Ok(Self::text_response(status, "ok"))
+            }
+            ("PUT", ["_upload_response", "streams", stream_id, "response", "claim", worker_id]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                }
+                if self.service.try_claim_response(stream_id, worker_id).await {
+                    Ok(Self::text_response(StatusCode::OK, "claimed"))
+                } else {
+                    let owner = self
+                        .service
+                        .response_owner(stream_id)
+                        .await
+                        .unwrap_or_else(|| "-".to_string());
+                    Ok(Self::text_response(
+                        StatusCode::CONFLICT,
+                        format!("already claimed by {owner}"),
+                    ))
+                }
+            }
+            ("DELETE", ["_upload_response", "streams", stream_id, "response", "claim", worker_id]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                }
+                let released = self.service.release_response(stream_id, worker_id).await;
+                let status = if released {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                };
+                Ok(Self::text_response(status, "ok"))
+            }
+            ("PUT", ["_upload_response", "streams", stream_id, "response", "headers"]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                }
+                let body = Self::collect_body(body).await?;
+                let frame = decode_frame(&body)
+                    .map_err(|e| ServerError::Config(format!("invalid HPKS headers frame: {e}")))?;
+                match frame {
+                    StreamFrame::Headers(StreamHeaders::Response(resp)) if resp.stream_id == stream_id => {
+                        self.service
+                            .write_response_headers(stream_id, StreamHeaders::Response(resp))
+                            .await
+                            .map_err(ServerError::Config)?;
+                        Ok(Self::text_response(StatusCode::OK, "ok"))
+                    }
+                    StreamFrame::Headers(StreamHeaders::Response(_)) => Ok(Self::text_response(
+                        StatusCode::BAD_REQUEST,
+                        "stream id mismatch",
+                    )),
+                    _ => Ok(Self::text_response(
+                        StatusCode::BAD_REQUEST,
+                        "expected response headers frame",
+                    )),
+                }
+            }
+            ("PUT", ["_upload_response", "streams", stream_id, "response", "body"]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                }
+                let body = Self::collect_body(body).await?;
+                self.service
+                    .append_response_body(stream_id, body)
+                    .await
+                    .map_err(ServerError::Config)?;
+                Ok(Self::text_response(StatusCode::OK, "ok"))
+            }
+            ("PUT", ["_upload_response", "streams", stream_id, "response", "end"]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                }
+                self.service
+                    .end_response(stream_id)
+                    .await
+                    .map_err(ServerError::Config)?;
+                Ok(Self::text_response(StatusCode::OK, "ok"))
+            }
+            _ => Ok(Self::text_response(StatusCode::NOT_FOUND, "not found")),
+        }
+    }
+
+    async fn await_response(
+        &self,
+        stream_id: u64,
+        rx: oneshot::Receiver<ResponseResult>,
+    ) -> HandlerResult<HandlerResponse> {
         let timeout_duration = Duration::from_millis(self.service.config.response_timeout_ms);
         match timeout(timeout_duration, rx).await {
-            Ok(Ok(Ok((status, body)))) => {
-                debug!(stream_id, ?status, "Received response");
+            Ok(Ok(Ok(cached))) => {
+                debug!(stream_id, status = ?cached.status, "Received response");
+                let mut content_type = None;
+                let mut headers = Vec::new();
+                for (name, value) in cached.headers {
+                    if name.eq_ignore_ascii_case("content-type") {
+                        content_type = Some(value);
+                    } else {
+                        headers.push((name, value));
+                    }
+                }
                 Ok(HandlerResponse {
-                    status,
-                    body: Some(body),
-                    ..Default::default()
+                    status: cached.status,
+                    body: Some(cached.body),
+                    content_type,
+                    headers,
+                    etag: None,
                 })
             }
             Ok(Ok(Err(e))) => {
@@ -565,11 +1063,86 @@ impl UploadResponseRouter {
             }
         }
     }
+
+    /// Stream a request into the cache and wait for response
+    ///
+    /// Format:
+    /// - Slot 1: HPKS headers frame
+    /// - Slot 2..N-1: Raw body bytes
+    /// - Slot N: END marker
+    async fn stream_request(
+        &self,
+        req: Request<()>,
+        mut body: Option<BodyStream>,
+    ) -> HandlerResult<HandlerResponse> {
+        let stream = self
+            .service
+            .open_stream()
+            .await
+            .map_err(ServerError::Config)?;
+        let stream_id = stream.stream_id();
+        let rx = self.service.register_response(stream_id).await;
+        debug!(stream_id, uri = %req.uri(), "Streaming request");
+
+        let result = async {
+            let headers = StreamHeaders::from_request(stream_id, &req)
+                .map_err(|e| ServerError::Config(e.to_string()))?;
+            self.service
+                .write_request_headers(stream_id, headers)
+                .await
+                .map_err(ServerError::Config)?;
+
+            if let Some(ref mut body_stream) = body {
+                use futures_util::StreamExt;
+
+                let slot_bytes = self.service.config.slot_bytes();
+
+                while let Some(chunk) = body_stream.next().await {
+                    let chunk = chunk?;
+                    if chunk.is_empty() {
+                        continue;
+                    }
+
+                    if chunk.len() <= slot_bytes {
+                        self.service
+                            .append_request_body(stream_id, chunk)
+                            .await
+                            .map_err(ServerError::Config)?;
+                    } else {
+                        let mut remaining = chunk;
+                        while !remaining.is_empty() {
+                            let take = remaining.len().min(slot_bytes);
+                            let data = remaining.split_to(take);
+                            self.service
+                                .append_request_body(stream_id, data)
+                                .await
+                                .map_err(ServerError::Config)?;
+                        }
+                    }
+                }
+            }
+
+            self.service
+                .end_request(stream_id)
+                .await
+                .map_err(ServerError::Config)?;
+
+            debug!(stream_id, "Request complete, waiting for response");
+            self.await_response(stream_id, rx).await
+        }
+        .await;
+
+        stream.close().await;
+        result
+    }
 }
 
 #[async_trait]
 impl Router for UploadResponseRouter {
     async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
+        if Self::is_internal_path(req.uri().path()) {
+            return self.route_internal(req, None).await;
+        }
         self.stream_request(req, None).await
     }
 
@@ -578,6 +1151,9 @@ impl Router for UploadResponseRouter {
         req: Request<()>,
         body: BodyStream,
     ) -> HandlerResult<HandlerResponse> {
+        if Self::is_internal_path(req.uri().path()) {
+            return self.route_internal(req, Some(body)).await;
+        }
         self.stream_request(req, Some(body)).await
     }
 
@@ -630,101 +1206,98 @@ impl WebSocketHandler for UploadResponseWsHandler {
         req: Request<()>,
         mut stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     ) -> HandlerResult<()> {
-        // Acquire stream slot
-        let _permit = self
+        let upload_stream = self
             .service
-            .acquire_stream()
+            .open_stream()
             .await
-            .map_err(|e| ServerError::Config(e))?;
-
-        let stream_id = self.service.next_id();
+            .map_err(ServerError::Config)?;
+        let stream_id = upload_stream.stream_id();
+        let rx = self.service.register_response(stream_id).await;
         debug!(stream_id, uri = %req.uri(), "WebSocket stream started");
 
-        // Slot 1: HPKS headers frame
-        let headers = StreamHeaders::from_request(stream_id, &req)
-            .map_err(|e| ServerError::Config(e.to_string()))?;
-        self.service
-            .write_request_headers(stream_id, headers)
-            .await
-            .map_err(|e| ServerError::Config(e))?;
+        let result = async {
+            let headers = StreamHeaders::from_request(stream_id, &req)
+                .map_err(|e| ServerError::Config(e.to_string()))?;
+            self.service
+                .write_request_headers(stream_id, headers)
+                .await
+                .map_err(ServerError::Config)?;
 
-        let slot_bytes = self.service.config.slot_bytes();
+            let slot_bytes = self.service.config.slot_bytes();
 
-        // Read binary frames and write to request cache
-        // Empty binary frame signals end of upload
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(Message::Binary(data)) => {
-                    if data.is_empty() {
-                        // Empty binary = end marker from client
-                        break;
-                    }
-                    // Split into slot-sized chunks if needed
-                    if data.len() <= slot_bytes {
-                        self.service
-                            .append_request_body(stream_id, Bytes::from(data))
-                            .await
-                            .map_err(|e| ServerError::Config(e))?;
-                    } else {
-                        let mut remaining = Bytes::from(data);
-                        while !remaining.is_empty() {
-                            let take = remaining.len().min(slot_bytes);
-                            let chunk = remaining.split_to(take);
+            while let Some(msg) = stream.next().await {
+                match msg {
+                    Ok(Message::Binary(data)) => {
+                        if data.is_empty() {
+                            break;
+                        }
+                        if data.len() <= slot_bytes {
                             self.service
-                                .append_request_body(stream_id, chunk)
+                                .append_request_body(stream_id, Bytes::from(data))
                                 .await
-                                .map_err(|e| ServerError::Config(e))?;
+                                .map_err(ServerError::Config)?;
+                        } else {
+                            let mut remaining = Bytes::from(data);
+                            while !remaining.is_empty() {
+                                let take = remaining.len().min(slot_bytes);
+                                let chunk = remaining.split_to(take);
+                                self.service
+                                    .append_request_body(stream_id, chunk)
+                                    .await
+                                    .map_err(ServerError::Config)?;
+                            }
                         }
                     }
-                }
-                Ok(Message::Close(_)) => break,
-                Ok(_) => continue, // Ignore text, ping, pong
-                Err(e) => {
-                    error!(stream_id, error = %e, "WebSocket error");
-                    break;
+                    Ok(Message::Close(_)) => break,
+                    Ok(_) => continue,
+                    Err(e) => {
+                        error!(stream_id, error = %e, "WebSocket error");
+                        break;
+                    }
                 }
             }
-        }
 
-        // End marker
-        self.service
-            .end_request(stream_id)
-            .await
-            .map_err(|e| ServerError::Config(e))?;
+            self.service
+                .end_request(stream_id)
+                .await
+                .map_err(ServerError::Config)?;
 
-        debug!(stream_id, "Request complete, waiting for response");
-
-        // Wait for response
-        let rx = self.service.register_response(stream_id).await;
-        let timeout_duration = Duration::from_millis(self.service.config.response_timeout_ms);
-
-        match timeout(timeout_duration, rx).await {
-            Ok(Ok(Ok((status, body)))) => {
-                debug!(stream_id, ?status, "Sending WebSocket response");
-                // Send response as binary frame
-                if let Err(e) = stream.send(Message::Binary(body.to_vec().into())).await {
+            debug!(stream_id, "Request complete, waiting for response");
+            let timeout_duration = Duration::from_millis(self.service.config.response_timeout_ms);
+            match timeout(timeout_duration, rx).await {
+            Ok(Ok(Ok(cached))) => {
+                debug!(stream_id, status = ?cached.status, "Sending WebSocket response");
+                if let Err(e) = stream
+                    .send(Message::Binary(cached.body.to_vec().into()))
+                    .await
+                {
                     error!(stream_id, error = %e, "Failed to send WebSocket response");
                 }
                 let _ = stream.close(None).await;
+                }
+                Ok(Ok(Err(e))) => {
+                    error!(stream_id, error = %e, "Response error");
+                    self.service.drop_response_channel(stream_id).await;
+                    let _ = stream.close(None).await;
+                }
+                Ok(Err(_)) => {
+                    error!(stream_id, "Response channel closed");
+                    self.service.drop_response_channel(stream_id).await;
+                    let _ = stream.close(None).await;
+                }
+                Err(_) => {
+                    error!(stream_id, "Response timeout");
+                    self.service.drop_response_channel(stream_id).await;
+                    let _ = stream.close(None).await;
+                }
             }
-            Ok(Ok(Err(e))) => {
-                error!(stream_id, error = %e, "Response error");
-                self.service.drop_response_channel(stream_id).await;
-                let _ = stream.close(None).await;
-            }
-            Ok(Err(_)) => {
-                error!(stream_id, "Response channel closed");
-                self.service.drop_response_channel(stream_id).await;
-                let _ = stream.close(None).await;
-            }
-            Err(_) => {
-                error!(stream_id, "Response timeout");
-                self.service.drop_response_channel(stream_id).await;
-                let _ = stream.close(None).await;
-            }
+            Ok(())
         }
+        .await;
 
-        Ok(())
+        upload_stream.close().await;
+        result
+
     }
 
     fn can_handle(&self, path: &str) -> bool {
@@ -827,9 +1400,9 @@ mod tests {
     #[tokio::test]
     async fn test_stream_format() {
         let config = UploadResponseConfig::default();
-        let service = UploadResponseService::new(config);
-
-        let stream_id = 1u64;
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
 
         // Slot 1: HPKS headers frame
         let headers = StreamHeaders::Request(StreamRequestHeaders {
@@ -841,13 +1414,22 @@ mod tests {
             path: b"/upload".to_vec(),
             headers: vec![],
         });
-        service.write_request_headers(stream_id, headers).await.unwrap();
+        service
+            .write_request_headers(stream_id, headers)
+            .await
+            .unwrap();
 
         // Slot 2: Raw body bytes
-        service.append_request_body(stream_id, Bytes::from("hello")).await.unwrap();
+        service
+            .append_request_body(stream_id, Bytes::from("hello"))
+            .await
+            .unwrap();
 
         // Slot 3: More raw body bytes
-        service.append_request_body(stream_id, Bytes::from(" world")).await.unwrap();
+        service
+            .append_request_body(stream_id, Bytes::from(" world"))
+            .await
+            .unwrap();
 
         // Slot 4: END marker
         service.end_request(stream_id).await.unwrap();
@@ -864,14 +1446,16 @@ mod tests {
 
         let slot4 = service.request_get(stream_id, 4).await.unwrap();
         assert!(UploadResponseService::is_end_marker(&slot4));
+
+        upload_stream.close().await;
     }
 
     #[tokio::test]
     async fn test_tail_request() {
         let config = UploadResponseConfig::default();
-        let service = UploadResponseService::new(config);
-
-        let stream_id = 1u64;
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
 
         // Write stream
         let headers = StreamHeaders::Request(StreamRequestHeaders {
@@ -883,8 +1467,14 @@ mod tests {
             path: b"/upload".to_vec(),
             headers: vec![],
         });
-        service.write_request_headers(stream_id, headers).await.unwrap();
-        service.append_request_body(stream_id, Bytes::from("hello world")).await.unwrap();
+        service
+            .write_request_headers(stream_id, headers)
+            .await
+            .unwrap();
+        service
+            .append_request_body(stream_id, Bytes::from("hello world"))
+            .await
+            .unwrap();
         service.end_request(stream_id).await.unwrap();
 
         // Tail the stream
@@ -905,6 +1495,8 @@ mod tests {
 
         let slot3 = service.tail_request(stream_id, 3).await.unwrap();
         assert!(matches!(slot3, TailSlot::End));
+
+        upload_stream.close().await;
     }
 
     #[tokio::test]
@@ -916,12 +1508,19 @@ mod tests {
         let rx = service.register_response(stream_id).await;
 
         service
-            .complete_response(stream_id, Ok((StatusCode::OK, Bytes::from("ok"))))
+            .complete_response(
+                stream_id,
+                Ok(CachedResponse {
+                    status: StatusCode::OK,
+                    body: Bytes::from("ok"),
+                    headers: Vec::new(),
+                }),
+            )
             .await;
 
-        let (status, body) = rx.await.unwrap().unwrap();
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, Bytes::from("ok"));
+        let cached = rx.await.unwrap().unwrap();
+        assert_eq!(cached.status, StatusCode::OK);
+        assert_eq!(cached.body, Bytes::from("ok"));
     }
 
     #[tokio::test]
@@ -930,9 +1529,9 @@ mod tests {
             num_streams: 10,
             ..Default::default()
         };
-        let service = UploadResponseService::new(config);
-
-        let stream_id = 1u64;
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
 
         // Initially no readers
         assert_eq!(service.reader_count(stream_id), 0);
@@ -963,6 +1562,8 @@ mod tests {
         // Clear all readers
         service.clear_readers(stream_id).await;
         assert_eq!(service.reader_count(stream_id), 0);
+
+        upload_stream.close().await;
     }
 
     #[tokio::test]
@@ -971,9 +1572,9 @@ mod tests {
             num_streams: 10,
             ..Default::default()
         };
-        let service = UploadResponseService::new(config);
-
-        let stream_id = 1u64;
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
 
         // Initially unclaimed
         assert!(service.response_owner(stream_id).await.is_none());
@@ -981,17 +1582,26 @@ mod tests {
 
         // Worker 1 claims successfully
         assert!(service.try_claim_response(stream_id, "writer-1").await);
-        assert_eq!(service.response_owner(stream_id).await, Some("writer-1".to_string()));
+        assert_eq!(
+            service.response_owner(stream_id).await,
+            Some("writer-1".to_string())
+        );
         assert!(service.is_response_claimed_by(stream_id, "writer-1").await);
         assert!(!service.is_response_claimed_by(stream_id, "writer-2").await);
 
         // Worker 2 cannot claim (already claimed)
         assert!(!service.try_claim_response(stream_id, "writer-2").await);
-        assert_eq!(service.response_owner(stream_id).await, Some("writer-1".to_string()));
+        assert_eq!(
+            service.response_owner(stream_id).await,
+            Some("writer-1".to_string())
+        );
 
         // Worker 2 cannot release (not owner)
         assert!(!service.release_response(stream_id, "writer-2").await);
-        assert_eq!(service.response_owner(stream_id).await, Some("writer-1".to_string()));
+        assert_eq!(
+            service.response_owner(stream_id).await,
+            Some("writer-1".to_string())
+        );
 
         // Worker 1 releases successfully
         assert!(service.release_response(stream_id, "writer-1").await);
@@ -999,11 +1609,16 @@ mod tests {
 
         // Now worker 2 can claim
         assert!(service.try_claim_response(stream_id, "writer-2").await);
-        assert_eq!(service.response_owner(stream_id).await, Some("writer-2".to_string()));
+        assert_eq!(
+            service.response_owner(stream_id).await,
+            Some("writer-2".to_string())
+        );
 
         // Force release works regardless of owner
         service.force_release_response(stream_id).await;
         assert!(service.response_owner(stream_id).await.is_none());
+
+        upload_stream.close().await;
     }
 
     #[tokio::test]
@@ -1015,8 +1630,8 @@ mod tests {
             ..Default::default()
         };
         let service = Arc::new(UploadResponseService::new(config));
-
-        let stream_id = 1u64;
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
         let claim_count = Arc::new(AtomicUsize::new(0));
 
         // Spawn 10 workers trying to claim the same response
@@ -1039,5 +1654,7 @@ mod tests {
         // Exactly one worker should have claimed it
         assert_eq!(claim_count.load(Ordering::SeqCst), 1);
         assert!(service.response_owner(stream_id).await.is_some());
+
+        upload_stream.close().await;
     }
 }

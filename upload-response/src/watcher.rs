@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{debug, trace, warn};
 
-use crate::{UploadResponseService, END_MARKER};
+use crate::{CachedResponse, UploadResponseService, END_MARKER};
 
 /// Watches the response cache for complete responses and delivers them
 /// to waiting clients via oneshot channels.
@@ -18,6 +18,7 @@ pub struct ResponseWatcher {
 /// State for tracking a response stream being assembled
 struct ResponseAssembly {
     status: Option<u16>,
+    headers: Vec<(String, String)>,
     body_chunks: Vec<Bytes>,
 }
 
@@ -25,19 +26,30 @@ impl ResponseAssembly {
     fn new() -> Self {
         Self {
             status: None,
+            headers: Vec::new(),
             body_chunks: Vec::new(),
         }
     }
 
     fn set_headers(&mut self, headers: StreamResponseHeaders) {
         self.status = Some(headers.status);
+        self.headers = headers
+            .headers
+            .into_iter()
+            .map(|header| {
+                (
+                    String::from_utf8_lossy(&header.name).into_owned(),
+                    String::from_utf8_lossy(&header.value).into_owned(),
+                )
+            })
+            .collect();
     }
 
     fn add_body(&mut self, data: Bytes) {
         self.body_chunks.push(data);
     }
 
-    fn finalize(self) -> Result<(StatusCode, Bytes), String> {
+    fn finalize(self) -> Result<CachedResponse, String> {
         let status = self.status.ok_or("missing status")?;
         let status = StatusCode::from_u16(status).map_err(|e| e.to_string())?;
 
@@ -47,7 +59,11 @@ impl ResponseAssembly {
             body.extend_from_slice(&chunk);
         }
 
-        Ok((status, Bytes::from(body)))
+        Ok(CachedResponse {
+            status,
+            body: Bytes::from(body),
+            headers: self.headers,
+        })
     }
 }
 
@@ -78,18 +94,34 @@ impl ResponseWatcher {
         let mut poll_interval = interval(Duration::from_millis(self.poll_interval_ms));
         let num_streams = self.service.config().num_streams;
 
-        // Track last seen slot index for each stream
+        // Track the stream currently assigned to each slot and the last slot seen for it.
+        let mut stream_ids: Vec<u64> = vec![0; num_streams];
         let mut last_seen: Vec<usize> = vec![0; num_streams];
-        // Track in-progress response assemblies by stream_id
         let mut assemblies: HashMap<u64, ResponseAssembly> = HashMap::new();
 
         loop {
             poll_interval.tick().await;
 
-            // Poll each stream for new slots
             for stream_idx in 0..num_streams {
-                // Derive stream_id from stream_idx (simplified - in practice would track active streams)
-                let stream_id = stream_idx as u64;
+                let stream_id = self.service.slot_stream_id(stream_idx).unwrap_or(0);
+                let previous_stream_id = stream_ids[stream_idx];
+
+                if stream_id == 0 {
+                    if previous_stream_id != 0 {
+                        assemblies.remove(&previous_stream_id);
+                        last_seen[stream_idx] = 0;
+                        stream_ids[stream_idx] = 0;
+                    }
+                    continue;
+                }
+
+                if previous_stream_id != stream_id {
+                    if previous_stream_id != 0 {
+                        assemblies.remove(&previous_stream_id);
+                    }
+                    stream_ids[stream_idx] = stream_id;
+                    last_seen[stream_idx] = 0;
+                }
 
                 let current_last = self.service.response_last(stream_id).unwrap_or(0);
                 let seen = last_seen[stream_idx];
@@ -98,11 +130,9 @@ impl ResponseWatcher {
                     continue;
                 }
 
-                // Process new slots
                 for slot_id in (seen + 1)..=current_last {
                     if let Some(bytes) = self.service.response_get(stream_id, slot_id).await {
                         if slot_id == 1 {
-                            // First slot: HPKS headers frame
                             if let Ok(frame) = decode_frame(&bytes) {
                                 if let StreamFrame::Headers(StreamHeaders::Response(resp)) = frame {
                                     trace!(stream_id, status = resp.status, "Response headers");
@@ -112,14 +142,12 @@ impl ResponseWatcher {
                                 }
                             }
                         } else if bytes.as_ref() == END_MARKER {
-                            // End marker - finalize response
                             debug!(stream_id, "Response end");
                             if let Some(assembly) = assemblies.remove(&stream_id) {
                                 let result = assembly.finalize();
                                 self.deliver_response(stream_id, result).await;
                             }
                         } else {
-                            // Raw body bytes
                             trace!(stream_id, len = bytes.len(), "Response body chunk");
                             if let Some(assembly) = assemblies.get_mut(&stream_id) {
                                 assembly.add_body(bytes);
@@ -134,7 +162,7 @@ impl ResponseWatcher {
     }
 
     /// Deliver a completed response to the waiting client
-    async fn deliver_response(&self, stream_id: u64, result: Result<(StatusCode, Bytes), String>) {
+    async fn deliver_response(&self, stream_id: u64, result: Result<CachedResponse, String>) {
         let channels = self.service.response_channels();
         let tx = {
             let mut guard = channels.write().await;
@@ -162,8 +190,8 @@ mod tests {
     async fn test_response_assembly() {
         let config = UploadResponseConfig::default();
         let service = Arc::new(crate::UploadResponseService::new(config));
-
-        let stream_id = 0u64; // Use stream 0 for simplicity
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
 
         // Register a response channel
         let rx = service.register_response(stream_id).await;
@@ -175,8 +203,14 @@ mod tests {
             status: 200,
             headers: vec![],
         });
-        service.write_response_headers(stream_id, headers).await.unwrap();
-        service.append_response_body(stream_id, Bytes::from("hello")).await.unwrap();
+        service
+            .write_response_headers(stream_id, headers)
+            .await
+            .unwrap();
+        service
+            .append_response_body(stream_id, Bytes::from("hello"))
+            .await
+            .unwrap();
         service.end_response(stream_id).await.unwrap();
 
         // Create watcher and process manually
@@ -209,8 +243,10 @@ mod tests {
         }
 
         // Check that response was delivered
-        let (status, body) = rx.await.unwrap().unwrap();
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, Bytes::from("hello"));
+        let cached = rx.await.unwrap().unwrap();
+        assert_eq!(cached.status, StatusCode::OK);
+        assert_eq!(cached.body, Bytes::from("hello"));
+
+        upload_stream.close().await;
     }
 }

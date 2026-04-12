@@ -2,17 +2,17 @@ use bytes::Bytes;
 use http::StatusCode;
 use http_pack::stream::{StreamHeaders, StreamResponseHeaders};
 use portpicker::pick_unused_port;
+use rist::Profile as RistProfile;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::time::{interval, Duration};
 use upload_response::{
-    AllowAllEncrypted, ResponseWatcher, RistIngest, SrtIngest, TailSlot, TcpIngest, UploadResponseConfig,
-    UploadResponseRouter, UploadResponseService, WebRtcIngest,
+    AllowAllEncrypted, ResponseWatcher, RistIngest, SrtIngest, TailSlot, TcpIngest,
+    UploadResponseConfig, UploadResponseRouter, UploadResponseService, WebRtcIngest,
 };
 #[cfg(feature = "udp-fec")]
 use upload_response::{UdpFecIngest, UdpFecSender};
-use rist::Profile as RistProfile;
 use web_service::{H2H3Server, Server, ServerBuilder};
 
 // HTTP/3 imports
@@ -30,7 +30,9 @@ use tokio::io::AsyncWriteExt;
 
 // RTMP imports
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rml_rtmp::sessions::{ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType};
+use rml_rtmp::sessions::{
+    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
+};
 use rtmp_ingress::upload::RtmpUploadIngest;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -38,18 +40,24 @@ use tokio::net::TcpStream;
 // WebRTC imports
 use futures::{select, FutureExt};
 use futures_timer::Delay;
-use matchbox_signaling::SignalingServerBuilder;
 use matchbox_signaling::topologies::client_server::{ClientServer, ClientServerState};
+use matchbox_signaling::SignalingServerBuilder;
 use matchbox_socket::{ChannelConfig, PeerState, WebRtcSocket, WebRtcSocketBuilder};
 
-use std::fs;
 use base64::Engine;
+use std::fs;
 
 const SLOT_SIZE_KB: usize = 64;
 
 // Local cert paths (checked into repo)
-const LOCAL_CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tls/local.wavey.ai/fullchain.pem");
-const LOCAL_KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tls/local.wavey.ai/privkey.pem");
+const LOCAL_CERT_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tls/local.wavey.ai/fullchain.pem"
+);
+const LOCAL_KEY_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tls/local.wavey.ai/privkey.pem"
+);
 
 fn load_test_env() -> Option<(String, String)> {
     dotenvy::dotenv().ok();
@@ -76,6 +84,7 @@ fn load_test_env() -> Option<(String, String)> {
 async fn run_worker(service: Arc<UploadResponseService>) {
     let mut poll = interval(Duration::from_micros(50));
     let num_streams = service.config().num_streams;
+    let mut stream_ids: Vec<u64> = vec![0; num_streams];
     let mut last_seen: Vec<usize> = vec![0; num_streams];
     let mut hashers: std::collections::HashMap<u64, xxhash_rust::xxh64::Xxh64> =
         std::collections::HashMap::new();
@@ -84,7 +93,26 @@ async fn run_worker(service: Arc<UploadResponseService>) {
         poll.tick().await;
 
         for stream_idx in 0..num_streams {
-            let stream_id = stream_idx as u64;
+            let stream_id = service.slot_stream_id(stream_idx).unwrap_or(0);
+            let previous_stream_id = stream_ids[stream_idx];
+
+            if stream_id == 0 {
+                if previous_stream_id != 0 {
+                    hashers.remove(&previous_stream_id);
+                    stream_ids[stream_idx] = 0;
+                    last_seen[stream_idx] = 0;
+                }
+                continue;
+            }
+
+            if previous_stream_id != stream_id {
+                if previous_stream_id != 0 {
+                    hashers.remove(&previous_stream_id);
+                }
+                stream_ids[stream_idx] = stream_id;
+                last_seen[stream_idx] = 0;
+            }
+
             let current_last = service.request_last(stream_id).unwrap_or(0);
 
             if current_last <= last_seen[stream_idx] {
@@ -169,18 +197,11 @@ fn generate_test_data(size_bytes: usize) -> (Vec<u8>, u64) {
     (data, hasher.digest())
 }
 
-async fn run_upload_test(
-    port: u16,
-    upload_size_mb: usize,
-    use_http2: bool,
-) -> (f64, bool) {
+async fn run_upload_test(port: u16, upload_size_mb: usize, use_http2: bool) -> (f64, bool) {
     run_upload_test_inner(port, upload_size_mb, use_http2, false).await
 }
 
-async fn run_upload_test_chunked(
-    port: u16,
-    upload_size_mb: usize,
-) -> (f64, bool) {
+async fn run_upload_test_chunked(port: u16, upload_size_mb: usize) -> (f64, bool) {
     run_upload_test_inner(port, upload_size_mb, false, true).await
 }
 
@@ -199,13 +220,15 @@ async fn run_upload_test_inner(
     } else {
         "HTTP/1.1"
     };
-    println!("Generating {} MB test data for {}...", upload_size_mb, proto);
+    println!(
+        "Generating {} MB test data for {}...",
+        upload_size_mb, proto
+    );
     let gen_start = Instant::now();
     let (data, expected_hash) = generate_test_data(upload_size_bytes);
     println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
 
-    let mut builder = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true);
+    let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(true);
 
     if !use_http2 {
         builder = builder.http1_only();
@@ -222,7 +245,8 @@ async fn run_upload_test_inner(
         use http_body_util::StreamBody;
 
         let chunk_size = 64 * 1024;
-        let chunks: Vec<_> = data.chunks(chunk_size)
+        let chunks: Vec<_> = data
+            .chunks(chunk_size)
             .map(|c| Ok::<_, std::io::Error>(hyper::body::Frame::data(Bytes::copy_from_slice(c))))
             .collect();
         let stream = futures_util::stream::iter(chunks);
@@ -330,7 +354,8 @@ async fn run_h3_upload_test(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).expect("quic config"),
     ));
 
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).expect("bind endpoint");
+    let mut endpoint =
+        quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).expect("bind endpoint");
     endpoint.set_default_client_config(client_config);
 
     let server_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -447,14 +472,10 @@ async fn run_wss_upload_test(
     let start = Instant::now();
 
     let url = format!("wss://localhost:{}/upload", port);
-    let (mut ws_stream, _response) = tokio_tungstenite::connect_async_tls_with_config(
-        &url,
-        None,
-        false,
-        Some(connector),
-    )
-    .await
-    .expect("WebSocket connect");
+    let (mut ws_stream, _response) =
+        tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector))
+            .await
+            .expect("WebSocket connect");
 
     // Send data in 64KB chunks
     let chunk_size = 64 * 1024;
@@ -543,9 +564,16 @@ async fn run_srt_upload_test_inner(
     passphrase: Option<&str>,
 ) -> (f64, bool) {
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
-    let proto = if passphrase.is_some() { "SRT (encrypted)" } else { "SRT" };
+    let proto = if passphrase.is_some() {
+        "SRT (encrypted)"
+    } else {
+        "SRT"
+    };
 
-    println!("Generating {} MB test data for {}...", upload_size_mb, proto);
+    println!(
+        "Generating {} MB test data for {}...",
+        upload_size_mb, proto
+    );
     let gen_start = Instant::now();
     let (data, expected_hash) = generate_test_data(upload_size_bytes);
     println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
@@ -758,11 +786,11 @@ async fn setup_srt_server_encrypted(
     });
 
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let srt_ingest = SrtIngest::with_auth(
-        service.clone(),
-        AllowAllEncrypted::new(SRT_PASSPHRASE),
-    );
-    let shutdown_tx = srt_ingest.start(addr).await.expect("start SRT server (encrypted)");
+    let srt_ingest = SrtIngest::with_auth(service.clone(), AllowAllEncrypted::new(SRT_PASSPHRASE));
+    let shutdown_tx = srt_ingest
+        .start(addr)
+        .await
+        .expect("start SRT server (encrypted)");
 
     // Give SRT server time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -936,7 +964,8 @@ async fn test_srt_encrypted_100mb() {
     let (service, shutdown_tx) = setup_srt_server_encrypted(port, 100).await;
 
     println!("\n=== SRT (Encrypted) 100MB Upload Test ===");
-    let (throughput, passed) = run_srt_upload_test_encrypted(service, port, 100, SRT_PASSPHRASE).await;
+    let (throughput, passed) =
+        run_srt_upload_test_encrypted(service, port, 100, SRT_PASSPHRASE).await;
     println!("Throughput: {:.1} MB/s", throughput);
     println!("=========================================\n");
 
@@ -1175,8 +1204,12 @@ async fn run_rtmp_upload_test(
         .collect();
     let total_bytes: usize = frames.iter().map(|f| f.len()).sum();
 
-    println!("Generated {} frames ({} bytes) in {:.2}s",
-             num_frames, total_bytes, gen_start.elapsed().as_secs_f64());
+    println!(
+        "Generated {} frames ({} bytes) in {:.2}s",
+        num_frames,
+        total_bytes,
+        gen_start.elapsed().as_secs_f64()
+    );
 
     let addr = format!("127.0.0.1:{}", port);
 
@@ -1315,7 +1348,10 @@ async fn run_rtmp_upload_test(
                         ClientSessionEvent::ConnectionRequestAccepted => {
                             connected = true;
                             // Request publishing
-                            let result = match session.request_publishing("test-stream".to_string(), PublishRequestType::Live) {
+                            let result = match session.request_publishing(
+                                "test-stream".to_string(),
+                                PublishRequestType::Live,
+                            ) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     println!("RTMP request_publishing failed: {:?}", e);
@@ -1353,7 +1389,11 @@ async fn run_rtmp_upload_test(
         let mut audio_data = vec![0xAF, 0x01];
         audio_data.extend_from_slice(frame);
 
-        let result = match session.publish_audio_data(Bytes::from(audio_data), rml_rtmp::time::RtmpTimestamp::new(timestamp), false) {
+        let result = match session.publish_audio_data(
+            Bytes::from(audio_data),
+            rml_rtmp::time::RtmpTimestamp::new(timestamp),
+            false,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 println!("RTMP publish_audio_data failed: {:?}", e);
@@ -1755,12 +1795,9 @@ async fn setup_webrtc_server(
 
     // Start signaling server
     let signaling_addr: SocketAddr = format!("127.0.0.1:{}", signaling_port).parse().unwrap();
-    let signaling_server = SignalingServerBuilder::new(
-        signaling_addr,
-        ClientServer,
-        ClientServerState::default(),
-    )
-    .build();
+    let signaling_server =
+        SignalingServerBuilder::new(signaling_addr, ClientServer, ClientServerState::default())
+            .build();
 
     let signaling_handle = tokio::spawn(async move {
         signaling_server.serve().await.expect("signaling server");
@@ -1772,7 +1809,10 @@ async fn setup_webrtc_server(
     // Start WebRTC ingest connected to signaling server
     let signaling_url = format!("ws://127.0.0.1:{}/bench", signaling_port);
     let webrtc_ingest = WebRtcIngest::new(service.clone());
-    let shutdown_tx = webrtc_ingest.start(signaling_url).await.expect("start WebRTC ingest");
+    let shutdown_tx = webrtc_ingest
+        .start(signaling_url)
+        .await
+        .expect("start WebRTC ingest");
 
     // Give WebRTC ingest time to connect
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2070,7 +2110,8 @@ async fn test_webrtc_high_throughput_100mb() {
     let (service, shutdown_tx, signaling_handle) = setup_webrtc_server(signaling_port, 100).await;
 
     println!("\n=== WebRTC (High-Throughput) 100MB Upload Test ===");
-    let (throughput, passed) = run_webrtc_upload_test_high_throughput(service, signaling_port, 100).await;
+    let (throughput, passed) =
+        run_webrtc_upload_test_high_throughput(service, signaling_port, 100).await;
     println!("Throughput: {:.1} MB/s", throughput);
     println!("==================================================\n");
 
@@ -2100,7 +2141,8 @@ async fn test_throughput_comparison() {
 
     // WebRTC Default
     let webrtc_port = pick_unused_port().expect("pick port");
-    let (webrtc_service, webrtc_shutdown, webrtc_handle) = setup_webrtc_server(webrtc_port, 100).await;
+    let (webrtc_service, webrtc_shutdown, webrtc_handle) =
+        setup_webrtc_server(webrtc_port, 100).await;
     let (webrtc_default, _) = run_webrtc_upload_test(webrtc_service, webrtc_port, 100).await;
     let _ = webrtc_shutdown.send(());
     webrtc_handle.abort();
@@ -2108,15 +2150,15 @@ async fn test_throughput_comparison() {
 
     // WebRTC High-Throughput
     let webrtc_port2 = pick_unused_port().expect("pick port");
-    let (webrtc_service2, webrtc_shutdown2, webrtc_handle2) = setup_webrtc_server(webrtc_port2, 100).await;
-    let (webrtc_high, _) = run_webrtc_upload_test_high_throughput(webrtc_service2, webrtc_port2, 100).await;
+    let (webrtc_service2, webrtc_shutdown2, webrtc_handle2) =
+        setup_webrtc_server(webrtc_port2, 100).await;
+    let (webrtc_high, _) =
+        run_webrtc_upload_test_high_throughput(webrtc_service2, webrtc_port2, 100).await;
     let _ = webrtc_shutdown2.send(());
     webrtc_handle2.abort();
 
     println!("\n=== Results ===");
-    println!(
-        "| Protocol | Default | High-Throughput | Improvement |"
-    );
+    println!("| Protocol | Default | High-Throughput | Improvement |");
     println!("|----------|---------|-----------------|-------------|");
     println!(
         "| SRT      | {:.1} MB/s | {:.1} MB/s | {:.1}x |",
@@ -2329,7 +2371,8 @@ async fn test_protocol_comparison() {
     let (srt_service, srt_shutdown_tx) = setup_srt_server(srt_port, 512).await;
     let (rist_service, rist_shutdown_tx) = setup_rist_server(rist_port, 512).await;
     let (rtmp_service, rtmp_shutdown_tx) = setup_rtmp_server(rtmp_port, 512).await;
-    let (webrtc_service, webrtc_shutdown_tx, webrtc_handle) = setup_webrtc_server(webrtc_port, 512).await;
+    let (webrtc_service, webrtc_shutdown_tx, webrtc_handle) =
+        setup_webrtc_server(webrtc_port, 512).await;
 
     println!("\n========================================");
     println!("    Protocol Comparison (512 MB)");
@@ -2343,23 +2386,71 @@ async fn test_protocol_comparison() {
     let (srt_throughput, srt_passed) = run_srt_upload_test(srt_service, srt_port, 512).await;
     let (rist_throughput, rist_passed) = run_rist_upload_test(rist_service, rist_port, 512).await;
     let (rtmp_throughput, rtmp_passed) = run_rtmp_upload_test(rtmp_service, rtmp_port, 512).await;
-    let (webrtc_throughput, webrtc_passed) = run_webrtc_upload_test(webrtc_service, webrtc_port, 512).await;
+    let (webrtc_throughput, webrtc_passed) =
+        run_webrtc_upload_test(webrtc_service, webrtc_port, 512).await;
 
     println!("========================================");
     println!("    Results Summary");
     println!("========================================");
-    println!("HTTP/1.1:           {:.1} MB/s {}", h1_throughput, if h1_passed { "✓" } else { "✗" });
-    println!("HTTP/1.1 (chunked): {:.1} MB/s {}", h1c_throughput, if h1c_passed { "✓" } else { "✗" });
-    println!("HTTP/2:             {:.1} MB/s {}", h2_throughput, if h2_passed { "✓" } else { "✗" });
-    println!("HTTP/3:             {:.1} MB/s {}", h3_throughput, if h3_passed { "✓" } else { "✗" });
-    println!("WSS:                {:.1} MB/s {}", wss_throughput, if wss_passed { "✓" } else { "✗" });
-    println!("SRT:                {:.1} MB/s {}", srt_throughput, if srt_passed { "✓" } else { "✗" });
-    println!("RIST:               {:.1} MB/s {}", rist_throughput, if rist_passed { "✓" } else { "✗" });
-    println!("RTMP:               {:.1} MB/s {}", rtmp_throughput, if rtmp_passed { "✓" } else { "✗" });
-    println!("WebRTC:             {:.1} MB/s {}", webrtc_throughput, if webrtc_passed { "✓" } else { "✗" });
+    println!(
+        "HTTP/1.1:           {:.1} MB/s {}",
+        h1_throughput,
+        if h1_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "HTTP/1.1 (chunked): {:.1} MB/s {}",
+        h1c_throughput,
+        if h1c_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "HTTP/2:             {:.1} MB/s {}",
+        h2_throughput,
+        if h2_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "HTTP/3:             {:.1} MB/s {}",
+        h3_throughput,
+        if h3_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "WSS:                {:.1} MB/s {}",
+        wss_throughput,
+        if wss_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "SRT:                {:.1} MB/s {}",
+        srt_throughput,
+        if srt_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "RIST:               {:.1} MB/s {}",
+        rist_throughput,
+        if rist_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "RTMP:               {:.1} MB/s {}",
+        rtmp_throughput,
+        if rtmp_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "WebRTC:             {:.1} MB/s {}",
+        webrtc_throughput,
+        if webrtc_passed { "✓" } else { "✗" }
+    );
     println!("========================================\n");
 
-    assert!(h1_passed && h1c_passed && h2_passed && h3_passed && wss_passed && srt_passed && rist_passed && rtmp_passed && webrtc_passed, "Protocol tests failed");
+    assert!(
+        h1_passed
+            && h1c_passed
+            && h2_passed
+            && h3_passed
+            && wss_passed
+            && srt_passed
+            && rist_passed
+            && rtmp_passed
+            && webrtc_passed,
+        "Protocol tests failed"
+    );
     let _ = shutdown_tx.send(());
     let _ = srt_shutdown_tx.send(());
     let _ = rist_shutdown_tx.send(());
@@ -2388,7 +2479,8 @@ async fn test_protocol_comparison_1gb() {
     let (srt_service, srt_shutdown_tx) = setup_srt_server(srt_port, 1024).await;
     let (rist_service, rist_shutdown_tx) = setup_rist_server(rist_port, 1024).await;
     let (rtmp_service, rtmp_shutdown_tx) = setup_rtmp_server(rtmp_port, 1024).await;
-    let (webrtc_service, webrtc_shutdown_tx, webrtc_handle) = setup_webrtc_server(webrtc_port, 1024).await;
+    let (webrtc_service, webrtc_shutdown_tx, webrtc_handle) =
+        setup_webrtc_server(webrtc_port, 1024).await;
 
     println!("\n========================================");
     println!("    Protocol Comparison (1 GB)");
@@ -2402,23 +2494,71 @@ async fn test_protocol_comparison_1gb() {
     let (srt_throughput, srt_passed) = run_srt_upload_test(srt_service, srt_port, 1024).await;
     let (rist_throughput, rist_passed) = run_rist_upload_test(rist_service, rist_port, 1024).await;
     let (rtmp_throughput, rtmp_passed) = run_rtmp_upload_test(rtmp_service, rtmp_port, 1024).await;
-    let (webrtc_throughput, webrtc_passed) = run_webrtc_upload_test(webrtc_service, webrtc_port, 1024).await;
+    let (webrtc_throughput, webrtc_passed) =
+        run_webrtc_upload_test(webrtc_service, webrtc_port, 1024).await;
 
     println!("========================================");
     println!("    Results Summary (1 GB)");
     println!("========================================");
-    println!("HTTP/1.1:           {:.1} MB/s {}", h1_throughput, if h1_passed { "✓" } else { "✗" });
-    println!("HTTP/1.1 (chunked): {:.1} MB/s {}", h1c_throughput, if h1c_passed { "✓" } else { "✗" });
-    println!("HTTP/2:             {:.1} MB/s {}", h2_throughput, if h2_passed { "✓" } else { "✗" });
-    println!("HTTP/3:             {:.1} MB/s {}", h3_throughput, if h3_passed { "✓" } else { "✗" });
-    println!("WSS:                {:.1} MB/s {}", wss_throughput, if wss_passed { "✓" } else { "✗" });
-    println!("SRT:                {:.1} MB/s {}", srt_throughput, if srt_passed { "✓" } else { "✗" });
-    println!("RIST:               {:.1} MB/s {}", rist_throughput, if rist_passed { "✓" } else { "✗" });
-    println!("RTMP:               {:.1} MB/s {}", rtmp_throughput, if rtmp_passed { "✓" } else { "✗" });
-    println!("WebRTC:             {:.1} MB/s {}", webrtc_throughput, if webrtc_passed { "✓" } else { "✗" });
+    println!(
+        "HTTP/1.1:           {:.1} MB/s {}",
+        h1_throughput,
+        if h1_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "HTTP/1.1 (chunked): {:.1} MB/s {}",
+        h1c_throughput,
+        if h1c_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "HTTP/2:             {:.1} MB/s {}",
+        h2_throughput,
+        if h2_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "HTTP/3:             {:.1} MB/s {}",
+        h3_throughput,
+        if h3_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "WSS:                {:.1} MB/s {}",
+        wss_throughput,
+        if wss_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "SRT:                {:.1} MB/s {}",
+        srt_throughput,
+        if srt_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "RIST:               {:.1} MB/s {}",
+        rist_throughput,
+        if rist_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "RTMP:               {:.1} MB/s {}",
+        rtmp_throughput,
+        if rtmp_passed { "✓" } else { "✗" }
+    );
+    println!(
+        "WebRTC:             {:.1} MB/s {}",
+        webrtc_throughput,
+        if webrtc_passed { "✓" } else { "✗" }
+    );
     println!("========================================\n");
 
-    assert!(h1_passed && h1c_passed && h2_passed && h3_passed && wss_passed && srt_passed && rist_passed && rtmp_passed && webrtc_passed, "Protocol tests failed");
+    assert!(
+        h1_passed
+            && h1c_passed
+            && h2_passed
+            && h3_passed
+            && wss_passed
+            && srt_passed
+            && rist_passed
+            && rtmp_passed
+            && webrtc_passed,
+        "Protocol tests failed"
+    );
     let _ = shutdown_tx.send(());
     let _ = srt_shutdown_tx.send(());
     let _ = rist_shutdown_tx.send(());
@@ -2469,7 +2609,7 @@ async fn run_udp_fec_upload_test(
     port: u16,
     upload_size_mb: usize,
 ) -> (f64, bool) {
-    use upload_response::{DEFAULT_SYMBOL_SIZE, DEFAULT_SOURCE_SYMBOLS};
+    use upload_response::{DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE};
 
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
     println!("Generating {} MB test data for UDP+FEC...", upload_size_mb);
@@ -2499,7 +2639,11 @@ async fn run_udp_fec_upload_test(
     let elapsed = start.elapsed();
     let throughput = upload_size_mb as f64 / elapsed.as_secs_f64();
 
-    println!("UDP+FEC: {:.2}s ({:.1} MB/s)", elapsed.as_secs_f64(), throughput);
+    println!(
+        "UDP+FEC: {:.2}s ({:.1} MB/s)",
+        elapsed.as_secs_f64(),
+        throughput
+    );
     println!("UDP+FEC PASSED\n");
 
     (throughput, true)
@@ -2507,12 +2651,9 @@ async fn run_udp_fec_upload_test(
 
 /// Send data via a proxy that drops every 5th datagram; verify FEC recovers all blocks.
 #[cfg(feature = "udp-fec")]
-async fn run_udp_fec_loss_test(
-    _service: Arc<UploadResponseService>,
-    port: u16,
-) -> (f64, bool) {
-    use upload_response::{DEFAULT_SYMBOL_SIZE, DEFAULT_SOURCE_SYMBOLS};
+async fn run_udp_fec_loss_test(_service: Arc<UploadResponseService>, port: u16) -> (f64, bool) {
     use tokio::net::UdpSocket;
+    use upload_response::{DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE};
 
     let upload_size_mb = 10usize;
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
@@ -2592,13 +2733,22 @@ async fn test_udp_fec_benchmark() {
     println!("========================================\n");
 
     let (throughput, passed) = run_udp_fec_upload_test(service.clone(), port, 100).await;
-    let (loss_throughput, loss_passed) = run_udp_fec_loss_test(loss_service.clone(), loss_port).await;
+    let (loss_throughput, loss_passed) =
+        run_udp_fec_loss_test(loss_service.clone(), loss_port).await;
 
     println!("========================================");
     println!("    Results");
     println!("========================================");
-    println!("UDP+FEC 100 MB:        {:.1} MB/s {}", throughput, if passed { "✓" } else { "✗" });
-    println!("UDP+FEC loss-recovery: {:.1} MB/s {}", loss_throughput, if loss_passed { "✓" } else { "✗" });
+    println!(
+        "UDP+FEC 100 MB:        {:.1} MB/s {}",
+        throughput,
+        if passed { "✓" } else { "✗" }
+    );
+    println!(
+        "UDP+FEC loss-recovery: {:.1} MB/s {}",
+        loss_throughput,
+        if loss_passed { "✓" } else { "✗" }
+    );
     println!("========================================\n");
 
     assert!(passed, "UDP+FEC upload test failed");

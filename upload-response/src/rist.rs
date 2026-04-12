@@ -76,16 +76,16 @@ impl<A: RistAuth> RistIngest<A> {
         info!("RIST ingest server listening on {}", addr);
 
         tokio::spawn(async move {
-            // Acquire stream slot for this receiver
-            let _permit = match service.acquire_stream().await {
-                Ok(p) => p,
+            let upload_stream = match service.open_stream().await {
+                Ok(stream) => stream,
                 Err(e) => {
-                    error!("Failed to acquire stream: {}", e);
+                    error!("Failed to open stream: {}", e);
                     return;
                 }
             };
 
-            let stream_id = service.next_id();
+            let stream_id = upload_stream.stream_id();
+            let rx = service.register_response(stream_id).await;
             debug!(stream_id, "RIST receiver started");
 
             // Slot 1: Headers
@@ -163,13 +163,15 @@ impl<A: RistAuth> RistIngest<A> {
 
             debug!(stream_id, "RIST request complete, waiting for response");
 
-            // Wait for response
-            let rx = service.register_response(stream_id).await;
             let timeout_duration = Duration::from_millis(service.config.response_timeout_ms);
-
             match tokio::time::timeout(timeout_duration, rx).await {
-                Ok(Ok(Ok((status, body)))) => {
-                    debug!(stream_id, ?status, len = body.len(), "RIST response received");
+                Ok(Ok(Ok(cached))) => {
+                    debug!(
+                        stream_id,
+                        status = ?cached.status,
+                        len = cached.body.len(),
+                        "RIST response received"
+                    );
                 }
                 Ok(Ok(Err(e))) => {
                     error!(stream_id, error = %e, "Response error");
@@ -184,6 +186,8 @@ impl<A: RistAuth> RistIngest<A> {
                     service.drop_response_channel(stream_id).await;
                 }
             }
+
+            upload_stream.close().await;
         });
 
         Ok(shutdown_tx)

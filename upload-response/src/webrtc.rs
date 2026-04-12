@@ -1,4 +1,4 @@
-use crate::UploadResponseService;
+use crate::{UploadResponseService, UploadStream};
 use bytes::Bytes;
 use futures::{select, FutureExt};
 use futures_timer::Delay;
@@ -28,7 +28,8 @@ impl WebRtcAuth for AllowAllWebRtc {
 }
 
 struct PeerContext {
-    stream_id: u64,
+    stream: UploadStream,
+    response_rx: tokio::sync::oneshot::Receiver<crate::ResponseResult>,
     pending: Vec<u8>,
 }
 
@@ -99,16 +100,16 @@ impl<A: WebRtcAuth> WebRtcIngest<A> {
 
                                     info!("WebRTC peer connected: {}", peer);
 
-                                    // Acquire stream slot
-                                    let permit = match service.acquire_stream().await {
-                                        Ok(p) => p,
+                                    let stream = match service.open_stream().await {
+                                        Ok(stream) => stream,
                                         Err(e) => {
-                                            error!("Failed to acquire stream for peer {}: {}", peer, e);
+                                            error!("Failed to open stream for peer {}: {}", peer, e);
                                             continue;
                                         }
                                     };
 
-                                    let stream_id = service.next_id();
+                                    let stream_id = stream.stream_id();
+                                    let response_rx = service.register_response(stream_id).await;
 
                                     // Write headers
                                     let headers = StreamHeaders::Request(StreamRequestHeaders {
@@ -135,11 +136,9 @@ impl<A: WebRtcAuth> WebRtcIngest<A> {
                                         continue;
                                     }
 
-                                    // Keep permit alive by storing it (it drops when peer disconnects)
-                                    std::mem::forget(permit);
-
                                     peer_contexts.insert(peer, PeerContext {
-                                        stream_id,
+                                        stream,
+                                        response_rx,
                                         pending: Vec::new(),
                                     });
                                 }
@@ -147,39 +146,41 @@ impl<A: WebRtcAuth> WebRtcIngest<A> {
                                     info!("WebRTC peer disconnected: {}", peer);
 
                                     if let Some(ctx) = peer_contexts.remove(&peer) {
+                                        let stream_id = ctx.stream.stream_id();
                                         // Flush remaining data
                                         if !ctx.pending.is_empty() {
                                             let _ = service.append_request_body(
-                                                ctx.stream_id,
+                                                stream_id,
                                                 Bytes::from(ctx.pending),
                                             ).await;
                                         }
 
                                         // End request
-                                        let _ = service.end_request(ctx.stream_id).await;
+                                        let _ = service.end_request(stream_id).await;
 
                                         // Wait for response and send back
-                                        let rx = service.register_response(ctx.stream_id).await;
                                         let timeout_duration = Duration::from_millis(service.config().response_timeout_ms);
 
-                                        match tokio::time::timeout(timeout_duration, rx).await {
-                                            Ok(Ok(Ok((status, body)))) => {
-                                                debug!(stream_id = ctx.stream_id, ?status, len = body.len(), "Sending WebRTC response");
-                                                socket.channel_mut(CHANNEL_ID).send(body, peer);
+                                        match tokio::time::timeout(timeout_duration, ctx.response_rx).await {
+                                            Ok(Ok(Ok(cached))) => {
+                                                debug!(stream_id, status = ?cached.status, len = cached.body.len(), "Sending WebRTC response");
+                                                socket.channel_mut(CHANNEL_ID).send(cached.body, peer);
                                             }
                                             Ok(Ok(Err(e))) => {
-                                                error!(stream_id = ctx.stream_id, error = %e, "Response error");
-                                                service.drop_response_channel(ctx.stream_id).await;
+                                                error!(stream_id, error = %e, "Response error");
+                                                service.drop_response_channel(stream_id).await;
                                             }
                                             Ok(Err(_)) => {
-                                                error!(stream_id = ctx.stream_id, "Response channel closed");
-                                                service.drop_response_channel(ctx.stream_id).await;
+                                                error!(stream_id, "Response channel closed");
+                                                service.drop_response_channel(stream_id).await;
                                             }
                                             Err(_) => {
-                                                error!(stream_id = ctx.stream_id, "Response timeout");
-                                                service.drop_response_channel(ctx.stream_id).await;
+                                                error!(stream_id, "Response timeout");
+                                                service.drop_response_channel(stream_id).await;
                                             }
                                         }
+
+                                        ctx.stream.close().await;
                                     }
                                 }
                             }
@@ -194,7 +195,7 @@ impl<A: WebRtcAuth> WebRtcIngest<A> {
                                 while ctx.pending.len() >= slot_bytes {
                                     let chunk: Vec<u8> = ctx.pending.drain(..slot_bytes).collect();
                                     if let Err(e) = service.append_request_body(
-                                        ctx.stream_id,
+                                        ctx.stream.stream_id(),
                                         Bytes::from(chunk),
                                     ).await {
                                         error!("Failed to write body for peer {}: {}", peer, e);

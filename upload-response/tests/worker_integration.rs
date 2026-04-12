@@ -1,7 +1,9 @@
 use bytes::Bytes;
 use futures_util::stream;
 use http::{Request, StatusCode};
-use http_pack::stream::{StreamHeaders, StreamRequestHeaders, StreamResponseHeaders};
+use http_pack::stream::{
+    encode_frame, StreamFrame, StreamHeaders, StreamRequestHeaders, StreamResponseHeaders,
+};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{interval, Duration};
@@ -91,7 +93,8 @@ async fn test_worker_computes_xxhash() {
     let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
     let _watcher_handle = watcher.spawn();
 
-    let stream_id = 0u64;
+    let upload_stream = service.open_stream().await.unwrap();
+    let stream_id = upload_stream.stream_id();
 
     // Register response channel before worker starts
     let rx = service.register_response(stream_id).await;
@@ -134,20 +137,21 @@ async fn test_worker_computes_xxhash() {
 
     // Wait for response
     let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
-    let (status, body) = result.unwrap().unwrap().unwrap();
+    let cached = result.unwrap().unwrap().unwrap();
 
     // Verify response
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cached.status, StatusCode::OK);
 
     // Compute expected hash
     let full_body = b"hello world";
     let expected_hash = xxh64(full_body, 0);
     let expected_hex = format!("{:016x}", expected_hash);
 
-    assert_eq!(body, Bytes::from(expected_hex));
+    assert_eq!(cached.body, Bytes::from(expected_hex));
 
     // Cleanup
     worker_handle.await.unwrap();
+    upload_stream.close().await;
 }
 
 #[tokio::test]
@@ -164,7 +168,8 @@ async fn test_worker_handles_large_body() {
     let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
     let _watcher_handle = watcher.spawn();
 
-    let stream_id = 0u64;
+    let upload_stream = service.open_stream().await.unwrap();
+    let stream_id = upload_stream.stream_id();
 
     // Register response channel
     let rx = service.register_response(stream_id).await;
@@ -196,7 +201,9 @@ async fn test_worker_handles_large_body() {
     let mut full_body = Vec::new();
 
     for i in 0..num_chunks {
-        let chunk: Vec<u8> = (0..chunk_size).map(|j| ((i * chunk_size + j) % 256) as u8).collect();
+        let chunk: Vec<u8> = (0..chunk_size)
+            .map(|j| ((i * chunk_size + j) % 256) as u8)
+            .collect();
         full_body.extend_from_slice(&chunk);
         service
             .append_request_body(stream_id, Bytes::from(chunk))
@@ -209,16 +216,17 @@ async fn test_worker_handles_large_body() {
 
     // Wait for response
     let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
-    let (status, body) = result.unwrap().unwrap().unwrap();
+    let cached = result.unwrap().unwrap().unwrap();
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cached.status, StatusCode::OK);
 
     // Verify hash
     let expected_hash = xxh64(&full_body, 0);
     let expected_hex = format!("{:016x}", expected_hash);
-    assert_eq!(body, Bytes::from(expected_hex));
+    assert_eq!(cached.body, Bytes::from(expected_hex));
 
     worker_handle.await.unwrap();
+    upload_stream.close().await;
 }
 
 #[tokio::test]
@@ -230,7 +238,8 @@ async fn test_worker_handles_empty_body() {
     let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
     let _watcher_handle = watcher.spawn();
 
-    let stream_id = 0u64;
+    let upload_stream = service.open_stream().await.unwrap();
+    let stream_id = upload_stream.stream_id();
 
     // Register response channel
     let rx = service.register_response(stream_id).await;
@@ -261,16 +270,17 @@ async fn test_worker_handles_empty_body() {
 
     // Wait for response
     let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
-    let (status, body) = result.unwrap().unwrap().unwrap();
+    let cached = result.unwrap().unwrap().unwrap();
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cached.status, StatusCode::OK);
 
     // Hash of empty body
     let expected_hash = xxh64(&[], 0);
     let expected_hex = format!("{:016x}", expected_hash);
-    assert_eq!(body, Bytes::from(expected_hex));
+    assert_eq!(cached.body, Bytes::from(expected_hex));
 
     worker_handle.await.unwrap();
+    upload_stream.close().await;
 }
 
 /// Streaming worker that computes hash incrementally without buffering entire body
@@ -340,7 +350,8 @@ async fn run_upload_benchmark(slot_size_kb: usize, upload_size_mb: usize) -> f64
     let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
     let _watcher_handle = watcher.spawn();
 
-    let stream_id = 0u64;
+    let upload_stream = service.open_stream().await.unwrap();
+    let stream_id = upload_stream.stream_id();
     let rx = service.register_response(stream_id).await;
 
     let worker_service = service.clone();
@@ -390,15 +401,16 @@ async fn run_upload_benchmark(slot_size_kb: usize, upload_size_mb: usize) -> f64
     let expected_hex = format!("{:016x}", expected_hash);
 
     let result = tokio::time::timeout(Duration::from_secs(300), rx).await;
-    let (status, body) = result.unwrap().unwrap().unwrap();
+    let cached = result.unwrap().unwrap().unwrap();
 
     let elapsed = start.elapsed();
     let throughput = upload_size_mb as f64 / elapsed.as_secs_f64();
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body.as_ref(), expected_hex.as_bytes());
+    assert_eq!(cached.status, StatusCode::OK);
+    assert_eq!(cached.body.as_ref(), expected_hex.as_bytes());
 
     worker_handle.await.unwrap();
+    upload_stream.close().await;
 
     throughput
 }
@@ -411,7 +423,10 @@ async fn test_slot_size_benchmark() {
 
     println!("\n=== Slot Size Throughput Benchmark ===");
     println!("Upload size: {} MB", UPLOAD_SIZE_MB);
-    println!("{:>12} | {:>12} | {:>12}", "Slot Size", "Throughput", "Slots Used");
+    println!(
+        "{:>12} | {:>12} | {:>12}",
+        "Slot Size", "Throughput", "Slots Used"
+    );
     println!("{:-<12}-+-{:-<12}-+-{:-<12}", "", "", "");
 
     let mut results = Vec::new();
@@ -474,7 +489,8 @@ async fn test_100mb_upload_validation() {
     let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
     let _watcher_handle = watcher.spawn();
 
-    let stream_id = 0u64;
+    let upload_stream = service.open_stream().await.unwrap();
+    let stream_id = upload_stream.stream_id();
     let rx = service.register_response(stream_id).await;
 
     let worker_service = service.clone();
@@ -523,7 +539,7 @@ async fn test_100mb_upload_validation() {
     let expected_hex = format!("{:016x}", expected_hash);
 
     let result = tokio::time::timeout(Duration::from_secs(60), rx).await;
-    let (status, body) = result.unwrap().unwrap().unwrap();
+    let cached = result.unwrap().unwrap().unwrap();
 
     let elapsed = start.elapsed();
     println!(
@@ -533,16 +549,18 @@ async fn test_100mb_upload_validation() {
         expected_hex
     );
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, Bytes::from(expected_hex));
+    assert_eq!(cached.status, StatusCode::OK);
+    assert_eq!(cached.body, Bytes::from(expected_hex));
 
     worker_handle.await.unwrap();
+    upload_stream.close().await;
 }
 
 /// Worker that processes ALL streams (not just one specific stream_id)
 async fn run_multi_stream_worker(service: Arc<UploadResponseService>) {
     let mut poll = interval(Duration::from_micros(100));
     let num_streams = service.config().num_streams;
+    let mut stream_ids: Vec<u64> = vec![0; num_streams];
     let mut last_seen: Vec<usize> = vec![0; num_streams];
     let mut assemblies: std::collections::HashMap<u64, (Option<StreamRequestHeaders>, Vec<Bytes>)> =
         std::collections::HashMap::new();
@@ -551,7 +569,26 @@ async fn run_multi_stream_worker(service: Arc<UploadResponseService>) {
         poll.tick().await;
 
         for stream_idx in 0..num_streams {
-            let stream_id = stream_idx as u64;
+            let stream_id = service.slot_stream_id(stream_idx).unwrap_or(0);
+            let previous_stream_id = stream_ids[stream_idx];
+
+            if stream_id == 0 {
+                if previous_stream_id != 0 {
+                    assemblies.remove(&previous_stream_id);
+                    stream_ids[stream_idx] = 0;
+                    last_seen[stream_idx] = 0;
+                }
+                continue;
+            }
+
+            if previous_stream_id != stream_id {
+                if previous_stream_id != 0 {
+                    assemblies.remove(&previous_stream_id);
+                }
+                stream_ids[stream_idx] = stream_id;
+                last_seen[stream_idx] = 0;
+            }
+
             let current_last = service.request_last(stream_id).unwrap_or(0);
 
             if current_last <= last_seen[stream_idx] {
@@ -589,7 +626,10 @@ async fn run_multi_stream_worker(service: Arc<UploadResponseService>) {
                                 .await
                                 .unwrap();
                             service
-                                .append_response_body(stream_id, Bytes::from(format!("{:016x}", hash)))
+                                .append_response_body(
+                                    stream_id,
+                                    Bytes::from(format!("{:016x}", hash)),
+                                )
                                 .await
                                 .unwrap();
                             service.end_response(stream_id).await.unwrap();
@@ -709,4 +749,165 @@ async fn test_router_concurrent_requests() {
     // All 5 requests completed
     assert_eq!(completed.len(), 5);
     println!("\n5 concurrent Router requests completed successfully\n");
+}
+
+#[tokio::test]
+async fn test_internal_cache_api_lists_and_reads_active_stream() {
+    let config = UploadResponseConfig {
+        num_streams: 2,
+        slot_size_kb: 64,
+        slots_per_stream: 32,
+        response_timeout_ms: 5000,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+    let router = UploadResponseRouter::new(service.clone());
+
+    let upload_stream = service.open_stream().await.unwrap();
+    let stream_id = upload_stream.stream_id();
+
+    let headers = StreamHeaders::Request(StreamRequestHeaders {
+        stream_id,
+        version: http_pack::HttpVersion::Http11,
+        method: b"POST".to_vec(),
+        scheme: None,
+        authority: None,
+        path: b"/internal".to_vec(),
+        headers: vec![],
+    });
+    service.write_request_headers(stream_id, headers).await.unwrap();
+    service
+        .append_request_body(stream_id, Bytes::from_static(b"hello"))
+        .await
+        .unwrap();
+    service.end_request(stream_id).await.unwrap();
+
+    let streams = router
+        .route(
+            Request::builder()
+                .method("GET")
+                .uri("/_upload_response/streams")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let streams_body = String::from_utf8(streams.body.unwrap().to_vec()).unwrap();
+    assert!(streams_body.contains(&stream_id.to_string()));
+
+    let last = router
+        .route(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/_upload_response/streams/{stream_id}/request/last"))
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(last.status, StatusCode::OK);
+    assert_eq!(last.body.unwrap(), Bytes::from("3"));
+
+    let slot = router
+        .route(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/_upload_response/streams/{stream_id}/request/slots/2"))
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(slot.status, StatusCode::OK);
+    assert_eq!(slot.body.unwrap(), Bytes::from("hello"));
+    assert!(slot.headers.iter().any(|(name, value)| {
+        name == "x-upload-response-slot-type" && value == "body"
+    }));
+
+    upload_stream.close().await;
+}
+
+#[tokio::test]
+async fn test_internal_cache_api_writes_response() {
+    let config = UploadResponseConfig {
+        num_streams: 1,
+        slot_size_kb: 64,
+        slots_per_stream: 32,
+        response_timeout_ms: 5000,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+    let router = UploadResponseRouter::new(service.clone());
+    let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
+    let _watcher_handle = watcher.spawn();
+
+    let upload_stream = service.open_stream().await.unwrap();
+    let stream_id = upload_stream.stream_id();
+    let rx = service.register_response(stream_id).await;
+
+    let headers = StreamHeaders::Request(StreamRequestHeaders {
+        stream_id,
+        version: http_pack::HttpVersion::Http11,
+        method: b"POST".to_vec(),
+        scheme: None,
+        authority: None,
+        path: b"/internal-response".to_vec(),
+        headers: vec![],
+    });
+    service.write_request_headers(stream_id, headers).await.unwrap();
+    service.end_request(stream_id).await.unwrap();
+
+    let response_headers = StreamHeaders::Response(StreamResponseHeaders {
+        stream_id,
+        version: http_pack::HttpVersion::Http11,
+        status: 201,
+        headers: vec![],
+    });
+    let encoded_headers = encode_frame(&StreamFrame::Headers(response_headers));
+
+    let header_write = router
+        .route_body(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/_upload_response/streams/{stream_id}/response/headers"))
+                .body(())
+                .unwrap(),
+            Box::pin(stream::iter(vec![Ok(Bytes::from(encoded_headers))])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(header_write.status, StatusCode::OK);
+
+    let body_write = router
+        .route_body(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/_upload_response/streams/{stream_id}/response/body"))
+                .body(())
+                .unwrap(),
+            Box::pin(stream::iter(vec![Ok(Bytes::from_static(b"remote-ok"))])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_write.status, StatusCode::OK);
+
+    let end_write = router
+        .route(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/_upload_response/streams/{stream_id}/response/end"))
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(end_write.status, StatusCode::OK);
+
+    let cached = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(cached.status, StatusCode::CREATED);
+    assert_eq!(cached.body, Bytes::from_static(b"remote-ok"));
+
+    upload_stream.close().await;
 }
