@@ -41,6 +41,7 @@ async fn run_worker(service: Arc<UploadResponseService>, stream_id: u64) {
                 Some(TailSlot::Body(data)) => {
                     body_chunks.push(data);
                 }
+                Some(TailSlot::Control(_)) => {}
                 Some(TailSlot::End) => {
                     // Compute xxhash of concatenated body
                     let total_len: usize = body_chunks.iter().map(|c| c.len()).sum();
@@ -303,6 +304,7 @@ async fn run_streaming_worker(service: Arc<UploadResponseService>, stream_id: u6
                 Some(TailSlot::Body(data)) => {
                     hasher.update(&data);
                 }
+                Some(TailSlot::Control(_)) => {}
                 Some(TailSlot::End) => {
                     let hash = hasher.digest();
 
@@ -605,6 +607,7 @@ async fn run_multi_stream_worker(service: Arc<UploadResponseService>) {
                             chunks.push(data);
                         }
                     }
+                    Some(TailSlot::Control(_)) => {}
                     Some(TailSlot::End) => {
                         if let Some((_, chunks)) = assemblies.remove(&stream_id) {
                             // Compute hash
@@ -774,7 +777,10 @@ async fn test_internal_cache_api_lists_and_reads_active_stream() {
         path: b"/internal".to_vec(),
         headers: vec![],
     });
-    service.write_request_headers(stream_id, headers).await.unwrap();
+    service
+        .write_request_headers(stream_id, headers)
+        .await
+        .unwrap();
     service
         .append_request_body(stream_id, Bytes::from_static(b"hello"))
         .await
@@ -798,7 +804,9 @@ async fn test_internal_cache_api_lists_and_reads_active_stream() {
         .route(
             Request::builder()
                 .method("GET")
-                .uri(format!("/_upload_response/streams/{stream_id}/request/last"))
+                .uri(format!(
+                    "/_upload_response/streams/{stream_id}/request/last"
+                ))
                 .body(())
                 .unwrap(),
         )
@@ -811,7 +819,9 @@ async fn test_internal_cache_api_lists_and_reads_active_stream() {
         .route(
             Request::builder()
                 .method("GET")
-                .uri(format!("/_upload_response/streams/{stream_id}/request/slots/2"))
+                .uri(format!(
+                    "/_upload_response/streams/{stream_id}/request/slots/2"
+                ))
                 .body(())
                 .unwrap(),
         )
@@ -819,9 +829,10 @@ async fn test_internal_cache_api_lists_and_reads_active_stream() {
         .unwrap();
     assert_eq!(slot.status, StatusCode::OK);
     assert_eq!(slot.body.unwrap(), Bytes::from("hello"));
-    assert!(slot.headers.iter().any(|(name, value)| {
-        name == "x-upload-response-slot-type" && value == "body"
-    }));
+    assert!(slot
+        .headers
+        .iter()
+        .any(|(name, value)| { name == "x-upload-response-slot-type" && value == "body" }));
 
     upload_stream.close().await;
 }
@@ -852,7 +863,10 @@ async fn test_internal_cache_api_writes_response() {
         path: b"/internal-response".to_vec(),
         headers: vec![],
     });
-    service.write_request_headers(stream_id, headers).await.unwrap();
+    service
+        .write_request_headers(stream_id, headers)
+        .await
+        .unwrap();
     service.end_request(stream_id).await.unwrap();
 
     let response_headers = StreamHeaders::Response(StreamResponseHeaders {
@@ -867,7 +881,9 @@ async fn test_internal_cache_api_writes_response() {
         .route_body(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/_upload_response/streams/{stream_id}/response/headers"))
+                .uri(format!(
+                    "/_upload_response/streams/{stream_id}/response/headers"
+                ))
                 .body(())
                 .unwrap(),
             Box::pin(stream::iter(vec![Ok(Bytes::from(encoded_headers))])),
@@ -880,7 +896,9 @@ async fn test_internal_cache_api_writes_response() {
         .route_body(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/_upload_response/streams/{stream_id}/response/body"))
+                .uri(format!(
+                    "/_upload_response/streams/{stream_id}/response/body"
+                ))
                 .body(())
                 .unwrap(),
             Box::pin(stream::iter(vec![Ok(Bytes::from_static(b"remote-ok"))])),
@@ -893,7 +911,9 @@ async fn test_internal_cache_api_writes_response() {
         .route(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/_upload_response/streams/{stream_id}/response/end"))
+                .uri(format!(
+                    "/_upload_response/streams/{stream_id}/response/end"
+                ))
                 .body(())
                 .unwrap(),
         )

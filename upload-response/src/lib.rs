@@ -57,6 +57,55 @@ pub use udp_fec::{
 
 /// End-of-stream marker - empty slot
 const END_MARKER: &[u8] = b"";
+const REQUEST_CONTROL_MAGIC: &[u8; 8] = b"URCTRL1\0";
+
+/// Control message embedded in a request stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestControl {
+    Finalize,
+    KeepAlive,
+}
+
+impl RequestControl {
+    fn to_code(self) -> u8 {
+        match self {
+            Self::Finalize => 1,
+            Self::KeepAlive => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Finalize),
+            2 => Some(Self::KeepAlive),
+            _ => None,
+        }
+    }
+
+    fn as_slot_type(self) -> &'static str {
+        match self {
+            Self::Finalize => "control-finalize",
+            Self::KeepAlive => "control-keepalive",
+        }
+    }
+}
+
+fn encode_request_control(control: RequestControl) -> Bytes {
+    let mut payload = Vec::with_capacity(REQUEST_CONTROL_MAGIC.len() + 1);
+    payload.extend_from_slice(REQUEST_CONTROL_MAGIC);
+    payload.push(control.to_code());
+    Bytes::from(payload)
+}
+
+fn decode_request_control(bytes: &[u8]) -> Option<RequestControl> {
+    if bytes.len() != REQUEST_CONTROL_MAGIC.len() + 1 {
+        return None;
+    }
+    if &bytes[..REQUEST_CONTROL_MAGIC.len()] != REQUEST_CONTROL_MAGIC {
+        return None;
+    }
+    RequestControl::from_code(bytes[REQUEST_CONTROL_MAGIC.len()])
+}
 
 /// Configuration for the upload-response service
 #[derive(Debug, Clone)]
@@ -205,10 +254,12 @@ impl UploadResponseService {
         // Initialize per-stream worker counts
         let stream_worker_counts: Vec<AtomicU64> =
             (0..config.num_streams).map(|_| AtomicU64::new(0)).collect();
-        let request_started: Vec<AtomicBool> =
-            (0..config.num_streams).map(|_| AtomicBool::new(false)).collect();
-        let response_started: Vec<AtomicBool> =
-            (0..config.num_streams).map(|_| AtomicBool::new(false)).collect();
+        let request_started: Vec<AtomicBool> = (0..config.num_streams)
+            .map(|_| AtomicBool::new(false))
+            .collect();
+        let response_started: Vec<AtomicBool> = (0..config.num_streams)
+            .map(|_| AtomicBool::new(false))
+            .collect();
 
         // Initialize per-stream worker sets (for readers)
         let stream_workers: Vec<std::collections::HashSet<String>> = (0..config.num_streams)
@@ -572,10 +623,32 @@ impl UploadResponseService {
             .stream_idx(stream_id)
             .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
         if !self.request_started[stream_idx].load(Ordering::SeqCst) {
-            return Err(format!("request headers not written for stream: {stream_id}"));
+            return Err(format!(
+                "request headers not written for stream: {stream_id}"
+            ));
         }
         self.request_cache
             .append(stream_idx, data)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Append a request control marker after the headers slot.
+    pub async fn append_request_control(
+        &self,
+        stream_id: u64,
+        control: RequestControl,
+    ) -> Result<(), String> {
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        if !self.request_started[stream_idx].load(Ordering::SeqCst) {
+            return Err(format!(
+                "request headers not written for stream: {stream_id}"
+            ));
+        }
+        self.request_cache
+            .append(stream_idx, encode_request_control(control))
             .await
             .map_err(|e| e.to_string())
     }
@@ -586,7 +659,9 @@ impl UploadResponseService {
             .stream_idx(stream_id)
             .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
         if !self.request_started[stream_idx].load(Ordering::SeqCst) {
-            return Err(format!("request headers not written for stream: {stream_id}"));
+            return Err(format!(
+                "request headers not written for stream: {stream_id}"
+            ));
         }
         self.request_cache
             .append(stream_idx, Bytes::from_static(END_MARKER))
@@ -621,7 +696,9 @@ impl UploadResponseService {
             .stream_idx(stream_id)
             .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
         if !self.response_started[stream_idx].load(Ordering::SeqCst) {
-            return Err(format!("response headers not written for stream: {stream_id}"));
+            return Err(format!(
+                "response headers not written for stream: {stream_id}"
+            ));
         }
         self.response_cache
             .append(stream_idx, data)
@@ -635,7 +712,9 @@ impl UploadResponseService {
             .stream_idx(stream_id)
             .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
         if !self.response_started[stream_idx].load(Ordering::SeqCst) {
-            return Err(format!("response headers not written for stream: {stream_id}"));
+            return Err(format!(
+                "response headers not written for stream: {stream_id}"
+            ));
         }
         self.response_cache
             .append(stream_idx, Bytes::from_static(END_MARKER))
@@ -782,10 +861,17 @@ impl UploadResponseRouter {
         }
     }
 
-    fn binary_response(status: StatusCode, body: Bytes, slot_type: Option<&str>) -> HandlerResponse {
+    fn binary_response(
+        status: StatusCode,
+        body: Bytes,
+        slot_type: Option<&str>,
+    ) -> HandlerResponse {
         let mut headers = Vec::new();
         if let Some(slot_type) = slot_type {
-            headers.push(("x-upload-response-slot-type".to_string(), slot_type.to_string()));
+            headers.push((
+                "x-upload-response-slot-type".to_string(),
+                slot_type.to_string(),
+            ));
         }
         HandlerResponse {
             status,
@@ -840,11 +926,19 @@ impl UploadResponseRouter {
         body: Option<BodyStream>,
     ) -> HandlerResult<HandlerResponse> {
         let method = req.method().clone();
-        let path_parts: Vec<&str> = req.uri().path().split('/').filter(|part| !part.is_empty()).collect();
+        let path_parts: Vec<&str> = req
+            .uri()
+            .path()
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
 
         match (method.as_str(), path_parts.as_slice()) {
             ("GET", ["_upload_response", "streams"]) => {
-                let mut lines = vec!["stream_id\tstream_idx\trequest_last\tresponse_last\treaders\tresponse_owner".to_string()];
+                let mut lines = vec![
+                    "stream_id\tstream_idx\trequest_last\tresponse_last\treaders\tresponse_owner"
+                        .to_string(),
+                ];
                 for info in self.service.active_streams().await {
                     lines.push(Self::format_stream_info(&info));
                 }
@@ -859,22 +953,34 @@ impl UploadResponseRouter {
                     .into_iter()
                     .find(|info| info.stream_id == stream_id)
                 {
-                    Some(info) => Ok(Self::text_response(StatusCode::OK, Self::format_stream_info(&info))),
-                    None => Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found")),
+                    Some(info) => Ok(Self::text_response(
+                        StatusCode::OK,
+                        Self::format_stream_info(&info),
+                    )),
+                    None => Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    )),
                 }
             }
             ("GET", ["_upload_response", "streams", stream_id, "request", "last"]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
                 match self.service.request_last(stream_id) {
                     Some(last) => Ok(Self::text_response(StatusCode::OK, last.to_string())),
-                    None => Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found")),
+                    None => Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    )),
                 }
             }
             ("GET", ["_upload_response", "streams", stream_id, "response", "last"]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
                 match self.service.response_last(stream_id) {
                     Some(last) => Ok(Self::text_response(StatusCode::OK, last.to_string())),
-                    None => Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found")),
+                    None => Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    )),
                 }
             }
             ("GET", ["_upload_response", "streams", stream_id, "request", "slots", slot_id]) => {
@@ -886,6 +992,8 @@ impl UploadResponseRouter {
                             Some("headers")
                         } else if UploadResponseService::is_end_marker(&bytes) {
                             Some("end")
+                        } else if let Some(control) = decode_request_control(&bytes) {
+                            Some(control.as_slot_type())
                         } else {
                             Some("body")
                         };
@@ -914,7 +1022,10 @@ impl UploadResponseRouter {
             ("PUT", ["_upload_response", "streams", stream_id, "readers", worker_id]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
                 if self.service.stream_idx(stream_id).is_none() {
-                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
                 }
                 let inserted = self.service.register_reader(stream_id, worker_id).await;
                 let status = if inserted {
@@ -927,7 +1038,10 @@ impl UploadResponseRouter {
             ("DELETE", ["_upload_response", "streams", stream_id, "readers", worker_id]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
                 if self.service.stream_idx(stream_id).is_none() {
-                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
                 }
                 let removed = self.service.unregister_reader(stream_id, worker_id).await;
                 let status = if removed {
@@ -940,7 +1054,10 @@ impl UploadResponseRouter {
             ("PUT", ["_upload_response", "streams", stream_id, "response", "claim", worker_id]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
                 if self.service.stream_idx(stream_id).is_none() {
-                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
                 }
                 if self.service.try_claim_response(stream_id, worker_id).await {
                     Ok(Self::text_response(StatusCode::OK, "claimed"))
@@ -956,10 +1073,16 @@ impl UploadResponseRouter {
                     ))
                 }
             }
-            ("DELETE", ["_upload_response", "streams", stream_id, "response", "claim", worker_id]) => {
+            (
+                "DELETE",
+                ["_upload_response", "streams", stream_id, "response", "claim", worker_id],
+            ) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
                 if self.service.stream_idx(stream_id).is_none() {
-                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
                 }
                 let released = self.service.release_response(stream_id, worker_id).await;
                 let status = if released {
@@ -972,13 +1095,18 @@ impl UploadResponseRouter {
             ("PUT", ["_upload_response", "streams", stream_id, "response", "headers"]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
                 if self.service.stream_idx(stream_id).is_none() {
-                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
                 }
                 let body = Self::collect_body(body).await?;
                 let frame = decode_frame(&body)
                     .map_err(|e| ServerError::Config(format!("invalid HPKS headers frame: {e}")))?;
                 match frame {
-                    StreamFrame::Headers(StreamHeaders::Response(resp)) if resp.stream_id == stream_id => {
+                    StreamFrame::Headers(StreamHeaders::Response(resp))
+                        if resp.stream_id == stream_id =>
+                    {
                         self.service
                             .write_response_headers(stream_id, StreamHeaders::Response(resp))
                             .await
@@ -998,7 +1126,10 @@ impl UploadResponseRouter {
             ("PUT", ["_upload_response", "streams", stream_id, "response", "body"]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
                 if self.service.stream_idx(stream_id).is_none() {
-                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
                 }
                 let body = Self::collect_body(body).await?;
                 self.service
@@ -1010,7 +1141,10 @@ impl UploadResponseRouter {
             ("PUT", ["_upload_response", "streams", stream_id, "response", "end"]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
                 if self.service.stream_idx(stream_id).is_none() {
-                    return Ok(Self::text_response(StatusCode::NOT_FOUND, "stream not found"));
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
                 }
                 self.service
                     .end_response(stream_id)
@@ -1267,15 +1401,15 @@ impl WebSocketHandler for UploadResponseWsHandler {
             debug!(stream_id, "Request complete, waiting for response");
             let timeout_duration = Duration::from_millis(self.service.config.response_timeout_ms);
             match timeout(timeout_duration, rx).await {
-            Ok(Ok(Ok(cached))) => {
-                debug!(stream_id, status = ?cached.status, "Sending WebSocket response");
-                if let Err(e) = stream
-                    .send(Message::Binary(cached.body.to_vec().into()))
-                    .await
-                {
-                    error!(stream_id, error = %e, "Failed to send WebSocket response");
-                }
-                let _ = stream.close(None).await;
+                Ok(Ok(Ok(cached))) => {
+                    debug!(stream_id, status = ?cached.status, "Sending WebSocket response");
+                    if let Err(e) = stream
+                        .send(Message::Binary(cached.body.to_vec().into()))
+                        .await
+                    {
+                        error!(stream_id, error = %e, "Failed to send WebSocket response");
+                    }
+                    let _ = stream.close(None).await;
                 }
                 Ok(Ok(Err(e))) => {
                     error!(stream_id, error = %e, "Response error");
@@ -1299,7 +1433,6 @@ impl WebSocketHandler for UploadResponseWsHandler {
 
         upload_stream.close().await;
         result
-
     }
 
     fn can_handle(&self, path: &str) -> bool {
@@ -1317,6 +1450,8 @@ pub enum TailSlot {
     Headers(StreamRequestHeaders),
     /// Slots 2..N-1: Raw body bytes (zero-copy from cache)
     Body(Bytes),
+    /// Request control marker embedded after the headers slot.
+    Control(RequestControl),
     /// Final slot: End marker
     End,
 }
@@ -1340,6 +1475,8 @@ impl UploadResponseService {
             }
         } else if Self::is_end_marker(&bytes) {
             Some(TailSlot::End)
+        } else if let Some(control) = decode_request_control(&bytes) {
+            Some(TailSlot::Control(control))
         } else {
             // Raw body bytes - zero-copy
             Some(TailSlot::Body(bytes))
