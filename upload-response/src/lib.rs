@@ -81,9 +81,11 @@ impl UploadResponseConfig {
 impl Default for UploadResponseConfig {
     fn default() -> Self {
         Self {
-            num_streams: 100,
-            slot_size_kb: 64,        // 64KB per slot (sweet spot for throughput)
-            slots_per_stream: 16384, // ~1GB max per request at 64KB slots
+            // ChunkCache eagerly allocates its ring buffers, so keep defaults sized for
+            // real streaming workloads instead of theoretical multi-GB uploads.
+            num_streams: 16,
+            slot_size_kb: 32,
+            slots_per_stream: 1024,
             response_timeout_ms: 30000,
         }
     }
