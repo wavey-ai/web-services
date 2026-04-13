@@ -12,6 +12,7 @@ tcp = []
 udp-fec = ["dep:raptorq"]
 
 [dependencies]
+anyhow = "1.0"
 web-service = { path = "../web-service/" }
 playlists = { git = "https://github.com/wavey-ai/playlists.git" }
 http-pack = { git = "https://github.com/wavey-ai/http-pack.git", default-features = false }
@@ -24,6 +25,7 @@ futures-util = "0.3"
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 hyper-util = { version = "0.1", features = ["full"] }
 hyper = { version = "1.6", features = ["full"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "http2"] }
 srt = { git = "https://github.com/wavey-ai/av-rs.git", features = ["async"], optional = true }
 raptorq = { version = "2", optional = true }
 rist = { git = "https://github.com/wavey-ai/rist-rs.git", features = ["tokio"], optional = true }

@@ -25,6 +25,21 @@ use web_service::{
 mod watcher;
 pub use watcher::ResponseWatcher;
 
+mod bridge;
+pub use bridge::{
+    build_streaming_response_head, clone_request_head, handler_response_from_cached,
+    request_from_headers_slot, request_from_stream_headers, response_content_type, CachedIngress,
+    CachedRequestGuard, IngressProxyConfig,
+};
+
+mod remote;
+pub use remote::{
+    discover_ingress_origins, RemoteIngressClient, RemoteRequestSlot, RemoteStreamInfo,
+};
+
+mod response_writer;
+pub use response_writer::ResponseCacheWriter;
+
 #[cfg(feature = "srt")]
 mod srt;
 #[cfg(feature = "srt")]
