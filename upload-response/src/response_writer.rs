@@ -58,7 +58,10 @@ impl ResponseCacheWriter {
 
         let headers =
             StreamHeaders::from_response(self.stream_id, &response_head).map_err(|error| {
-                anyhow!("failed to encode response headers for stream {}: {error}", self.stream_id)
+                anyhow!(
+                    "failed to encode response headers for stream {}: {error}",
+                    self.stream_id
+                )
             })?;
 
         match &self.target {
@@ -101,7 +104,10 @@ impl ResponseCacheWriter {
         if self.finished {
             return Ok(());
         }
-        anyhow::ensure!(self.started, "response headers must be written before finish");
+        anyhow::ensure!(
+            self.started,
+            "response headers must be written before finish"
+        );
         match &self.target {
             ResponseCacheTarget::Local(service) => service
                 .end_response(self.stream_id)
@@ -122,7 +128,9 @@ impl ResponseCacheWriter {
                 .await
                 .map_err(|error| anyhow!(error)),
             ResponseCacheTarget::Remote { client, origin } => {
-                client.write_handler_response(origin, self.stream_id, response).await
+                client
+                    .write_handler_response(origin, self.stream_id, response)
+                    .await
             }
         }
     }

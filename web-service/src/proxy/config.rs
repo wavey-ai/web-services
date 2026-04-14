@@ -4,9 +4,9 @@ use super::{
     DEFAULT_MAX_BACKENDS, DEFAULT_MAX_QUEUE_PER_BACKEND, DEFAULT_QUEUE_REQUEST_KB,
     DEFAULT_QUEUE_SLOT_KB,
 };
-use anyhow::Context;
-use crate::{default_tls_paths, load_default_tls_base64};
 use crate::quic_relay::QuicRelayConfig;
+use crate::{default_tls_paths, load_default_tls_base64};
+use anyhow::Context;
 use std::env;
 use std::net::SocketAddr;
 
@@ -135,7 +135,10 @@ impl ProxyConfig {
 
 fn env_bool(name: &str, default: bool) -> bool {
     match env::var(name) {
-        Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        ),
         Err(_) => default,
     }
 }

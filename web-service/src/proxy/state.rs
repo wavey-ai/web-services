@@ -9,14 +9,14 @@ use http_body_util::combinators::BoxBody;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
+use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::convert::Infallible;
+use tls_helpers::load_certs_from_base64;
 use tokio::sync::RwLock;
 use tracing::debug;
-use tls_helpers::load_certs_from_base64;
-use webpki_roots::TLS_SERVER_ROOTS;
 use url::Url;
+use webpki_roots::TLS_SERVER_ROOTS;
 
 pub type ProxyHttpClient =
     Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>>;
@@ -184,8 +184,7 @@ fn build_h3_endpoint(ca_cert_base64: &str) -> anyhow::Result<quinn::Endpoint> {
     tls_config.enable_early_data = true;
     tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
-    let mut endpoint =
-        quinn::Endpoint::client(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))?;
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))?;
     let client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
     ));
@@ -210,8 +209,8 @@ fn build_upstream_tls_config(ca_cert_base64: &str) -> anyhow::Result<rustls::Cli
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::balancer::LoadBalancingMode;
+    use super::*;
     use std::sync::Once;
     use url::Url;
 

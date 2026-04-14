@@ -1,27 +1,29 @@
 mod common;
 
 use std::{
-    env,
-    io,
+    env, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{atomic::{AtomicUsize, Ordering}, Arc, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use common::load_test_env;
 use futures_util::StreamExt;
 use http::{Request, StatusCode};
 use portpicker::pick_unused_port;
-use tokio_rustls::rustls;
 use tls_helpers::from_base64_raw;
+use tokio_rustls::rustls;
 use web_service::{
-    BodyStream, LoadBalancingMode, ProxyConfig, ProxyIngress, ProxyState, Server, ServerBuilder,
-    UpstreamProtocol, H2H3Server, HandlerResponse, HandlerResult, Router, ServerError,
+    BodyStream, H2H3Server, HandlerResponse, HandlerResult, LoadBalancingMode, ProxyConfig,
+    ProxyIngress, ProxyState, Router, Server, ServerBuilder, ServerError, UpstreamProtocol,
     WebSocketHandler, WebTransportHandler,
 };
 use xxhash_rust::xxh3::xxh3_64;
-use common::load_test_env;
 
 type BenchResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -218,7 +220,9 @@ impl BenchConfig {
 
         let backends = backends.unwrap_or_else(default_concurrency).max(1);
         let concurrency = concurrency.unwrap_or(backends + 1).max(1);
-        let requests_per_worker = requests_per_worker.unwrap_or(DEFAULT_REQUESTS_PER_WORKER).max(1);
+        let requests_per_worker = requests_per_worker
+            .unwrap_or(DEFAULT_REQUESTS_PER_WORKER)
+            .max(1);
         let payload_bytes = payload_bytes.unwrap_or(DEFAULT_PAYLOAD_BYTES).max(8);
 
         Self {
@@ -348,7 +352,10 @@ async fn start_backend(
     let server = H2H3Server::builder()
         .with_tls(cert_b64.to_string(), key_b64.to_string())
         .with_port(port)
-        .enable_h2(matches!(protocol, UpstreamProtocol::Http1 | UpstreamProtocol::Http2))
+        .enable_h2(matches!(
+            protocol,
+            UpstreamProtocol::Http1 | UpstreamProtocol::Http2
+        ))
         .enable_websocket(false)
         .with_router(router)
         .build()

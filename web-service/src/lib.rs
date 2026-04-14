@@ -19,9 +19,9 @@ pub use proxy::{
 };
 pub use quic_relay::QuicRelayConfig;
 pub use server::{H2H3Server, H2H3ServerBuilder};
+pub use tls::{default_tls_paths, load_default_tls_base64, load_tls_base64_from_paths};
 pub use traits::{
     BodyStream, HandlerResponse, HandlerResult, RawTcpHandler, RequestHandler, Router, Server,
     ServerBuilder, ServerHandle, StreamWriter, StreamingHandler, WebSocketHandler,
     WebTransportHandler,
 };
-pub use tls::{default_tls_paths, load_default_tls_base64, load_tls_base64_from_paths};

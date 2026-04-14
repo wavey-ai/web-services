@@ -1,10 +1,10 @@
 use super::balancer::LoadBalancingMode;
 use super::state::ProxyState;
+use crate::{HandlerResponse, HandlerResult};
 use bytes::Bytes;
 use http::{Method, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
-use crate::{HandlerResponse, HandlerResult};
 
 #[derive(Debug, Deserialize)]
 struct AddBackendRequest {
@@ -157,18 +157,13 @@ fn json_response<T: Serialize>(value: &T, status: StatusCode) -> HandlerResponse
 }
 
 fn json_error(status: StatusCode, message: String) -> HandlerResponse {
-    json_response(
-        &ErrorResponse {
-            error: message,
-        },
-        status,
-    )
+    json_response(&ErrorResponse { error: message }, status)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::balancer::LoadBalancingMode;
+    use super::*;
     use bytes::Bytes;
     use http::StatusCode;
     use serde_json::{json, Value};
@@ -216,11 +211,13 @@ mod tests {
         init_crypto();
         let state = ProxyState::new(LoadBalancingMode::LeastConn).unwrap();
 
-        let body = Bytes::from(serde_json::to_vec(&json!({
-            "url": "https://example.com",
-            "max_connections": null
-        }))
-        .unwrap());
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "url": "https://example.com",
+                "max_connections": null
+            }))
+            .unwrap(),
+        );
         let response = call_api(&state, Method::POST, "/api/backends", body).await;
         assert_eq!(response.status, StatusCode::CREATED);
         let created = response_json(&response);
@@ -257,15 +254,16 @@ mod tests {
         init_crypto();
         let state = ProxyState::new(LoadBalancingMode::LeastConn).unwrap();
 
-        let response =
-            call_api(&state, Method::POST, "/api/backends", Bytes::from_static(b"{oops"))
-                .await;
+        let response = call_api(
+            &state,
+            Method::POST,
+            "/api/backends",
+            Bytes::from_static(b"{oops"),
+        )
+        .await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         let payload = response_json(&response);
-        assert!(payload["error"]
-            .as_str()
-            .unwrap()
-            .contains("invalid json"));
+        assert!(payload["error"].as_str().unwrap().contains("invalid json"));
     }
 
     #[tokio::test]
@@ -273,10 +271,12 @@ mod tests {
         init_crypto();
         let state = ProxyState::new(LoadBalancingMode::LeastConn).unwrap();
 
-        let body = Bytes::from(serde_json::to_vec(&json!({
-            "url": "ftp://example.com"
-        }))
-        .unwrap());
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "url": "ftp://example.com"
+            }))
+            .unwrap(),
+        );
         let response = call_api(&state, Method::POST, "/api/backends", body).await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         let payload = response_json(&response);
@@ -291,10 +291,12 @@ mod tests {
         init_crypto();
         let state = ProxyState::new(LoadBalancingMode::LeastConn).unwrap();
 
-        let body = Bytes::from(serde_json::to_vec(&json!({
-            "mode": "queue"
-        }))
-        .unwrap());
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "mode": "queue"
+            }))
+            .unwrap(),
+        );
         let response = call_api(&state, Method::PUT, "/api/balancer", body).await;
         assert_eq!(response.status, StatusCode::OK);
 
@@ -309,10 +311,12 @@ mod tests {
         init_crypto();
         let state = ProxyState::new(LoadBalancingMode::LeastConn).unwrap();
 
-        let body = Bytes::from(serde_json::to_vec(&json!({
-            "mode": "unknown"
-        }))
-        .unwrap());
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "mode": "unknown"
+            }))
+            .unwrap(),
+        );
         let response = call_api(&state, Method::PUT, "/api/balancer", body).await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         let payload = response_json(&response);

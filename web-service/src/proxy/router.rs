@@ -4,13 +4,13 @@ use super::proxy;
 use super::queue::ProxyQueue;
 use super::state::ProxyState;
 use crate::quic_relay::QuicRelayPool;
+use crate::{
+    BodyStream, HandlerResponse, HandlerResult, Router, ServerError, StreamWriter,
+    WebSocketHandler, WebTransportHandler,
+};
 use http::{Method, Request, StatusCode};
 use std::sync::Arc;
 use tracing::{debug, debug_span, Instrument};
-use crate::{
-    BodyStream, HandlerResponse, HandlerResult, Router, ServerError, StreamWriter, WebSocketHandler,
-    WebTransportHandler,
-};
 
 pub struct ProxyRouter {
     state: Arc<ProxyState>,
@@ -217,8 +217,8 @@ impl WebSocketHandler for ProxyWebSocketHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::balancer::LoadBalancingMode;
+    use super::*;
     use http::StatusCode;
     use std::sync::Once;
 
@@ -230,9 +230,10 @@ mod tests {
     }
 
     fn has_header(response: &HandlerResponse, name: &str, value: &str) -> bool {
-        response.headers.iter().any(|(key, val)| {
-            key.eq_ignore_ascii_case(name) && val == value
-        })
+        response
+            .headers
+            .iter()
+            .any(|(key, val)| key.eq_ignore_ascii_case(name) && val == value)
     }
 
     #[tokio::test]
@@ -252,7 +253,11 @@ mod tests {
         let response = router.route(req).await.unwrap();
         assert_eq!(response.status, StatusCode::NO_CONTENT);
         assert!(response.body.is_none());
-        assert!(has_header(&response, context::REQUEST_ID_HEADER, "req-opts"));
+        assert!(has_header(
+            &response,
+            context::REQUEST_ID_HEADER,
+            "req-opts"
+        ));
     }
 
     #[tokio::test]
@@ -271,6 +276,10 @@ mod tests {
 
         let response = router.route(req).await.unwrap();
         assert_eq!(response.status, StatusCode::OK);
-        assert!(has_header(&response, context::REQUEST_ID_HEADER, "req-health"));
+        assert!(has_header(
+            &response,
+            context::REQUEST_ID_HEADER,
+            "req-health"
+        ));
     }
 }

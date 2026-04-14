@@ -9,9 +9,11 @@ use http_pack::stream::{
 use hyper_util::rt::TokioIo;
 use playlists::chunk_cache::ChunkCache;
 use playlists::Options;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
@@ -165,6 +167,37 @@ pub struct CachedResponse {
 
 pub type ResponseResult = Result<CachedResponse, String>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerHeartbeatUpdate {
+    pub max_inflight: usize,
+    pub inflight: usize,
+    pub available_slots: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerHeartbeat {
+    pub worker_id: String,
+    pub max_inflight: usize,
+    pub inflight: usize,
+    pub available_slots: usize,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCapacitySummary {
+    pub workers: usize,
+    pub total_max_inflight: usize,
+    pub total_inflight: usize,
+    pub total_available_slots: usize,
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 /// Snapshot of an active stream slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveStreamSlot {
@@ -249,6 +282,8 @@ pub struct UploadResponseService {
     stream_workers: Arc<RwLock<Vec<std::collections::HashSet<String>>>>,
     /// Per-stream response claim: None = unclaimed, Some(worker_id) = exclusive write access
     response_claims: Arc<RwLock<Vec<Option<String>>>>,
+    /// Worker heartbeat/capacity registry keyed by worker id.
+    workers: Arc<RwLock<HashMap<String, WorkerHeartbeat>>>,
     config: UploadResponseConfig,
 }
 
@@ -298,6 +333,7 @@ impl UploadResponseService {
             response_started,
             stream_workers: Arc::new(RwLock::new(stream_workers)),
             response_claims: Arc::new(RwLock::new(response_claims)),
+            workers: Arc::new(RwLock::new(HashMap::new())),
             config,
         }
     }
@@ -570,6 +606,56 @@ impl UploadResponseService {
         };
         let claims = self.response_claims.read().await;
         claims[stream_idx].is_some()
+    }
+
+    fn prune_stale_workers_locked(
+        workers: &mut HashMap<String, WorkerHeartbeat>,
+        stale_before_ms: u64,
+    ) {
+        workers.retain(|_, worker| worker.updated_at_ms >= stale_before_ms);
+    }
+
+    pub async fn upsert_worker_heartbeat(
+        &self,
+        worker_id: &str,
+        update: WorkerHeartbeatUpdate,
+    ) -> WorkerHeartbeat {
+        let heartbeat = WorkerHeartbeat {
+            worker_id: worker_id.to_string(),
+            max_inflight: update.max_inflight,
+            inflight: update.inflight.min(update.max_inflight),
+            available_slots: update.available_slots.min(update.max_inflight),
+            updated_at_ms: now_unix_ms(),
+        };
+        let mut workers = self.workers.write().await;
+        workers.insert(worker_id.to_string(), heartbeat.clone());
+        heartbeat
+    }
+
+    pub async fn worker_heartbeat(&self, worker_id: &str) -> Option<WorkerHeartbeat> {
+        let workers = self.workers.read().await;
+        workers.get(worker_id).cloned()
+    }
+
+    pub async fn list_workers(&self, ttl_ms: Option<u64>) -> Vec<WorkerHeartbeat> {
+        let stale_before_ms = ttl_ms.map(|ttl| now_unix_ms().saturating_sub(ttl));
+        let mut workers = self.workers.write().await;
+        if let Some(stale_before_ms) = stale_before_ms {
+            Self::prune_stale_workers_locked(&mut workers, stale_before_ms);
+        }
+        let mut listed: Vec<_> = workers.values().cloned().collect();
+        listed.sort_by(|left, right| left.worker_id.cmp(&right.worker_id));
+        listed
+    }
+
+    pub async fn worker_capacity_summary(&self, ttl_ms: Option<u64>) -> WorkerCapacitySummary {
+        let workers = self.list_workers(ttl_ms).await;
+        WorkerCapacitySummary {
+            workers: workers.len(),
+            total_max_inflight: workers.iter().map(|worker| worker.max_inflight).sum(),
+            total_inflight: workers.iter().map(|worker| worker.inflight).sum(),
+            total_available_slots: workers.iter().map(|worker| worker.available_slots).sum(),
+        }
     }
 
     /// Get a reference to the request cache for external consumers
@@ -864,7 +950,11 @@ impl UploadResponseRouter {
     }
 
     fn is_internal_path(path: &str) -> bool {
-        path == "/_upload_response/streams" || path.starts_with("/_upload_response/streams/")
+        path == "/_upload_response/streams"
+            || path.starts_with("/_upload_response/streams/")
+            || path == "/_upload_response/workers"
+            || path.starts_with("/_upload_response/workers/")
+            || path == "/_upload_response/capacity"
     }
 
     fn text_response(status: StatusCode, body: impl Into<String>) -> HandlerResponse {
@@ -872,6 +962,17 @@ impl UploadResponseRouter {
             status,
             body: Some(Bytes::from(body.into())),
             content_type: Some("text/plain; charset=utf-8".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn json_response<T: Serialize>(status: StatusCode, value: &T) -> HandlerResponse {
+        HandlerResponse {
+            status,
+            body: Some(Bytes::from(
+                serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()),
+            )),
+            content_type: Some("application/json".to_string()),
             ..Default::default()
         }
     }
@@ -935,6 +1036,11 @@ impl UploadResponseRouter {
         )
     }
 
+    fn parse_json_body<T: for<'de> Deserialize<'de>>(body: Bytes) -> Result<T, ServerError> {
+        serde_json::from_slice(&body)
+            .map_err(|error| ServerError::Config(format!("invalid json body: {error}")))
+    }
+
     async fn route_internal(
         &self,
         req: Request<()>,
@@ -958,6 +1064,32 @@ impl UploadResponseRouter {
                     lines.push(Self::format_stream_info(&info));
                 }
                 Ok(Self::text_response(StatusCode::OK, lines.join("\n")))
+            }
+            ("GET", ["_upload_response", "workers"]) => Ok(Self::json_response(
+                StatusCode::OK,
+                &self.service.list_workers(None).await,
+            )),
+            ("GET", ["_upload_response", "workers", worker_id]) => {
+                match self.service.worker_heartbeat(worker_id).await {
+                    Some(worker) => Ok(Self::json_response(StatusCode::OK, &worker)),
+                    None => Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "worker not found",
+                    )),
+                }
+            }
+            ("GET", ["_upload_response", "capacity"]) => Ok(Self::json_response(
+                StatusCode::OK,
+                &self.service.worker_capacity_summary(None).await,
+            )),
+            ("PUT", ["_upload_response", "workers", worker_id, "heartbeat"]) => {
+                let body = Self::collect_body(body).await?;
+                let update = Self::parse_json_body::<WorkerHeartbeatUpdate>(body)?;
+                let worker = self
+                    .service
+                    .upsert_worker_heartbeat(worker_id, update)
+                    .await;
+                Ok(Self::json_response(StatusCode::OK, &worker))
             }
             ("GET", ["_upload_response", "streams", stream_id]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
@@ -1810,5 +1942,67 @@ mod tests {
         assert!(service.response_owner(stream_id).await.is_some());
 
         upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_worker_heartbeat_summary() {
+        let service = UploadResponseService::new(UploadResponseConfig::default());
+
+        service
+            .upsert_worker_heartbeat(
+                "worker-a",
+                WorkerHeartbeatUpdate {
+                    max_inflight: 4,
+                    inflight: 1,
+                    available_slots: 3,
+                },
+            )
+            .await;
+        service
+            .upsert_worker_heartbeat(
+                "worker-b",
+                WorkerHeartbeatUpdate {
+                    max_inflight: 2,
+                    inflight: 2,
+                    available_slots: 0,
+                },
+            )
+            .await;
+
+        let workers = service.list_workers(None).await;
+        assert_eq!(workers.len(), 2);
+        assert_eq!(workers[0].worker_id, "worker-a");
+        assert_eq!(workers[1].worker_id, "worker-b");
+
+        let summary = service.worker_capacity_summary(None).await;
+        assert_eq!(summary.workers, 2);
+        assert_eq!(summary.total_max_inflight, 6);
+        assert_eq!(summary.total_inflight, 3);
+        assert_eq!(summary.total_available_slots, 3);
+    }
+
+    #[tokio::test]
+    async fn test_worker_heartbeat_ttl_prunes_stale_workers() {
+        let service = UploadResponseService::new(UploadResponseConfig::default());
+
+        service
+            .upsert_worker_heartbeat(
+                "worker-a",
+                WorkerHeartbeatUpdate {
+                    max_inflight: 2,
+                    inflight: 0,
+                    available_slots: 2,
+                },
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let workers = service.list_workers(Some(1)).await;
+        assert!(workers.is_empty());
+
+        let summary = service.worker_capacity_summary(Some(1)).await;
+        assert_eq!(summary.workers, 0);
+        assert_eq!(summary.total_available_slots, 0);
     }
 }

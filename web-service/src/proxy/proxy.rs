@@ -4,17 +4,17 @@ use super::queue::ProxyQueue;
 use super::state::ProxyState;
 use super::DEFAULT_HTTP_PACK_BODY_CHUNK_BYTES;
 use crate::quic_relay::QuicRelayPool;
+use crate::{BodyStream, HandlerResponse, HandlerResult, ServerError};
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
-use http_pack::stream::{StreamBody, StreamEnd, StreamFrame, StreamHeaders};
 use http::header::HeaderName;
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
+use http_pack::stream::{StreamBody, StreamEnd, StreamFrame, StreamHeaders};
 use hyper::body::Incoming;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_tungstenite::WebSocketStream;
-use tracing::{debug, field, debug_span, Instrument};
-use crate::{BodyStream, HandlerResponse, HandlerResult, ServerError};
+use tracing::{debug, debug_span, field, Instrument};
 
 static HTTP_PACK_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -257,10 +257,7 @@ async fn proxy_http_h3(
     }
 }
 
-fn build_h3_request(
-    req: Request<()>,
-    backend_url: &url::Url,
-) -> Result<http::Request<()>, String> {
+fn build_h3_request(req: Request<()>, backend_url: &url::Url) -> Result<http::Request<()>, String> {
     let mut builder = http::Request::builder()
         .method(req.method().clone())
         .uri(backend_url.as_str())
@@ -323,11 +320,12 @@ pub async fn proxy_websocket(
         backend_url = %lease.backend().url,
         "proxy websocket selected backend"
     );
-    let backend_url = compose_backend_url(&lease.backend().url, req.uri())
-        .map_err(|err| ServerError::Handler(Box::new(std::io::Error::new(
+    let backend_url = compose_backend_url(&lease.backend().url, req.uri()).map_err(|err| {
+        ServerError::Handler(Box::new(std::io::Error::new(
             std::io::ErrorKind::Other,
             err,
-        ))))?;
+        )))
+    })?;
 
     let mut ws_request = http::Request::builder()
         .method(http::Method::GET)
@@ -494,7 +492,10 @@ pub(crate) async fn collect_body_with_http_pack(
     let emit_headers = match StreamHeaders::from_request(stream_id, req) {
         Ok(headers) => {
             if let Some(relay) = relay {
-                if let Err(err) = relay.enqueue_frame(stream_id, StreamFrame::Headers(headers)).await {
+                if let Err(err) = relay
+                    .enqueue_frame(stream_id, StreamFrame::Headers(headers))
+                    .await
+                {
                     debug!(error = %err, "http-pack quic header enqueue failed");
                 }
             }

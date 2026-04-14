@@ -58,11 +58,7 @@ impl BackendPool {
         let view = {
             let mut state = self.inner.lock().await;
             state.backends.push(BackendState { backend, active: 0 });
-            state
-                .backends
-                .last()
-                .expect("backend just inserted")
-                .view()
+            state.backends.last().expect("backend just inserted").view()
         };
         debug!(
             backend_id = %view.id,
@@ -166,9 +162,7 @@ impl BackendPool {
                 debug!("queue acquire: waiting for available backend");
                 self.notify.notified()
             };
-            notified
-                .instrument(debug_span!("queue_wait"))
-                .await;
+            notified.instrument(debug_span!("queue_wait")).await;
         }
     }
 
@@ -267,15 +261,8 @@ fn select_queue(state: &mut PoolState) -> Option<usize> {
     None
 }
 
-fn allocate_backend(
-    pool: &Arc<BackendPool>,
-    state: &mut PoolState,
-    idx: usize,
-) -> BackendLease {
-    let backend_state = state
-        .backends
-        .get_mut(idx)
-        .expect("backend index exists");
+fn allocate_backend(pool: &Arc<BackendPool>, state: &mut PoolState, idx: usize) -> BackendLease {
+    let backend_state = state.backends.get_mut(idx).expect("backend index exists");
     backend_state.active = backend_state.active.saturating_add(1);
     let backend = backend_state.backend.clone();
     let backend_id = backend.id.clone();
@@ -295,8 +282,8 @@ fn allocate_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::backend::BackendScheme;
+    use super::*;
     use std::sync::Arc;
     use tokio::time::{timeout, Duration};
     use url::Url;
@@ -368,7 +355,11 @@ mod tests {
 
         let pool_clone = Arc::clone(&pool);
         let pending = tokio::spawn(async move {
-            timeout(Duration::from_millis(500), pool_clone.acquire(LoadBalancingMode::Queue)).await
+            timeout(
+                Duration::from_millis(500),
+                pool_clone.acquire(LoadBalancingMode::Queue),
+            )
+            .await
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;

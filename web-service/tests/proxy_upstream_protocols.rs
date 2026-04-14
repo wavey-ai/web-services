@@ -9,17 +9,17 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use common::load_test_env;
 use http::{Request, StatusCode, Version};
 use portpicker::pick_unused_port;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio_rustls::rustls;
 use web_service::{
-    LoadBalancingMode, ProxyConfig, ProxyIngress, ProxyState, Server, ServerBuilder,
-    UpstreamProtocol, H2H3Server, HandlerResponse, HandlerResult, Router, ServerError,
-    WebSocketHandler, WebTransportHandler,
+    H2H3Server, HandlerResponse, HandlerResult, LoadBalancingMode, ProxyConfig, ProxyIngress,
+    ProxyState, Router, Server, ServerBuilder, ServerError, UpstreamProtocol, WebSocketHandler,
+    WebTransportHandler,
 };
-use common::load_test_env;
 
 struct VersionRouter {
     version_tx: Arc<Mutex<Option<oneshot::Sender<Version>>>>,
@@ -118,7 +118,10 @@ async fn start_backend(
     let server = H2H3Server::builder()
         .with_tls(cert_b64.to_string(), key_b64.to_string())
         .with_port(port)
-        .enable_h2(matches!(protocol, UpstreamProtocol::Http1 | UpstreamProtocol::Http2))
+        .enable_h2(matches!(
+            protocol,
+            UpstreamProtocol::Http1 | UpstreamProtocol::Http2
+        ))
         .enable_websocket(false)
         .with_router(router)
         .build()
@@ -215,8 +218,8 @@ async fn run_proxy_test(protocol: UpstreamProtocol, expected: Version) {
         .await
         .expect("start proxy");
 
-    let backend_url = url::Url::parse(&format!("https://{host}:{}", backend.port))
-        .expect("backend url");
+    let backend_url =
+        url::Url::parse(&format!("https://{host}:{}", backend.port)).expect("backend url");
     proxy
         .state
         .add_backend(backend_url, None)

@@ -1,4 +1,7 @@
-use crate::{request_from_headers_slot, RequestControl};
+use crate::{
+    request_from_headers_slot, RequestControl, WorkerCapacitySummary, WorkerHeartbeat,
+    WorkerHeartbeatUpdate,
+};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use http::{header::CONTENT_TYPE, Request};
@@ -86,6 +89,81 @@ impl RemoteIngressClient {
         Ok(streams)
     }
 
+    pub async fn list_workers(&self, origin: &str) -> Result<Vec<WorkerHeartbeat>> {
+        let response = self
+            .client
+            .get(format!("{origin}/_upload_response/workers"))
+            .send()
+            .await
+            .map_err(|error| anyhow!("failed to list workers from {origin}: {error}"))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| anyhow!("failed to read worker list from {origin}: {error}"))?;
+        anyhow::ensure!(
+            status.is_success(),
+            "unexpected worker list status {status} from {origin}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        serde_json::from_slice(&body)
+            .map_err(|error| anyhow!("invalid worker list from {origin}: {error}"))
+    }
+
+    pub async fn worker_capacity(&self, origin: &str) -> Result<WorkerCapacitySummary> {
+        let response = self
+            .client
+            .get(format!("{origin}/_upload_response/capacity"))
+            .send()
+            .await
+            .map_err(|error| anyhow!("failed to read worker capacity from {origin}: {error}"))?;
+        let status = response.status();
+        let body = response.bytes().await.map_err(|error| {
+            anyhow!("failed to read worker capacity body from {origin}: {error}")
+        })?;
+        anyhow::ensure!(
+            status.is_success(),
+            "unexpected worker capacity status {status} from {origin}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        serde_json::from_slice(&body)
+            .map_err(|error| anyhow!("invalid worker capacity from {origin}: {error}"))
+    }
+
+    pub async fn heartbeat_worker(
+        &self,
+        origin: &str,
+        worker_id: &str,
+        update: &WorkerHeartbeatUpdate,
+    ) -> Result<WorkerHeartbeat> {
+        let encoded = serde_json::to_vec(update).map_err(|error| {
+            anyhow!("failed to encode worker heartbeat for {worker_id}: {error}")
+        })?;
+        let response = self
+            .client
+            .put(format!(
+                "{origin}/_upload_response/workers/{worker_id}/heartbeat"
+            ))
+            .header(CONTENT_TYPE, "application/json")
+            .body(encoded)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!("failed to heartbeat worker {worker_id} to {origin}: {error}")
+            })?;
+        let status = response.status();
+        let body = response.bytes().await.map_err(|error| {
+            anyhow!("failed to read worker heartbeat body from {origin}: {error}")
+        })?;
+        anyhow::ensure!(
+            status.is_success(),
+            "unexpected worker heartbeat status {status} from {origin}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        serde_json::from_slice(&body)
+            .map_err(|error| anyhow!("invalid worker heartbeat response from {origin}: {error}"))
+    }
+
     pub async fn request_last(&self, origin: &str, stream_id: u64) -> Result<usize> {
         let response = self
             .client
@@ -96,10 +174,9 @@ impl RemoteIngressClient {
             .await
             .map_err(|error| anyhow!("failed to read request_last for {stream_id}: {error}"))?;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| anyhow!("failed to read request_last body for {stream_id}: {error}"))?;
+        let body = response.text().await.map_err(|error| {
+            anyhow!("failed to read request_last body for {stream_id}: {error}")
+        })?;
         anyhow::ensure!(
             status.is_success(),
             "unexpected request_last status {status} for stream {stream_id}: {body}"
@@ -109,7 +186,11 @@ impl RemoteIngressClient {
             .map_err(|error| anyhow!("invalid request_last for stream {stream_id}: {error}"))
     }
 
-    pub async fn request_headers(&self, origin: &str, stream_id: u64) -> Result<Option<Request<()>>> {
+    pub async fn request_headers(
+        &self,
+        origin: &str,
+        stream_id: u64,
+    ) -> Result<Option<Request<()>>> {
         match self.request_slot(origin, stream_id, 1).await? {
             Some(RemoteRequestSlot::Headers(bytes)) => request_from_headers_slot(&bytes).map(Some),
             Some(_) | None => Ok(None),
@@ -129,7 +210,9 @@ impl RemoteIngressClient {
             ))
             .send()
             .await
-            .map_err(|error| anyhow!("failed to fetch stream {stream_id} slot {slot_id}: {error}"))?;
+            .map_err(|error| {
+                anyhow!("failed to fetch stream {stream_id} slot {slot_id}: {error}")
+            })?;
         let status = response.status();
         if status == StatusCode::NOT_FOUND {
             return Ok(None);
@@ -139,10 +222,9 @@ impl RemoteIngressClient {
             .get("x-upload-response-slot-type")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| anyhow!("failed to read stream {stream_id} slot {slot_id}: {error}"))?;
+        let bytes = response.bytes().await.map_err(|error| {
+            anyhow!("failed to read stream {stream_id} slot {slot_id}: {error}")
+        })?;
         anyhow::ensure!(
             status.is_success(),
             "unexpected slot status {status} for stream {stream_id} slot {slot_id}"
@@ -157,7 +239,12 @@ impl RemoteIngressClient {
         Ok(Some(slot))
     }
 
-    pub async fn register_reader(&self, origin: &str, stream_id: u64, worker_id: &str) -> Result<()> {
+    pub async fn register_reader(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        worker_id: &str,
+    ) -> Result<()> {
         let response = self
             .client
             .put(format!(
@@ -266,7 +353,8 @@ impl RemoteIngressClient {
         let headers = StreamHeaders::from_response(stream_id, &response_head).map_err(|error| {
             anyhow!("failed to encode response headers for stream {stream_id}: {error}")
         })?;
-        self.write_response_headers(origin, stream_id, headers).await?;
+        self.write_response_headers(origin, stream_id, headers)
+            .await?;
         if let Some(body) = response.body {
             self.append_response_body(origin, stream_id, body).await?;
         }
@@ -293,7 +381,12 @@ impl RemoteIngressClient {
         Ok(())
     }
 
-    pub async fn append_response_body(&self, origin: &str, stream_id: u64, body: Bytes) -> Result<()> {
+    pub async fn append_response_body(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        body: Bytes,
+    ) -> Result<()> {
         for chunk in body.chunks(self.slot_bytes) {
             if chunk.is_empty() {
                 continue;

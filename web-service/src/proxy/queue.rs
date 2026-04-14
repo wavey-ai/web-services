@@ -23,7 +23,8 @@ pub struct ProxyQueue {
     max_slot_bytes: usize,
     max_body_chunk_bytes: usize,
     /// Map stream_id to response channel
-    response_channels: Arc<RwLock<HashMap<u64, oneshot::Sender<Result<(StatusCode, Bytes), String>>>>>,
+    response_channels:
+        Arc<RwLock<HashMap<u64, oneshot::Sender<Result<(StatusCode, Bytes), String>>>>>,
 }
 
 impl ProxyQueue {
@@ -122,7 +123,9 @@ impl ProxyQueue {
         let (tx, rx) = oneshot::channel();
         let mut channels = self.response_channels.write().await;
         if channels.insert(stream_id, tx).is_some() {
-            return Err(format!("response channel already exists for stream {stream_id}"));
+            return Err(format!(
+                "response channel already exists for stream {stream_id}"
+            ));
         }
         debug!(stream_id, "Registered response channel");
         Ok(rx)
@@ -203,9 +206,7 @@ mod tests {
         let queue = ProxyQueue::new(4, 1, 512, 64);
         let stream_id = 1;
 
-        let req = Request::get("https://example.com/test")
-            .body(())
-            .unwrap();
+        let req = Request::get("https://example.com/test").body(()).unwrap();
         let headers = StreamHeaders::from_request(stream_id, &req).unwrap();
         queue
             .enqueue_request_frame(StreamFrame::Headers(headers))
@@ -243,8 +244,7 @@ mod tests {
 
         let rx = queue.begin_request(stream_id).await.unwrap();
         let tx = queue.take_response_channel(stream_id).await.unwrap();
-        tx.send(Ok((StatusCode::OK, Bytes::from("ok"))))
-            .unwrap();
+        tx.send(Ok((StatusCode::OK, Bytes::from("ok")))).unwrap();
 
         let (status, body) = rx.await.unwrap().unwrap();
         assert_eq!(status, StatusCode::OK);

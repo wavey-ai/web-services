@@ -24,12 +24,8 @@ pub fn load_tls_base64_from_paths(
     cert_path: impl AsRef<Path>,
     key_path: impl AsRef<Path>,
 ) -> anyhow::Result<(String, String)> {
-    let cert_pem = fs::read(cert_path.as_ref()).with_context(|| {
-        format!(
-            "failed to read cert PEM: {}",
-            cert_path.as_ref().display()
-        )
-    })?;
+    let cert_pem = fs::read(cert_path.as_ref())
+        .with_context(|| format!("failed to read cert PEM: {}", cert_path.as_ref().display()))?;
     let key_pem = fs::read(key_path.as_ref()).with_context(|| {
         format!(
             "failed to read private key PEM: {}",

@@ -132,7 +132,11 @@ impl CachedIngress {
         Ok(())
     }
 
-    pub async fn append_request_control(&self, stream_id: u64, control: RequestControl) -> Result<()> {
+    pub async fn append_request_control(
+        &self,
+        stream_id: u64,
+        control: RequestControl,
+    ) -> Result<()> {
         self.service
             .append_request_control(stream_id, control)
             .await
@@ -146,7 +150,11 @@ impl CachedIngress {
             .map_err(|error| anyhow!(error))
     }
 
-    pub async fn await_response(&self, stream_id: u64, rx: oneshot::Receiver<ResponseResult>) -> Result<HandlerResponse> {
+    pub async fn await_response(
+        &self,
+        stream_id: u64,
+        rx: oneshot::Receiver<ResponseResult>,
+    ) -> Result<HandlerResponse> {
         let timeout_duration = Duration::from_millis(self.config.response_timeout_ms);
         match timeout(timeout_duration, rx).await {
             Ok(Ok(Ok(cached))) => Ok(handler_response_from_cached(cached)),
@@ -217,7 +225,10 @@ impl CachedIngress {
     }
 
     pub async fn write_handler_response(&self, stream_id: u64, response: HandlerResponse) {
-        let _ = self.service.write_handler_response(stream_id, response).await;
+        let _ = self
+            .service
+            .write_handler_response(stream_id, response)
+            .await;
     }
 }
 
@@ -278,7 +289,9 @@ pub fn handler_response_from_cached(cached: CachedResponse) -> HandlerResponse {
     }
 }
 
-pub fn build_streaming_response_head(headers: &StreamResponseHeaders) -> HandlerResult<Response<()>> {
+pub fn build_streaming_response_head(
+    headers: &StreamResponseHeaders,
+) -> HandlerResult<Response<()>> {
     let mut builder = Response::builder().status(headers.status);
     for header in &headers.headers {
         let name = http::HeaderName::from_bytes(&header.name).map_err(|error| {
@@ -303,8 +316,12 @@ pub fn response_content_type(headers: &StreamResponseHeaders) -> Option<String> 
 }
 
 pub fn request_from_headers_slot(bytes: &[u8]) -> Result<Request<()>> {
-    match decode_frame(bytes).map_err(|error| anyhow!("failed to decode request headers: {error}"))? {
-        StreamFrame::Headers(StreamHeaders::Request(headers)) => request_from_stream_headers(headers),
+    match decode_frame(bytes)
+        .map_err(|error| anyhow!("failed to decode request headers: {error}"))?
+    {
+        StreamFrame::Headers(StreamHeaders::Request(headers)) => {
+            request_from_stream_headers(headers)
+        }
         _ => Err(anyhow!("slot 1 was not a request headers frame")),
     }
 }
@@ -328,8 +345,8 @@ fn build_request_from_parts(
     authority: Option<Vec<u8>>,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<Request<()>> {
-    let method =
-        String::from_utf8(method).map_err(|error| anyhow!("invalid request method bytes: {error}"))?;
+    let method = String::from_utf8(method)
+        .map_err(|error| anyhow!("invalid request method bytes: {error}"))?;
     let uri =
         String::from_utf8(path).map_err(|error| anyhow!("invalid request path bytes: {error}"))?;
 
@@ -343,8 +360,8 @@ fn build_request_from_parts(
     }
 
     for (name_bytes, value_bytes) in headers {
-        let name =
-            HeaderName::from_bytes(&name_bytes).map_err(|error| anyhow!("invalid header name: {error}"))?;
+        let name = HeaderName::from_bytes(&name_bytes)
+            .map_err(|error| anyhow!("invalid header name: {error}"))?;
         let value = HeaderValue::from_bytes(&value_bytes)
             .map_err(|error| anyhow!("invalid header value: {error}"))?;
         builder = builder.header(name, value);

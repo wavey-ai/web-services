@@ -1,8 +1,7 @@
 mod common;
 
 use std::{
-    env,
-    io,
+    env, io,
     net::{IpAddr, Ipv4Addr},
     sync::OnceLock,
     time::{Duration, Instant},
@@ -10,16 +9,16 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use common::load_test_env;
 use http::{Request, StatusCode};
 use portpicker::pick_unused_port;
 use reqwest::header::CONNECTION;
-use tokio_rustls::rustls;
 use tls_helpers::from_base64_raw;
+use tokio_rustls::rustls;
 use web_service::{
     H2H3Server, HandlerResponse, HandlerResult, RequestHandler, Router, Server, ServerBuilder,
     ServerError,
 };
-use common::load_test_env;
 
 type BenchResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -292,7 +291,11 @@ fn print_summary(stats: &[BenchStats]) {
     }
 
     let mut ordered: Vec<&BenchStats> = stats.iter().collect();
-    ordered.sort_by(|a, b| b.rps.partial_cmp(&a.rps).unwrap_or(std::cmp::Ordering::Equal));
+    ordered.sort_by(|a, b| {
+        b.rps
+            .partial_cmp(&a.rps)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     println!();
     println!("benchmark summary (higher req/s is better):");
@@ -313,7 +316,11 @@ fn print_summary(stats: &[BenchStats]) {
         if let Some(best) = stats
             .iter()
             .filter(|stat| stat.label.contains("(new-conn)"))
-            .max_by(|a, b| a.rps.partial_cmp(&b.rps).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.rps
+                    .partial_cmp(&b.rps)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         {
             println!("best new-conn: {} at {:.2} req/s", best.label, best.rps);
         }
@@ -322,12 +329,13 @@ fn print_summary(stats: &[BenchStats]) {
         if let Some(best) = stats
             .iter()
             .filter(|stat| stat.label.contains("(reuse-conn)"))
-            .max_by(|a, b| a.rps.partial_cmp(&b.rps).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.rps
+                    .partial_cmp(&b.rps)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         {
-            println!(
-                "best reuse-conn: {} at {:.2} req/s",
-                best.label, best.rps
-            );
+            println!("best reuse-conn: {} at {:.2} req/s", best.label, best.rps);
         }
     }
 }
@@ -486,15 +494,7 @@ async fn run_h2_benchmark(
 
     let url = format!("https://{host}:{port}/");
     let label = format!("h2 ({})", scenario.label());
-    run_reqwest_benchmark(
-        &label,
-        client,
-        url,
-        config,
-        reqwest::Version::HTTP_2,
-        false,
-    )
-    .await
+    run_reqwest_benchmark(&label, client, url, config, reqwest::Version::HTTP_2, false).await
 }
 
 async fn run_with_server<F, Fut>(
@@ -512,8 +512,8 @@ where
         .lock()
         .await;
 
-    let port = pick_unused_port()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "pick port"))?;
+    let port =
+        pick_unused_port().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "pick port"))?;
     let handle = start_server(cert_b64, key_b64, port, payload).await?;
     handle.ready_rx.await?;
     wait_for_port(port).await;

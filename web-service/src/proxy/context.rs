@@ -15,8 +15,7 @@ pub fn ensure_context(req: &mut Request<()>) -> RequestContext {
         return existing;
     }
 
-    let request_id = request_id_from_headers(req.headers())
-        .unwrap_or_else(|| id::next_id_string());
+    let request_id = request_id_from_headers(req.headers()).unwrap_or_else(|| id::next_id_string());
 
     let context = RequestContext { request_id };
     req.extensions_mut().insert(context.clone());

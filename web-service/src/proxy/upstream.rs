@@ -36,13 +36,34 @@ mod tests {
 
     #[test]
     fn upstream_protocol_parses_variants() {
-        assert_eq!("http1".parse::<UpstreamProtocol>().unwrap(), UpstreamProtocol::Http1);
-        assert_eq!("http1.1".parse::<UpstreamProtocol>().unwrap(), UpstreamProtocol::Http1);
-        assert_eq!("h1".parse::<UpstreamProtocol>().unwrap(), UpstreamProtocol::Http1);
-        assert_eq!("http2".parse::<UpstreamProtocol>().unwrap(), UpstreamProtocol::Http2);
-        assert_eq!("h2".parse::<UpstreamProtocol>().unwrap(), UpstreamProtocol::Http2);
-        assert_eq!("http3".parse::<UpstreamProtocol>().unwrap(), UpstreamProtocol::Http3);
-        assert_eq!("h3".parse::<UpstreamProtocol>().unwrap(), UpstreamProtocol::Http3);
+        assert_eq!(
+            "http1".parse::<UpstreamProtocol>().unwrap(),
+            UpstreamProtocol::Http1
+        );
+        assert_eq!(
+            "http1.1".parse::<UpstreamProtocol>().unwrap(),
+            UpstreamProtocol::Http1
+        );
+        assert_eq!(
+            "h1".parse::<UpstreamProtocol>().unwrap(),
+            UpstreamProtocol::Http1
+        );
+        assert_eq!(
+            "http2".parse::<UpstreamProtocol>().unwrap(),
+            UpstreamProtocol::Http2
+        );
+        assert_eq!(
+            "h2".parse::<UpstreamProtocol>().unwrap(),
+            UpstreamProtocol::Http2
+        );
+        assert_eq!(
+            "http3".parse::<UpstreamProtocol>().unwrap(),
+            UpstreamProtocol::Http3
+        );
+        assert_eq!(
+            "h3".parse::<UpstreamProtocol>().unwrap(),
+            UpstreamProtocol::Http3
+        );
         assert!("unknown".parse::<UpstreamProtocol>().is_err());
     }
 

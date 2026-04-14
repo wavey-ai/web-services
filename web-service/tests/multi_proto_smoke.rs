@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use common::load_test_env;
 use futures_util::{SinkExt, StreamExt};
 use http::{Request, StatusCode};
 use portpicker::pick_unused_port;
@@ -20,7 +21,6 @@ use web_service::{
     H2H3Server, HandlerResponse, HandlerResult, RawTcpHandler, RequestHandler, Router, Server,
     ServerBuilder, ServerError, WebSocketHandler,
 };
-use common::load_test_env;
 
 struct HelloHandler;
 

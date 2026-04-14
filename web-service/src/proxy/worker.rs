@@ -5,7 +5,9 @@ use bytes::Bytes;
 use futures_util::stream;
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, StreamBody as HttpStreamBody};
-use http_pack::stream::{decode_frame, StreamBody as StreamBodyFrame, StreamEnd, StreamFrame, StreamHeaders};
+use http_pack::stream::{
+    decode_frame, StreamBody as StreamBodyFrame, StreamEnd, StreamFrame, StreamHeaders,
+};
 use hyper::body::Frame;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -71,8 +73,7 @@ impl ProxyWorker {
                         if body_channels.contains_key(&stream_id) {
                             warn!(
                                 worker_id = self.worker_id,
-                                stream_id,
-                                "Duplicate headers frame, resetting stream"
+                                stream_id, "Duplicate headers frame, resetting stream"
                             );
                             body_channels.remove(&stream_id);
                         }
@@ -101,18 +102,13 @@ impl ProxyWorker {
                     StreamFrame::Body(body) => {
                         if let Some(tx) = body_channels.get_mut(&stream_id) {
                             if tx.send(Ok(Frame::data(body.data))).await.is_err() {
-                                warn!(
-                                    worker_id = self.worker_id,
-                                    stream_id,
-                                    "Body channel closed"
-                                );
+                                warn!(worker_id = self.worker_id, stream_id, "Body channel closed");
                                 body_channels.remove(&stream_id);
                             }
                         } else {
                             warn!(
                                 worker_id = self.worker_id,
-                                stream_id,
-                                "Body frame received before headers"
+                                stream_id, "Body frame received before headers"
                             );
                         }
                     }
@@ -146,7 +142,10 @@ async fn process_stream_request(
     let request_headers = match headers {
         StreamHeaders::Request(req) => req,
         StreamHeaders::Response(_) => {
-            warn!(worker_id, stream_id, "Received response headers in request queue");
+            warn!(
+                worker_id,
+                stream_id, "Received response headers in request queue"
+            );
             return;
         }
     };

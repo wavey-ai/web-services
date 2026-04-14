@@ -84,7 +84,12 @@ impl RelayBuffers {
     pub async fn request_get(&self, slot: usize, id: usize) -> Option<Bytes> {
         match self.requests.get(slot, id).await {
             Some((bytes, _)) => {
-                trace!(slot, id, len = bytes.len(), "QUIC relay request buffer read");
+                trace!(
+                    slot,
+                    id,
+                    len = bytes.len(),
+                    "QUIC relay request buffer read"
+                );
                 Some(bytes)
             }
             None => {
@@ -109,7 +114,12 @@ impl RelayBuffers {
     pub async fn response_get(&self, slot: usize, id: usize) -> Option<Bytes> {
         match self.responses.get(slot, id).await {
             Some((bytes, _)) => {
-                trace!(slot, id, len = bytes.len(), "QUIC relay response buffer read");
+                trace!(
+                    slot,
+                    id,
+                    len = bytes.len(),
+                    "QUIC relay response buffer read"
+                );
                 Some(bytes)
             }
             None => {
@@ -142,9 +152,11 @@ impl BackendConnectionPool {
     }
 
     async fn send_request(&self, data: &[u8]) -> std::io::Result<()> {
-        let _permit = self.semaphore.acquire().await.map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "semaphore closed")
-        })?;
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "semaphore closed"))?;
 
         let mut stream = TcpStream::connect(self.backend_addr).await?;
         stream.set_nodelay(true)?;
@@ -272,7 +284,10 @@ impl QuicRelayWorker {
                 Some(conn) => conn,
                 None => return,
             };
-            info!("QUIC relay sender {} initial connection established", self.id);
+            info!(
+                "QUIC relay sender {} initial connection established",
+                self.id
+            );
 
             let mut interval = tokio::time::interval(POLL_INTERVAL);
             loop {
@@ -304,7 +319,10 @@ impl QuicRelayWorker {
         let client_config = match create_client_config() {
             Ok(config) => config,
             Err(err) => {
-                error!("QUIC relay sender {} client config failed: {}", self.id, err);
+                error!(
+                    "QUIC relay sender {} client config failed: {}",
+                    self.id, err
+                );
                 return None;
             }
         };
@@ -312,7 +330,10 @@ impl QuicRelayWorker {
         let mut endpoint = match Endpoint::client("0.0.0.0:0".parse().unwrap()) {
             Ok(endpoint) => endpoint,
             Err(err) => {
-                error!("QUIC relay sender {} endpoint creation failed: {}", self.id, err);
+                error!(
+                    "QUIC relay sender {} endpoint creation failed: {}",
+                    self.id, err
+                );
                 return None;
             }
         };
@@ -320,23 +341,21 @@ impl QuicRelayWorker {
 
         loop {
             match endpoint.connect(self.forward_addr, "localhost") {
-                Ok(connecting) => {
-                    match connecting.await {
-                        Ok(connection) => {
-                            info!(
-                                "QUIC relay sender {} connected to {}",
-                                self.id, self.forward_addr
-                            );
-                            return Some(connection);
-                        }
-                        Err(err) => {
-                            warn!(
-                                "QUIC relay sender {} connect await failed: {}, retrying in {:?}",
-                                self.id, err, backoff
-                            );
-                        }
+                Ok(connecting) => match connecting.await {
+                    Ok(connection) => {
+                        info!(
+                            "QUIC relay sender {} connected to {}",
+                            self.id, self.forward_addr
+                        );
+                        return Some(connection);
                     }
-                }
+                    Err(err) => {
+                        warn!(
+                            "QUIC relay sender {} connect await failed: {}, retrying in {:?}",
+                            self.id, err, backoff
+                        );
+                    }
+                },
                 Err(err) => {
                     warn!(
                         "QUIC relay sender {} connect failed: {}, retrying in {:?}",
@@ -417,13 +436,14 @@ struct QuicRelayReceiver {
 impl QuicRelayReceiver {
     fn start(self, mut shutdown_rx: watch::Receiver<()>) {
         tokio::spawn(async move {
-            let server_config = match create_server_config(&self.cert_pem_base64, &self.key_pem_base64) {
-                Ok(config) => config,
-                Err(err) => {
-                    error!("QUIC relay receiver server config failed: {}", err);
-                    return;
-                }
-            };
+            let server_config =
+                match create_server_config(&self.cert_pem_base64, &self.key_pem_base64) {
+                    Ok(config) => config,
+                    Err(err) => {
+                        error!("QUIC relay receiver server config failed: {}", err);
+                        return;
+                    }
+                };
 
             let endpoint = match Endpoint::server(server_config, self.listen_addr) {
                 Ok(endpoint) => endpoint,
@@ -489,13 +509,7 @@ async fn handle_quic_connection(
         let buffers_clone = Arc::clone(&buffers);
 
         tokio::spawn(async move {
-            handle_quic_stream(
-                stream,
-                backend_pool_clone,
-                buffers_clone,
-                slots,
-            )
-            .await;
+            handle_quic_stream(stream, backend_pool_clone, buffers_clone, slots).await;
         });
     }
 }
@@ -563,11 +577,7 @@ async fn process_frame(
         StreamFrame::Body(_) => "body",
         StreamFrame::End(_) => "end",
     };
-    debug!(
-        stream_id,
-        frame_kind,
-        "QUIC relay receiver decoded frame"
-    );
+    debug!(stream_id, frame_kind, "QUIC relay receiver decoded frame");
     let out = match rebuilder.push_frame(frame) {
         Ok(out) => out,
         Err(err) => {
@@ -575,7 +585,11 @@ async fn process_frame(
             return;
         }
     };
-    debug!(stream_id, chunk_count = out.len(), "QUIC relay rebuilder output");
+    debug!(
+        stream_id,
+        chunk_count = out.len(),
+        "QUIC relay rebuilder output"
+    );
 
     if out.is_empty() {
         return;
@@ -691,8 +705,7 @@ fn create_server_config(
     let cert_pem = base64_engine.decode(cert_pem_base64)?;
     let key_pem = base64_engine.decode(key_pem_base64)?;
 
-    let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_slice()).collect::<Result<Vec<_>, _>>()?;
     let key = rustls_pemfile::private_key(&mut key_pem.as_slice())?
         .ok_or_else(|| anyhow::anyhow!("no private key found"))?;
 
