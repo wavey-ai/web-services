@@ -90,15 +90,14 @@ impl CachedIngress {
     }
 
     pub async fn copy_request_body(&self, stream_id: u64, mut body: BodyStream) -> Result<()> {
+        let chunk_size = self.service.config().slot_bytes().max(1);
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|error| anyhow!("failed to read request body: {error}"))?;
             if chunk.is_empty() {
                 continue;
             }
-            self.service
-                .append_request_body(stream_id, chunk)
-                .await
-                .map_err(|error| anyhow!(error))?;
+            self.append_request_body_sliced(stream_id, &chunk, chunk_size)
+                .await?;
         }
         Ok(())
     }

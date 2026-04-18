@@ -1,13 +1,13 @@
 use crate::{
-    request_from_headers_slot, RequestControl, WorkerCapacitySummary, WorkerHeartbeat,
-    WorkerHeartbeatUpdate,
+    encode_request_control, request_from_headers_slot, RequestControl, StageState,
+    WorkerCapacitySummary, WorkerHeartbeat, WorkerHeartbeatUpdate,
 };
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use http::{header::CONTENT_TYPE, Request};
 use http_pack::stream::{encode_frame, StreamFrame, StreamHeaders};
 use reqwest::{Client, StatusCode};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tokio::net::lookup_host;
 use web_service::HandlerResponse;
 
@@ -22,6 +22,19 @@ pub struct RemoteStreamInfo {
     pub stream_id: u64,
     pub request_last: usize,
     pub response_owner: Option<String>,
+    pub stages: BTreeMap<String, StageState>,
+}
+
+impl RemoteStreamInfo {
+    pub fn stage_last(&self, stage: &str) -> usize {
+        self.stages.get(stage).map(|state| state.last).unwrap_or(0)
+    }
+
+    pub fn stage_owner(&self, stage: &str) -> Option<&str> {
+        self.stages
+            .get(stage)
+            .and_then(|state| state.owner.as_deref())
+    }
 }
 
 #[derive(Debug)]
@@ -29,6 +42,14 @@ pub enum RemoteRequestSlot {
     Headers(Bytes),
     Body(Bytes),
     Control(RequestControl),
+    End,
+}
+
+#[derive(Debug)]
+pub enum RemoteStageSlot {
+    Head(Bytes),
+    Control(RequestControl),
+    Body(Bytes),
     End,
 }
 
@@ -69,7 +90,7 @@ impl RemoteIngressClient {
         let mut streams = Vec::new();
         for line in body.lines() {
             let fields: Vec<_> = line.split('\t').collect();
-            if fields.len() < 6 || fields[0] == "stream_id" {
+            if fields.len() < 7 || fields[0] == "stream_id" {
                 continue;
             }
             streams.push(RemoteStreamInfo {
@@ -83,6 +104,8 @@ impl RemoteIngressClient {
                     "" | "-" => None,
                     other => Some(other.to_string()),
                 },
+                stages: serde_json::from_str(fields[6])
+                    .map_err(|error| anyhow!("invalid stages_json in {origin}: {error}"))?,
             });
         }
 
@@ -239,6 +262,73 @@ impl RemoteIngressClient {
         Ok(Some(slot))
     }
 
+    pub async fn stage_last(&self, origin: &str, stream_id: u64, stage: &str) -> Result<usize> {
+        let response = self
+            .client
+            .get(format!(
+                "{origin}/_upload_response/streams/{stream_id}/stages/{stage}/last"
+            ))
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!("failed to read stage_last for {stream_id}/{stage}: {error}")
+            })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|error| {
+            anyhow!("failed to read stage_last body for {stream_id}/{stage}: {error}")
+        })?;
+        anyhow::ensure!(
+            status.is_success(),
+            "unexpected stage_last status {status} for stream {stream_id}/{stage}: {body}"
+        );
+        body.trim()
+            .parse()
+            .map_err(|error| anyhow!("invalid stage_last for stream {stream_id}/{stage}: {error}"))
+    }
+
+    pub async fn stage_slot(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        stage: &str,
+        slot_id: usize,
+    ) -> Result<Option<RemoteStageSlot>> {
+        let response = self
+            .client
+            .get(format!(
+                "{origin}/_upload_response/streams/{stream_id}/stages/{stage}/slots/{slot_id}"
+            ))
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!("failed to fetch stage {stage} stream {stream_id} slot {slot_id}: {error}")
+            })?;
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let slot_type = response
+            .headers()
+            .get("x-upload-response-slot-type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.bytes().await.map_err(|error| {
+            anyhow!("failed to read stage {stage} stream {stream_id} slot {slot_id}: {error}")
+        })?;
+        anyhow::ensure!(
+            status.is_success(),
+            "unexpected stage slot status {status} for stream {stream_id}/{stage} slot {slot_id}"
+        );
+        let slot = match slot_type.as_deref().unwrap_or("body") {
+            "head" => RemoteStageSlot::Head(bytes),
+            "control-finalize" => RemoteStageSlot::Control(RequestControl::Finalize),
+            "control-keepalive" => RemoteStageSlot::Control(RequestControl::KeepAlive),
+            "end" => RemoteStageSlot::End,
+            _ => RemoteStageSlot::Body(bytes),
+        };
+        Ok(Some(slot))
+    }
+
     pub async fn register_reader(
         &self,
         origin: &str,
@@ -328,6 +418,143 @@ impl RemoteIngressClient {
             "release response failed for stream {stream_id} with status {}",
             response.status()
         );
+        Ok(())
+    }
+
+    pub async fn try_claim_stage(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        stage: &str,
+        worker_id: &str,
+    ) -> Result<bool> {
+        let response = self
+            .client
+            .put(format!(
+                "{origin}/_upload_response/streams/{stream_id}/stages/{stage}/claim/{worker_id}"
+            ))
+            .send()
+            .await
+            .map_err(|error| anyhow!("failed to claim stage {stage} for {stream_id}: {error}"))?;
+        match response.status() {
+            StatusCode::OK | StatusCode::CREATED => Ok(true),
+            StatusCode::CONFLICT => Ok(false),
+            status => {
+                let body = response.text().await.unwrap_or_default();
+                Err(anyhow!(
+                    "unexpected stage claim status {status} for stream {stream_id}/{stage}: {body}"
+                ))
+            }
+        }
+    }
+
+    pub async fn release_stage(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        stage: &str,
+        worker_id: &str,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .delete(format!(
+                "{origin}/_upload_response/streams/{stream_id}/stages/{stage}/claim/{worker_id}"
+            ))
+            .send()
+            .await
+            .map_err(|error| anyhow!("failed to release stage {stage} for {stream_id}: {error}"))?;
+        anyhow::ensure!(
+            response.status().is_success() || response.status() == StatusCode::NOT_FOUND,
+            "release stage failed for stream {stream_id}/{stage} with status {}",
+            response.status()
+        );
+        Ok(())
+    }
+
+    pub async fn write_stage_head(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        stage: &str,
+        head: Bytes,
+    ) -> Result<()> {
+        self.client
+            .put(format!(
+                "{origin}/_upload_response/streams/{stream_id}/stages/{stage}/head"
+            ))
+            .body(head)
+            .send()
+            .await
+            .map_err(|error| anyhow!("write stage head for stream {stream_id}/{stage}: {error}"))?
+            .error_for_status()
+            .map_err(|error| anyhow!("write stage head for stream {stream_id}/{stage}: {error}"))?;
+        Ok(())
+    }
+
+    pub async fn append_stage_body(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        stage: &str,
+        body: Bytes,
+    ) -> Result<()> {
+        for chunk in body.chunks(self.slot_bytes) {
+            if chunk.is_empty() {
+                continue;
+            }
+            self.client
+                .put(format!(
+                    "{origin}/_upload_response/streams/{stream_id}/stages/{stage}/body"
+                ))
+                .body(Bytes::copy_from_slice(chunk))
+                .send()
+                .await
+                .map_err(|error| {
+                    anyhow!("write stage body for stream {stream_id}/{stage}: {error}")
+                })?
+                .error_for_status()
+                .map_err(|error| {
+                    anyhow!("write stage body for stream {stream_id}/{stage}: {error}")
+                })?;
+        }
+        Ok(())
+    }
+
+    pub async fn append_stage_control(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        stage: &str,
+        control: RequestControl,
+    ) -> Result<()> {
+        let encoded = encode_request_control(control);
+        self.client
+            .put(format!(
+                "{origin}/_upload_response/streams/{stream_id}/stages/{stage}/control"
+            ))
+            .body(encoded)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!("write stage control for stream {stream_id}/{stage}: {error}")
+            })?
+            .error_for_status()
+            .map_err(|error| {
+                anyhow!("write stage control for stream {stream_id}/{stage}: {error}")
+            })?;
+        Ok(())
+    }
+
+    pub async fn end_stage(&self, origin: &str, stream_id: u64, stage: &str) -> Result<()> {
+        self.client
+            .put(format!(
+                "{origin}/_upload_response/streams/{stream_id}/stages/{stage}/end"
+            ))
+            .send()
+            .await
+            .map_err(|error| anyhow!("finish stage {stage} for stream {stream_id}: {error}"))?
+            .error_for_status()
+            .map_err(|error| anyhow!("finish stage {stage} for stream {stream_id}: {error}"))?;
         Ok(())
     }
 

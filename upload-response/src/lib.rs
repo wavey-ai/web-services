@@ -10,7 +10,7 @@ use hyper_util::rt::TokioIo;
 use playlists::chunk_cache::ChunkCache;
 use playlists::Options;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,7 +36,8 @@ pub use bridge::{
 
 mod remote;
 pub use remote::{
-    discover_ingress_origins, RemoteIngressClient, RemoteRequestSlot, RemoteStreamInfo,
+    discover_ingress_origins, RemoteIngressClient, RemoteRequestSlot, RemoteStageSlot,
+    RemoteStreamInfo,
 };
 
 mod response_writer;
@@ -157,6 +158,15 @@ impl Default for UploadResponseConfig {
     }
 }
 
+fn chunk_cache_options(config: &UploadResponseConfig) -> Options {
+    let mut options = Options::default();
+    options.num_playlists = config.num_streams;
+    options.max_segments = 1;
+    options.max_parts_per_segment = config.slots_per_stream;
+    options.buffer_size_kb = config.slot_size_kb;
+    options
+}
+
 /// Response type sent through oneshot channels
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedResponse {
@@ -169,6 +179,7 @@ pub type ResponseResult = Result<CachedResponse, String>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerHeartbeatUpdate {
+    pub stage: String,
     pub max_inflight: usize,
     pub inflight: usize,
     pub available_slots: usize,
@@ -177,6 +188,7 @@ pub struct WorkerHeartbeatUpdate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerHeartbeat {
     pub worker_id: String,
+    pub stage: String,
     pub max_inflight: usize,
     pub inflight: usize,
     pub available_slots: usize,
@@ -214,6 +226,60 @@ pub struct ActiveStreamInfo {
     pub response_last: usize,
     pub reader_count: u64,
     pub response_owner: Option<String>,
+    pub stages: BTreeMap<String, StageState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageState {
+    pub last: usize,
+    pub owner: Option<String>,
+}
+
+impl ActiveStreamInfo {
+    pub fn stage_last(&self, stage: &str) -> usize {
+        self.stages.get(stage).map(|state| state.last).unwrap_or(0)
+    }
+
+    pub fn stage_owner(&self, stage: &str) -> Option<&str> {
+        self.stages
+            .get(stage)
+            .and_then(|state| state.owner.as_deref())
+    }
+}
+
+struct StageLane {
+    cache: Arc<ChunkCache>,
+    started: Vec<AtomicBool>,
+    claims: Arc<RwLock<Vec<Option<String>>>>,
+}
+
+impl StageLane {
+    fn new(config: &UploadResponseConfig) -> Self {
+        let cache = Arc::new(ChunkCache::new(chunk_cache_options(config)));
+        let started: Vec<AtomicBool> = (0..config.num_streams)
+            .map(|_| AtomicBool::new(false))
+            .collect();
+        let claims: Vec<Option<String>> = (0..config.num_streams).map(|_| None).collect();
+
+        Self {
+            cache,
+            started,
+            claims: Arc::new(RwLock::new(claims)),
+        }
+    }
+
+    fn last(&self, stream_idx: usize) -> usize {
+        if !self.started[stream_idx].load(Ordering::SeqCst) {
+            return 0;
+        }
+        self.cache.last(stream_idx).unwrap_or(0)
+    }
+
+    async fn clear_slot_state(&self, stream_idx: usize) {
+        self.started[stream_idx].store(false, Ordering::SeqCst);
+        let mut claims = self.claims.write().await;
+        claims[stream_idx] = None;
+    }
 }
 
 /// RAII handle for an active upload-response stream.
@@ -268,6 +334,7 @@ impl Drop for UploadStream {
 pub struct UploadResponseService {
     request_cache: Arc<ChunkCache>,
     response_cache: Arc<ChunkCache>,
+    stages: Arc<RwLock<HashMap<String, Arc<StageLane>>>>,
     slot_semaphore: Arc<Semaphore>,
     next_stream_id: AtomicU64,
     stream_to_slot: StdRwLock<HashMap<u64, usize>>,
@@ -290,14 +357,9 @@ pub struct UploadResponseService {
 impl UploadResponseService {
     /// Create a new upload-response service with the given configuration
     pub fn new(config: UploadResponseConfig) -> Self {
-        let mut options = Options::default();
-        options.num_playlists = config.num_streams;
-        options.max_segments = 1;
-        options.max_parts_per_segment = config.slots_per_stream;
-        options.buffer_size_kb = config.slot_size_kb;
-
+        let options = chunk_cache_options(&config);
         let request_cache = Arc::new(ChunkCache::new(options));
-        let response_cache = Arc::new(ChunkCache::new(options));
+        let response_cache = Arc::new(ChunkCache::new(chunk_cache_options(&config)));
         let slot_semaphore = Arc::new(Semaphore::new(config.num_streams));
         let free_slots: Vec<usize> = (0..config.num_streams).rev().collect();
 
@@ -322,6 +384,7 @@ impl UploadResponseService {
         Self {
             request_cache,
             response_cache,
+            stages: Arc::new(RwLock::new(HashMap::new())),
             slot_semaphore,
             next_stream_id: AtomicU64::new(1),
             stream_to_slot: StdRwLock::new(HashMap::new()),
@@ -374,19 +437,66 @@ impl UploadResponseService {
             .collect()
     }
 
+    async fn get_or_create_stage_lane(&self, stage: &str) -> Arc<StageLane> {
+        {
+            let stages = self.stages.read().await;
+            if let Some(lane) = stages.get(stage) {
+                return Arc::clone(lane);
+            }
+        }
+
+        let mut stages = self.stages.write().await;
+        Arc::clone(
+            stages
+                .entry(stage.to_string())
+                .or_insert_with(|| Arc::new(StageLane::new(&self.config))),
+        )
+    }
+
+    async fn get_stage_lane(&self, stage: &str) -> Option<Arc<StageLane>> {
+        let stages = self.stages.read().await;
+        stages.get(stage).cloned()
+    }
+
+    pub async fn stage_names(&self) -> Vec<String> {
+        let stages = self.stages.read().await;
+        let mut names: Vec<_> = stages.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     pub async fn active_streams(&self) -> Vec<ActiveStreamInfo> {
         let claims = self.response_claims.read().await;
-        self.active_stream_slots()
-            .into_iter()
-            .map(|slot| ActiveStreamInfo {
+        let stage_names = self.stage_names().await;
+        let mut active = Vec::new();
+
+        for slot in self.active_stream_slots() {
+            let mut stages = BTreeMap::new();
+            for stage_name in &stage_names {
+                if let Some(lane) = self.get_stage_lane(stage_name).await {
+                    let owner = {
+                        let stage_claims = lane.claims.read().await;
+                        stage_claims[slot.stream_idx].clone()
+                    };
+                    let last = lane.last(slot.stream_idx);
+                    if last > 0 || owner.is_some() {
+                        stages.insert(stage_name.clone(), StageState { last, owner });
+                    }
+                }
+            }
+
+            active.push(ActiveStreamInfo {
                 stream_id: slot.stream_id,
                 stream_idx: slot.stream_idx,
                 request_last: self.request_cache.last(slot.stream_idx).unwrap_or(0),
                 response_last: self.response_cache.last(slot.stream_idx).unwrap_or(0),
                 reader_count: self.stream_worker_counts[slot.stream_idx].load(Ordering::SeqCst),
                 response_owner: claims[slot.stream_idx].clone(),
-            })
-            .collect()
+                stages,
+            });
+        }
+
+        active
     }
 
     async fn clear_slot_state(&self, stream_idx: usize) {
@@ -397,6 +507,14 @@ impl UploadResponseService {
         self.stream_worker_counts[stream_idx].store(0, Ordering::SeqCst);
         self.request_started[stream_idx].store(false, Ordering::SeqCst);
         self.response_started[stream_idx].store(false, Ordering::SeqCst);
+        {
+            let stages = self.stages.read().await;
+            let lanes: Vec<_> = stages.values().cloned().collect();
+            drop(stages);
+            for lane in lanes {
+                lane.clear_slot_state(stream_idx).await;
+            }
+        }
         {
             let mut claims = self.response_claims.write().await;
             claims[stream_idx] = None;
@@ -536,6 +654,73 @@ impl UploadResponseService {
 
     // ==================== Response Writer Claim (Exclusive) ====================
 
+    /// Try to claim exclusive access to a named stage on a stream.
+    pub async fn try_claim_stage(&self, stream_id: u64, stage: &str, worker_id: &str) -> bool {
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        let lane = self.get_or_create_stage_lane(stage).await;
+        let mut claims = lane.claims.write().await;
+        if claims[stream_idx].is_none() {
+            claims[stream_idx] = Some(worker_id.to_string());
+            debug!(stream_id, stage, worker_id, "Stage claimed");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Release a previously claimed stage.
+    pub async fn release_stage(&self, stream_id: u64, stage: &str, worker_id: &str) -> bool {
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        let Some(lane) = self.get_stage_lane(stage).await else {
+            return false;
+        };
+        let mut claims = lane.claims.write().await;
+        if claims[stream_idx].as_deref() == Some(worker_id) {
+            claims[stream_idx] = None;
+            debug!(stream_id, stage, worker_id, "Stage released");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Force-release stage ownership regardless of owner (for cleanup/recovery).
+    pub async fn force_release_stage(&self, stream_id: u64, stage: &str) {
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return;
+        };
+        let Some(lane) = self.get_stage_lane(stage).await else {
+            return;
+        };
+        let mut claims = lane.claims.write().await;
+        claims[stream_idx] = None;
+        debug!(stream_id, stage, "Stage force-released");
+    }
+
+    /// Get the worker ID that currently holds a stage claim, if any.
+    pub async fn stage_owner(&self, stream_id: u64, stage: &str) -> Option<String> {
+        let stream_idx = self.stream_idx(stream_id)?;
+        let lane = self.get_stage_lane(stage).await?;
+        let claims = lane.claims.read().await;
+        claims[stream_idx].clone()
+    }
+
+    /// Check if a stage is claimed by anyone.
+    pub async fn is_stage_claimed(&self, stream_id: u64, stage: &str) -> bool {
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        let Some(lane) = self.get_stage_lane(stage).await else {
+            return false;
+        };
+        let claims = lane.claims.read().await;
+        claims[stream_idx].is_some()
+    }
+
     /// Try to claim exclusive write access to a stream's response.
     ///
     /// Only one worker can hold the response claim at a time.
@@ -622,6 +807,7 @@ impl UploadResponseService {
     ) -> WorkerHeartbeat {
         let heartbeat = WorkerHeartbeat {
             worker_id: worker_id.to_string(),
+            stage: update.stage,
             max_inflight: update.max_inflight,
             inflight: update.inflight.min(update.max_inflight),
             available_slots: update.available_slots.min(update.max_inflight),
@@ -661,6 +847,12 @@ impl UploadResponseService {
     /// Get a reference to the request cache for external consumers
     pub fn request_cache(&self) -> Arc<ChunkCache> {
         Arc::clone(&self.request_cache)
+    }
+
+    /// Get a reference to a named stage cache for external consumers.
+    pub async fn stage_cache(&self, stage: &str) -> Arc<ChunkCache> {
+        let lane = self.get_or_create_stage_lane(stage).await;
+        Arc::clone(&lane.cache)
     }
 
     /// Get a reference to the response cache for external consumers
@@ -765,6 +957,86 @@ impl UploadResponseService {
             ));
         }
         self.request_cache
+            .append(stream_idx, Bytes::from_static(END_MARKER))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Write opaque stage head bytes to slot 1 of a named stage stream.
+    pub async fn write_stage_head(
+        &self,
+        stream_id: u64,
+        stage: &str,
+        head: Bytes,
+    ) -> Result<(), String> {
+        if head.is_empty() {
+            return Err("stage head cannot be empty".to_string());
+        }
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        let lane = self.get_or_create_stage_lane(stage).await;
+        lane.cache
+            .add(stream_idx, 1, head)
+            .await
+            .map_err(|e| e.to_string())?;
+        lane.started[stream_idx].store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Append opaque bytes to a named stage stream (slots 2+).
+    pub async fn append_stage_body(
+        &self,
+        stream_id: u64,
+        stage: &str,
+        data: Bytes,
+    ) -> Result<(), String> {
+        if data.is_empty() {
+            return Err("stage body chunks cannot be empty".to_string());
+        }
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        let lane = self.get_or_create_stage_lane(stage).await;
+        if !lane.started[stream_idx].load(Ordering::SeqCst) {
+            return Err(format!("stage head not written for stream: {stream_id}"));
+        }
+        lane.cache
+            .append(stream_idx, data)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Append a stage control marker after the stage head slot.
+    pub async fn append_stage_control(
+        &self,
+        stream_id: u64,
+        stage: &str,
+        control: RequestControl,
+    ) -> Result<(), String> {
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        let lane = self.get_or_create_stage_lane(stage).await;
+        if !lane.started[stream_idx].load(Ordering::SeqCst) {
+            return Err(format!("stage head not written for stream: {stream_id}"));
+        }
+        lane.cache
+            .append(stream_idx, encode_request_control(control))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Write end marker to a named stage stream.
+    pub async fn end_stage(&self, stream_id: u64, stage: &str) -> Result<(), String> {
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        let lane = self.get_or_create_stage_lane(stage).await;
+        if !lane.started[stream_idx].load(Ordering::SeqCst) {
+            return Err(format!("stage head not written for stream: {stream_id}"));
+        }
+        lane.cache
             .append(stream_idx, Bytes::from_static(END_MARKER))
             .await
             .map_err(|e| e.to_string())
@@ -881,6 +1153,27 @@ impl UploadResponseService {
             return Some(0);
         }
         self.response_cache.last(stream_idx)
+    }
+
+    /// Get last slot index for a named stage stream.
+    pub async fn stage_last(&self, stream_id: u64, stage: &str) -> Option<usize> {
+        let stream_idx = self.stream_idx(stream_id)?;
+        let lane = self.get_stage_lane(stage).await?;
+        if !lane.started[stream_idx].load(Ordering::SeqCst) {
+            return Some(0);
+        }
+        lane.cache.last(stream_idx)
+    }
+
+    /// Get raw bytes from a named stage stream slot.
+    pub async fn stage_get(&self, stream_id: u64, stage: &str, slot_id: usize) -> Option<Bytes> {
+        let stream_idx = self.stream_idx(stream_id)?;
+        let lane = self.get_stage_lane(stage).await?;
+        if !lane.started[stream_idx].load(Ordering::SeqCst) {
+            return None;
+        }
+        let (bytes, _hash) = lane.cache.get(stream_idx, slot_id).await?;
+        Some(bytes)
     }
 
     /// Get raw bytes from response stream slot
@@ -1025,14 +1318,16 @@ impl UploadResponseRouter {
     }
 
     fn format_stream_info(info: &ActiveStreamInfo) -> String {
+        let stages = serde_json::to_string(&info.stages).unwrap_or_else(|_| "{}".to_string());
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             info.stream_id,
             info.stream_idx,
             info.request_last,
             info.response_last,
             info.reader_count,
-            info.response_owner.as_deref().unwrap_or("-")
+            info.response_owner.as_deref().unwrap_or("-"),
+            stages
         )
     }
 
@@ -1057,7 +1352,7 @@ impl UploadResponseRouter {
         match (method.as_str(), path_parts.as_slice()) {
             ("GET", ["_upload_response", "streams"]) => {
                 let mut lines = vec![
-                    "stream_id\tstream_idx\trequest_last\tresponse_last\treaders\tresponse_owner"
+                    "stream_id\tstream_idx\trequest_last\tresponse_last\treaders\tresponse_owner\tstages_json"
                         .to_string(),
                 ];
                 for info in self.service.active_streams().await {
@@ -1130,6 +1425,16 @@ impl UploadResponseRouter {
                     )),
                 }
             }
+            ("GET", ["_upload_response", "streams", stream_id, "stages", stage, "last"]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                match self.service.stage_last(stream_id, stage).await {
+                    Some(last) => Ok(Self::text_response(StatusCode::OK, last.to_string())),
+                    None => Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream or stage not found",
+                    )),
+                }
+            }
             ("GET", ["_upload_response", "streams", stream_id, "request", "slots", slot_id]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
                 let slot_id = Self::parse_usize_component(slot_id, "slot_id")?;
@@ -1158,6 +1463,28 @@ impl UploadResponseRouter {
                             Some("headers")
                         } else if UploadResponseService::is_end_marker(&bytes) {
                             Some("end")
+                        } else {
+                            Some("body")
+                        };
+                        Ok(Self::binary_response(StatusCode::OK, bytes, slot_type))
+                    }
+                    None => Ok(Self::text_response(StatusCode::NOT_FOUND, "slot not found")),
+                }
+            }
+            (
+                "GET",
+                ["_upload_response", "streams", stream_id, "stages", stage, "slots", slot_id],
+            ) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                let slot_id = Self::parse_usize_component(slot_id, "slot_id")?;
+                match self.service.stage_get(stream_id, stage, slot_id).await {
+                    Some(bytes) => {
+                        let slot_type = if slot_id == 1 {
+                            Some("head")
+                        } else if UploadResponseService::is_end_marker(&bytes) {
+                            Some("end")
+                        } else if let Some(control) = decode_request_control(&bytes) {
+                            Some(control.as_slot_type())
                         } else {
                             Some("body")
                         };
@@ -1238,6 +1565,119 @@ impl UploadResponseRouter {
                     StatusCode::CONFLICT
                 };
                 Ok(Self::text_response(status, "ok"))
+            }
+            (
+                "PUT",
+                ["_upload_response", "streams", stream_id, "stages", stage, "claim", worker_id],
+            ) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
+                }
+                if self
+                    .service
+                    .try_claim_stage(stream_id, stage, worker_id)
+                    .await
+                {
+                    Ok(Self::text_response(StatusCode::OK, "claimed"))
+                } else {
+                    let owner = self
+                        .service
+                        .stage_owner(stream_id, stage)
+                        .await
+                        .unwrap_or_else(|| "-".to_string());
+                    Ok(Self::text_response(
+                        StatusCode::CONFLICT,
+                        format!("already claimed by {owner}"),
+                    ))
+                }
+            }
+            (
+                "DELETE",
+                ["_upload_response", "streams", stream_id, "stages", stage, "claim", worker_id],
+            ) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
+                }
+                let released = self
+                    .service
+                    .release_stage(stream_id, stage, worker_id)
+                    .await;
+                let status = if released {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                };
+                Ok(Self::text_response(status, "ok"))
+            }
+            ("PUT", ["_upload_response", "streams", stream_id, "stages", stage, "head"]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
+                }
+                let body = Self::collect_body(body).await?;
+                self.service
+                    .write_stage_head(stream_id, stage, body)
+                    .await
+                    .map_err(ServerError::Config)?;
+                Ok(Self::text_response(StatusCode::OK, "ok"))
+            }
+            ("PUT", ["_upload_response", "streams", stream_id, "stages", stage, "body"]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
+                }
+                let body = Self::collect_body(body).await?;
+                self.service
+                    .append_stage_body(stream_id, stage, body)
+                    .await
+                    .map_err(ServerError::Config)?;
+                Ok(Self::text_response(StatusCode::OK, "ok"))
+            }
+            ("PUT", ["_upload_response", "streams", stream_id, "stages", stage, "control"]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
+                }
+                let body = Self::collect_body(body).await?;
+                let control = decode_request_control(&body).ok_or_else(|| {
+                    ServerError::Config("expected encoded stage control marker".to_string())
+                })?;
+                self.service
+                    .append_stage_control(stream_id, stage, control)
+                    .await
+                    .map_err(ServerError::Config)?;
+                Ok(Self::text_response(StatusCode::OK, "ok"))
+            }
+            ("PUT", ["_upload_response", "streams", stream_id, "stages", stage, "end"]) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
+                }
+                self.service
+                    .end_stage(stream_id, stage)
+                    .await
+                    .map_err(ServerError::Config)?;
+                Ok(Self::text_response(StatusCode::OK, "ok"))
             }
             ("PUT", ["_upload_response", "streams", stream_id, "response", "headers"]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
@@ -1603,6 +2043,19 @@ pub enum TailSlot {
     End,
 }
 
+/// Slot content for workers tailing a named intermediate stage stream.
+#[derive(Debug, Clone)]
+pub enum StageTailSlot {
+    /// Slot 1: opaque stage head bytes
+    Head(Bytes),
+    /// Stage control marker embedded after the head slot.
+    Control(RequestControl),
+    /// Slots 2..N-1: opaque stage body bytes
+    Body(Bytes),
+    /// Final slot: end marker
+    End,
+}
+
 impl UploadResponseService {
     /// Tail a request stream slot by slot.
     ///
@@ -1642,6 +2095,31 @@ impl UploadResponseService {
         } else {
             Some(TailSlot::Body(bytes))
         }
+    }
+
+    /// Tail a named stage stream slot by slot.
+    pub async fn tail_stage(
+        &self,
+        stream_id: u64,
+        stage: &str,
+        slot_id: usize,
+    ) -> Option<StageTailSlot> {
+        let bytes = self.stage_get(stream_id, stage, slot_id).await?;
+
+        if slot_id == 1 {
+            Some(StageTailSlot::Head(bytes))
+        } else if Self::is_end_marker(&bytes) {
+            Some(StageTailSlot::End)
+        } else if let Some(control) = decode_request_control(&bytes) {
+            Some(StageTailSlot::Control(control))
+        } else {
+            Some(StageTailSlot::Body(bytes))
+        }
+    }
+
+    /// Return the opaque stage head from slot 1.
+    pub async fn get_stage_head(&self, stream_id: u64, stage: &str) -> Option<Bytes> {
+        self.stage_get(stream_id, stage, 1).await
     }
 
     /// Parse response headers from slot 1
@@ -1952,6 +2430,7 @@ mod tests {
             .upsert_worker_heartbeat(
                 "worker-a",
                 WorkerHeartbeatUpdate {
+                    stage: "processing".to_string(),
                     max_inflight: 4,
                     inflight: 1,
                     available_slots: 3,
@@ -1962,6 +2441,7 @@ mod tests {
             .upsert_worker_heartbeat(
                 "worker-b",
                 WorkerHeartbeatUpdate {
+                    stage: "response".to_string(),
                     max_inflight: 2,
                     inflight: 2,
                     available_slots: 0,
@@ -1972,7 +2452,9 @@ mod tests {
         let workers = service.list_workers(None).await;
         assert_eq!(workers.len(), 2);
         assert_eq!(workers[0].worker_id, "worker-a");
+        assert_eq!(workers[0].stage, "processing");
         assert_eq!(workers[1].worker_id, "worker-b");
+        assert_eq!(workers[1].stage, "response");
 
         let summary = service.worker_capacity_summary(None).await;
         assert_eq!(summary.workers, 2);
@@ -1989,6 +2471,7 @@ mod tests {
             .upsert_worker_heartbeat(
                 "worker-a",
                 WorkerHeartbeatUpdate {
+                    stage: "processing".to_string(),
                     max_inflight: 2,
                     inflight: 0,
                     available_slots: 2,
