@@ -434,7 +434,7 @@ Read:  22.1M ops/s
 Write: 22K ops/s (concurrent with reads)
 ```
 
-The `ChunkCache` scales to very high read fan-out because it uses:
+The shared-memory [`ChunkCache`](https://github.com/wavey-ai/playlists) scales to very high read fan-out because it uses:
 
 - Pre-allocated ring buffers with no per-write allocation
 - Per-slot `RwLock` instead of a global lock
