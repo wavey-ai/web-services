@@ -389,7 +389,7 @@ impl RemoteIngressClient {
             .map_err(|error| anyhow!("failed to claim response for {stream_id}: {error}"))?;
         match response.status() {
             StatusCode::OK | StatusCode::CREATED => Ok(true),
-            StatusCode::CONFLICT => Ok(false),
+            StatusCode::CONFLICT | StatusCode::NOT_FOUND => Ok(false),
             status => {
                 let body = response.text().await.unwrap_or_default();
                 Err(anyhow!(
@@ -438,7 +438,7 @@ impl RemoteIngressClient {
             .map_err(|error| anyhow!("failed to claim stage {stage} for {stream_id}: {error}"))?;
         match response.status() {
             StatusCode::OK | StatusCode::CREATED => Ok(true),
-            StatusCode::CONFLICT => Ok(false),
+            StatusCode::CONFLICT | StatusCode::NOT_FOUND => Ok(false),
             status => {
                 let body = response.text().await.unwrap_or_default();
                 Err(anyhow!(
