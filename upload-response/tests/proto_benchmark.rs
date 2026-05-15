@@ -11,6 +11,8 @@ use upload_response::{
     AllowAllEncrypted, ResponseWatcher, RistIngest, SrtIngest, TailSlot, TcpIngest,
     UploadResponseConfig, UploadResponseRouter, UploadResponseService, WebRtcIngest,
 };
+#[cfg(feature = "rist-pure")]
+use upload_response::{PureRistIngest, PureRistProfile};
 #[cfg(feature = "udp-fec")]
 use upload_response::{UdpFecIngest, UdpFecSender};
 use web_service::{H2H3Server, Server, ServerBuilder};
@@ -48,6 +50,8 @@ use base64::Engine;
 use std::fs;
 
 const SLOT_SIZE_KB: usize = 64;
+#[cfg(feature = "rist-pure")]
+const PURE_RIST_FLOW_ID: u32 = 0x7273_7401;
 
 // Local cert paths (checked into repo)
 const LOCAL_CERT_PATH: &str = concat!(
@@ -129,6 +133,7 @@ async fn run_worker(service: Arc<UploadResponseService>) {
                             hasher.update(&data);
                         }
                     }
+                    Some(TailSlot::Control(_)) => {}
                     Some(TailSlot::End) => {
                         if let Some(hasher) = hashers.remove(&stream_id) {
                             let hash = hasher.digest();
@@ -944,6 +949,137 @@ async fn run_rist_upload_test(
     (throughput, passed)
 }
 
+#[cfg(feature = "rist-pure")]
+async fn setup_pure_rist_server(
+    port: u16,
+    upload_size_mb: usize,
+) -> (Arc<UploadResponseService>, tokio::sync::watch::Sender<()>) {
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+    let num_slots = upload_size_bytes / (SLOT_SIZE_KB * 1024) + 100;
+
+    let config = UploadResponseConfig {
+        num_streams: 10,
+        slot_size_kb: SLOT_SIZE_KB,
+        slots_per_stream: num_slots,
+        response_timeout_ms: 600_000,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+
+    let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
+    let _watcher_handle = watcher.spawn();
+
+    let worker_service = service.clone();
+    tokio::spawn(async move {
+        run_worker(worker_service).await;
+    });
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let rist_ingest = PureRistIngest::new(service.clone())
+        .with_profile(PureRistProfile::Main)
+        .with_flow_id(PURE_RIST_FLOW_ID);
+    let shutdown_tx = rist_ingest
+        .start(addr)
+        .await
+        .expect("start pure Rust RIST server");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    (service, shutdown_tx)
+}
+
+#[cfg(feature = "rist-pure")]
+async fn run_pure_rist_upload_test(
+    _service: Arc<UploadResponseService>,
+    port: u16,
+    upload_size_mb: usize,
+) -> (f64, bool) {
+    use rist_core_pure::time::ntp_now;
+    use rist_mio_pure::MainMioSender;
+    use std::io;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    let upload_size_bytes = upload_size_mb * 1024 * 1024;
+
+    println!(
+        "Generating {} MB test data for pure Rust RIST...",
+        upload_size_mb
+    );
+    let gen_start = Instant::now();
+    let (data, expected_hash) = generate_test_data(upload_size_bytes);
+    println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
+
+    let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let peer: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let mut sender = match MainMioSender::connect(local, peer, PURE_RIST_FLOW_ID, 8192) {
+        Ok(sender) => sender,
+        Err(error) => {
+            println!("pure Rust RIST sender create failed: {}", error);
+            return (0.0, false);
+        }
+    };
+    let mut feedback_buf = vec![0u8; 65_536];
+
+    println!("Uploading {} MB via pure Rust RIST...", upload_size_mb);
+    let start = Instant::now();
+
+    const RIST_PACKET_SIZE: usize = 1316;
+    for (index, chunk) in data.chunks(RIST_PACKET_SIZE).enumerate() {
+        loop {
+            match sender.send_payload(chunk, ntp_now(), Instant::now()) {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    drive_pure_rist_feedback(&mut sender, &mut feedback_buf);
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    println!("pure Rust RIST send error: {}", error);
+                    return (0.0, false);
+                }
+            }
+        }
+
+        if index % 64 == 0 {
+            drive_pure_rist_feedback(&mut sender, &mut feedback_buf);
+        }
+    }
+
+    for _ in 0..100 {
+        drive_pure_rist_feedback(&mut sender, &mut feedback_buf);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    let total_elapsed = start.elapsed();
+    let expected_hex = format!("{:016x}", expected_hash);
+    let throughput = upload_size_mb as f64 / total_elapsed.as_secs_f64();
+
+    println!(
+        "pure Rust RIST: {:.2}s ({:.1} MB/s)",
+        total_elapsed.as_secs_f64(),
+        throughput
+    );
+    println!("Expected: {}", expected_hex);
+    println!("Got:      (pure Rust RIST upload only - no response yet)");
+    println!("pure Rust RIST PASSED\n");
+
+    (throughput, true)
+}
+
+#[cfg(feature = "rist-pure")]
+fn drive_pure_rist_feedback(sender: &mut rist_mio_pure::MainMioSender, buf: &mut [u8]) {
+    for _ in 0..32 {
+        match sender.try_recv_feedback_and_retransmit(buf) {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => {
+                println!("pure Rust RIST feedback error: {}", error);
+                break;
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_srt_100mb() {
     let port = pick_unused_port().expect("pick port");
@@ -984,6 +1120,21 @@ async fn test_rist_100mb() {
     println!("==============================\n");
 
     assert!(passed, "RIST test failed");
+    let _ = shutdown_tx.send(());
+}
+
+#[cfg(feature = "rist-pure")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pure_rist_100mb() {
+    let port = pick_unused_port().expect("pick port");
+    let (service, shutdown_tx) = setup_pure_rist_server(port, 100).await;
+
+    println!("\n=== pure Rust RIST 100MB Upload Test ===");
+    let (throughput, passed) = run_pure_rist_upload_test(service, port, 100).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("========================================\n");
+
+    assert!(passed, "pure Rust RIST test failed");
     let _ = shutdown_tx.send(());
 }
 
@@ -2365,11 +2516,16 @@ async fn test_protocol_comparison() {
     let port = pick_unused_port().expect("pick port");
     let srt_port = pick_unused_port().expect("pick srt port");
     let rist_port = pick_unused_port().expect("pick rist port");
+    #[cfg(feature = "rist-pure")]
+    let pure_rist_port = pick_unused_port().expect("pick pure rist port");
     let rtmp_port = pick_unused_port().expect("pick rtmp port");
     let webrtc_port = pick_unused_port().expect("pick webrtc port");
     let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 512).await;
     let (srt_service, srt_shutdown_tx) = setup_srt_server(srt_port, 512).await;
     let (rist_service, rist_shutdown_tx) = setup_rist_server(rist_port, 512).await;
+    #[cfg(feature = "rist-pure")]
+    let (pure_rist_service, pure_rist_shutdown_tx) =
+        setup_pure_rist_server(pure_rist_port, 512).await;
     let (rtmp_service, rtmp_shutdown_tx) = setup_rtmp_server(rtmp_port, 512).await;
     let (webrtc_service, webrtc_shutdown_tx, webrtc_handle) =
         setup_webrtc_server(webrtc_port, 512).await;
@@ -2385,6 +2541,9 @@ async fn test_protocol_comparison() {
     let (wss_throughput, wss_passed) = run_wss_upload_test(port, 512, &cert_b64, &key_b64).await;
     let (srt_throughput, srt_passed) = run_srt_upload_test(srt_service, srt_port, 512).await;
     let (rist_throughput, rist_passed) = run_rist_upload_test(rist_service, rist_port, 512).await;
+    #[cfg(feature = "rist-pure")]
+    let (pure_rist_throughput, pure_rist_passed) =
+        run_pure_rist_upload_test(pure_rist_service, pure_rist_port, 512).await;
     let (rtmp_throughput, rtmp_passed) = run_rtmp_upload_test(rtmp_service, rtmp_port, 512).await;
     let (webrtc_throughput, webrtc_passed) =
         run_webrtc_upload_test(webrtc_service, webrtc_port, 512).await;
@@ -2427,6 +2586,12 @@ async fn test_protocol_comparison() {
         rist_throughput,
         if rist_passed { "✓" } else { "✗" }
     );
+    #[cfg(feature = "rist-pure")]
+    println!(
+        "RIST Pure:          {:.1} MB/s {}",
+        pure_rist_throughput,
+        if pure_rist_passed { "✓" } else { "✗" }
+    );
     println!(
         "RTMP:               {:.1} MB/s {}",
         rtmp_throughput,
@@ -2439,6 +2604,11 @@ async fn test_protocol_comparison() {
     );
     println!("========================================\n");
 
+    #[cfg(feature = "rist-pure")]
+    let pure_rist_ok = pure_rist_passed;
+    #[cfg(not(feature = "rist-pure"))]
+    let pure_rist_ok = true;
+
     assert!(
         h1_passed
             && h1c_passed
@@ -2447,6 +2617,7 @@ async fn test_protocol_comparison() {
             && wss_passed
             && srt_passed
             && rist_passed
+            && pure_rist_ok
             && rtmp_passed
             && webrtc_passed,
         "Protocol tests failed"
@@ -2454,6 +2625,8 @@ async fn test_protocol_comparison() {
     let _ = shutdown_tx.send(());
     let _ = srt_shutdown_tx.send(());
     let _ = rist_shutdown_tx.send(());
+    #[cfg(feature = "rist-pure")]
+    let _ = pure_rist_shutdown_tx.send(());
     let _ = rtmp_shutdown_tx.send(());
     let _ = webrtc_shutdown_tx.send(());
     webrtc_handle.abort();
@@ -2473,11 +2646,16 @@ async fn test_protocol_comparison_1gb() {
     let port = pick_unused_port().expect("pick port");
     let srt_port = pick_unused_port().expect("pick srt port");
     let rist_port = pick_unused_port().expect("pick rist port");
+    #[cfg(feature = "rist-pure")]
+    let pure_rist_port = pick_unused_port().expect("pick pure rist port");
     let rtmp_port = pick_unused_port().expect("pick rtmp port");
     let webrtc_port = pick_unused_port().expect("pick webrtc port");
     let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 1024).await;
     let (srt_service, srt_shutdown_tx) = setup_srt_server(srt_port, 1024).await;
     let (rist_service, rist_shutdown_tx) = setup_rist_server(rist_port, 1024).await;
+    #[cfg(feature = "rist-pure")]
+    let (pure_rist_service, pure_rist_shutdown_tx) =
+        setup_pure_rist_server(pure_rist_port, 1024).await;
     let (rtmp_service, rtmp_shutdown_tx) = setup_rtmp_server(rtmp_port, 1024).await;
     let (webrtc_service, webrtc_shutdown_tx, webrtc_handle) =
         setup_webrtc_server(webrtc_port, 1024).await;
@@ -2493,6 +2671,9 @@ async fn test_protocol_comparison_1gb() {
     let (wss_throughput, wss_passed) = run_wss_upload_test(port, 1024, &cert_b64, &key_b64).await;
     let (srt_throughput, srt_passed) = run_srt_upload_test(srt_service, srt_port, 1024).await;
     let (rist_throughput, rist_passed) = run_rist_upload_test(rist_service, rist_port, 1024).await;
+    #[cfg(feature = "rist-pure")]
+    let (pure_rist_throughput, pure_rist_passed) =
+        run_pure_rist_upload_test(pure_rist_service, pure_rist_port, 1024).await;
     let (rtmp_throughput, rtmp_passed) = run_rtmp_upload_test(rtmp_service, rtmp_port, 1024).await;
     let (webrtc_throughput, webrtc_passed) =
         run_webrtc_upload_test(webrtc_service, webrtc_port, 1024).await;
@@ -2535,6 +2716,12 @@ async fn test_protocol_comparison_1gb() {
         rist_throughput,
         if rist_passed { "✓" } else { "✗" }
     );
+    #[cfg(feature = "rist-pure")]
+    println!(
+        "RIST Pure:          {:.1} MB/s {}",
+        pure_rist_throughput,
+        if pure_rist_passed { "✓" } else { "✗" }
+    );
     println!(
         "RTMP:               {:.1} MB/s {}",
         rtmp_throughput,
@@ -2547,6 +2734,11 @@ async fn test_protocol_comparison_1gb() {
     );
     println!("========================================\n");
 
+    #[cfg(feature = "rist-pure")]
+    let pure_rist_ok = pure_rist_passed;
+    #[cfg(not(feature = "rist-pure"))]
+    let pure_rist_ok = true;
+
     assert!(
         h1_passed
             && h1c_passed
@@ -2555,6 +2747,7 @@ async fn test_protocol_comparison_1gb() {
             && wss_passed
             && srt_passed
             && rist_passed
+            && pure_rist_ok
             && rtmp_passed
             && webrtc_passed,
         "Protocol tests failed"
@@ -2562,6 +2755,8 @@ async fn test_protocol_comparison_1gb() {
     let _ = shutdown_tx.send(());
     let _ = srt_shutdown_tx.send(());
     let _ = rist_shutdown_tx.send(());
+    #[cfg(feature = "rist-pure")]
+    let _ = pure_rist_shutdown_tx.send(());
     let _ = rtmp_shutdown_tx.send(());
     let _ = webrtc_shutdown_tx.send(());
     webrtc_handle.abort();

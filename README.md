@@ -66,12 +66,15 @@ The shared-memory `ChunkCache` and slot-based streaming architecture are inspire
 | WebSocket | TCP | TLS | Bearer | Binary frames |
 | WebRTC | UDP | DTLS | Signaling | Data channels, P2P capable |
 | SRT | UDP | AES-128 | Stream ID | Reliable UDP, media ingest |
-| RIST | UDP | DTLS/PSK | URL params | Reliable UDP, broadcast ingest |
+| RIST | UDP | DTLS/PSK | URL params | Reliable UDP, broadcast ingest via librist C wrapper |
+| RIST Pure | UDP | PSK/SRP support in progress | Socket addr | Pure Rust `rist-core`/`rist-mio` ingest |
 | RTMP | TCP | None | Stream key | Plain TCP, media ingest |
 | RTMPS | TCP | TLS | Stream key | TLS-wrapped RTMP |
 | UDP+FEC | UDP | None | None | RaptorQ FEC, lowest-latency reliable delivery |
 
-Some protocols require optional crate features such as `srt`, `rist`, `webrtc`, or `udp-fec`. The default feature set only enables `tcp`.
+Some protocols require optional crate features such as `srt`, `rist`, `rist-pure`, `webrtc`, or `udp-fec`. The default feature set only enables `tcp`.
+
+The `rist` feature keeps the existing librist/C-wrapper backend. The `rist-pure` feature adds `PureRistIngest`, backed by the pure Rust `rist-core` and `rist-mio` crates from `wavey-ai/rist-rs`.
 
 ### Architecture
 
@@ -303,7 +306,7 @@ async fn write_response(
 
 ### Performance
 
-Benchmarks below were captured on Apple Silicon in release mode.
+Benchmarks below were captured on Apple M1 in release mode.
 
 #### Slot Size Throughput
 
@@ -335,6 +338,7 @@ Latency characteristics for streaming and real-time delivery, such as audio fram
 | WebRTC | DTLS, SCTP, and NACK retransmit | ~50-150 ms |
 | SRT | ARQ retransmit on loss adds at least one RTT | ~120-200 ms |
 | RIST | Same retransmit model as SRT | ~100-200 ms |
+| RIST Pure | Same retransmit model as RIST, no librist FFI boundary | ~100-200 ms |
 | TCP/TLS | Head-of-line blocking and Nagle effects | Unpredictable |
 | HTTP/1.1 | TCP HOL plus framing overhead | Worse than TCP |
 | HTTP/2 | Multiplexing plus HOL at the TCP layer | Worse than TCP |
@@ -353,22 +357,23 @@ let sender = UdpFecSender::new(target)
 
 #### Protocol Throughput
 
-Benchmarked on Apple Silicon, `--release`, `512 MB` upload:
+Benchmarked on Apple M1, `--release`, loopback, May 15, 2026:
 
-| Protocol | Throughput | Notes |
-| --- | --- | --- |
-| WebSocket | 1244 MB/s | Binary frames |
-| HTTP/1.1 (chunked) | 1053 MB/s | Streaming without `Content-Length` |
-| HTTP/2 | 798 MB/s | Multiplexed streams |
-| RTMP | 604 MB/s | Plain TCP, access-unit serialization |
-| WebRTC | 580 MB/s | DTLS, SCTP data channels |
-| HTTP/1.1 | 551 MB/s | Requires `Content-Length` |
-| HTTP/3 | 199 MB/s | QUIC encryption overhead |
-| SRT | 125 MB/s | AES-128, reliable UDP with ARQ |
-| RIST | 105 MB/s | Main profile, reliable UDP |
-| UDP+FEC | 49 MB/s | RaptorQ encode/decode bound, fixed-latency reliable delivery |
+| Protocol | 512 MB | 1 GB | Notes |
+| --- | ---: | ---: | --- |
+| HTTP/1.1 (chunked) | 743.1 MB/s | 707.1 MB/s | Streaming without `Content-Length` |
+| WebSocket | 640.3 MB/s | 676.7 MB/s | Binary frames |
+| HTTP/1.1 | 553.9 MB/s | 417.1 MB/s | Requires `Content-Length` |
+| WebRTC | 527.2 MB/s | 418.6 MB/s | DTLS, SCTP data channels |
+| RTMP | 524.9 MB/s | 253.2 MB/s | Plain TCP, access-unit serialization |
+| HTTP/2 | 476.7 MB/s | 334.2 MB/s | Multiplexed streams |
+| RIST Pure | 234.7 MB/s | 246.2 MB/s | Pure Rust main profile, reliable UDP |
+| HTTP/3 | 154.1 MB/s | 157.1 MB/s | QUIC encryption overhead |
+| SRT | 133.1 MB/s | 132.6 MB/s | AES-128, reliable UDP with ARQ |
+| RIST | 87.1 MB/s | 66.1 MB/s | librist C wrapper, main profile |
+| UDP+FEC | 44.0 MB/s | n/a | RaptorQ encode/decode bound, fixed-latency reliable delivery |
 
-HTTP and WebSocket figures measure end-to-end request/response time. SRT, RTMP, WebRTC, and UDP+FEC figures measure client send completion.
+HTTP and WebSocket figures measure end-to-end request/response time. SRT, RIST, RIST Pure, RTMP, WebRTC, and UDP+FEC figures measure client send completion.
 
 #### UDP+FEC Throughput
 
@@ -378,8 +383,8 @@ UDP+FEC is optimized for latency, not bulk transfer. The RaptorQ codec dominates
 ========================================
     UDP+FEC (RaptorQ) Benchmark  (--release, loopback)
 ========================================
-UDP+FEC 100 MB:          49.2 MB/s
-UDP+FEC loss-recovery:   23.8 MB/s   (20% packet loss, 2 repair symbols)
+UDP+FEC 100 MB:          44.0 MB/s
+UDP+FEC loss-recovery:   20.0 MB/s   (20% packet loss, 2 repair symbols)
 ========================================
 ```
 
@@ -449,17 +454,20 @@ The shared-memory [`ChunkCache`](https://github.com/wavey-ai/playlists) scales t
 cargo test -p upload-response
 
 # Run all protocol benchmarks and print output
-cargo test -p upload-response --release -- --nocapture
+cargo test -p upload-response --release --features "srt,rist,rist-pure,webrtc,tcp,udp-fec" --test proto_benchmark -- --nocapture --test-threads=1
 
 # Specific worker/cache benchmarks
 cargo test -p upload-response --release test_slot_size_benchmark -- --nocapture
 cargo test -p upload-response --release test_gigabyte_upload_benchmark -- --nocapture
 
 # Protocol comparison benchmark
-cargo test -p upload-response --release test_protocol_comparison -- --nocapture
+cargo test -p upload-response --release --features "srt,rist,rist-pure,webrtc,tcp,udp-fec" --test proto_benchmark test_protocol_comparison -- --nocapture --test-threads=1
 
 # UDP+FEC benchmark
-cargo test -p upload-response --release --features "srt,rist,webrtc,tcp,udp-fec" test_udp_fec_benchmark -- --nocapture
+cargo test -p upload-response --release --features "srt,rist,rist-pure,webrtc,tcp,udp-fec" --test proto_benchmark test_udp_fec_benchmark -- --nocapture
+
+# Compile the pure Rust RIST backend
+cargo check -p upload-response --features rist-pure
 ```
 
 ### Dependencies

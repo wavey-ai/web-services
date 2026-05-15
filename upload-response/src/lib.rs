@@ -53,6 +53,11 @@ mod rist;
 #[cfg(feature = "rist")]
 pub use rist::{AllowAllRist, RistAuth, RistIngest};
 
+#[cfg(feature = "rist-pure")]
+mod pure_rist;
+#[cfg(feature = "rist-pure")]
+pub use pure_rist::{AllowAllPureRist, PureRistAuth, PureRistIngest, PureRistProfile};
+
 #[cfg(feature = "webrtc")]
 mod webrtc;
 #[cfg(feature = "webrtc")]

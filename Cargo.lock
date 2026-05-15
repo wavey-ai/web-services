@@ -2384,6 +2384,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78bed444cc8a2160f01cbcf811ef18cac863ad68ae8ca62092e8db51d51c761c"
 dependencies = [
  "libc",
+ "log",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.59.0",
 ]
@@ -2643,6 +2644,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest",
+ "hmac",
 ]
 
 [[package]]
@@ -3198,6 +3200,31 @@ dependencies = [
  "rist-sys",
  "thiserror 2.0.16",
  "tokio",
+]
+
+[[package]]
+name = "rist-core"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/rist-rs.git?branch=pure-rust#d656a3b14cb43af5e1056089f822d79bd064c226"
+dependencies = [
+ "aes",
+ "ctr",
+ "getrandom 0.2.16",
+ "num-bigint",
+ "num-traits",
+ "pbkdf2",
+ "sha2",
+ "thiserror 2.0.16",
+]
+
+[[package]]
+name = "rist-mio"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/rist-rs.git?branch=pure-rust#d656a3b14cb43af5e1056089f822d79bd064c226"
+dependencies = [
+ "mio",
+ "rist-core",
+ "socket2 0.6.0",
 ]
 
 [[package]]
@@ -4529,6 +4556,8 @@ dependencies = [
  "raptorq",
  "reqwest",
  "rist",
+ "rist-core",
+ "rist-mio",
  "rml_rtmp",
  "rtmp-ingress",
  "rustls 0.23.35",
