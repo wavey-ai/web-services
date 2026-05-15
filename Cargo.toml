@@ -1,5 +1,11 @@
 [workspace]
-members = ["web-service", "hls", "chunks", "upload-response"]
+members = [
+    "web-service",
+    "hls",
+    "chunks",
+    "upload-response",
+    "examples/obs-rist-llhls",
+]
 resolver = "3"
 
 [patch."https://github.com/wavey-ai/web-services.git"]

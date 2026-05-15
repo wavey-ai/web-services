@@ -17,6 +17,7 @@
 | --- | --- |
 | [`upload-response/tests`](./upload-response/tests/) | Worker integration tests and protocol throughput benchmarks. |
 | [`web-service/tests`](./web-service/tests/) | Server and proxy benchmarks. |
+| [`examples/obs-rist-llhls`](./examples/obs-rist-llhls/) | OBS RIST ingest with the pure Rust RIST receiver and browser LL-HLS playback through hls.js. |
 | [`tls`](./tls/) | Local TLS material used by tests and local development. |
 | [`pem_to_env.sh`](./pem_to_env.sh) | Helper script for exporting PEM files into environment variables. |
 
@@ -43,6 +44,9 @@ cargo test -p web-service --release --test benchmark -- --benchmark
 
 # Run upload-response tests and print benchmark output
 cargo test -p upload-response --release -- --nocapture
+
+# Run the OBS RIST -> LL-HLS browser playback example
+cargo run -p obs-rist-llhls -- --rist-bind 0.0.0.0:7000 --http-port 9444
 ```
 
 For local TLS-based tests, the repo also includes certificates under [`tls/local.wavey.ai`](./tls/local.wavey.ai/).

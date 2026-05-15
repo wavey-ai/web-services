@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OBS RIST LL-HLS</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="player">
+        <video id="video" autoplay muted playsinline controls></video>
+      </section>
+      <aside class="metrics">
+        <header>
+          <h1>OBS RIST LL-HLS</h1>
+          <span id="state" class="state">waiting</span>
+        </header>
+        <dl>
+          <div>
+            <dt>Latency</dt>
+            <dd id="latency">-</dd>
+          </div>
+          <div>
+            <dt>Ingest</dt>
+            <dd id="rate">-</dd>
+          </div>
+          <div>
+            <dt>RIST Packets</dt>
+            <dd id="packets">0</dd>
+          </div>
+          <div>
+            <dt>Cached Parts</dt>
+            <dd id="parts">0</dd>
+          </div>
+          <div>
+            <dt>Packet Age</dt>
+            <dd id="age">-</dd>
+          </div>
+          <div>
+            <dt>Recovered</dt>
+            <dd id="recovered">0</dd>
+          </div>
+        </dl>
+      </aside>
+    </main>
+    <script src="/hls.min.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
