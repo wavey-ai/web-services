@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -256,6 +256,8 @@ struct StageLane {
     cache: Arc<ChunkCache>,
     started: Vec<AtomicBool>,
     claims: Arc<RwLock<Vec<Option<String>>>>,
+    reader_positions: Arc<RwLock<Vec<HashMap<String, usize>>>>,
+    reader_notifies: Vec<Arc<Notify>>,
 }
 
 impl StageLane {
@@ -270,6 +272,8 @@ impl StageLane {
             cache,
             started,
             claims: Arc::new(RwLock::new(claims)),
+            reader_positions: new_reader_positions(config.num_streams),
+            reader_notifies: new_reader_notifies(config.num_streams),
         }
     }
 
@@ -282,9 +286,26 @@ impl StageLane {
 
     async fn clear_slot_state(&self, stream_idx: usize) {
         self.started[stream_idx].store(false, Ordering::SeqCst);
-        let mut claims = self.claims.write().await;
-        claims[stream_idx] = None;
+        {
+            let mut claims = self.claims.write().await;
+            claims[stream_idx] = None;
+        }
+        {
+            let mut positions = self.reader_positions.write().await;
+            positions[stream_idx].clear();
+        }
+        self.reader_notifies[stream_idx].notify_waiters();
     }
+}
+
+fn new_reader_positions(num_streams: usize) -> Arc<RwLock<Vec<HashMap<String, usize>>>> {
+    Arc::new(RwLock::new(
+        (0..num_streams).map(|_| HashMap::new()).collect(),
+    ))
+}
+
+fn new_reader_notifies(num_streams: usize) -> Vec<Arc<Notify>> {
+    (0..num_streams).map(|_| Arc::new(Notify::new())).collect()
 }
 
 /// RAII handle for an active upload-response stream.
@@ -352,6 +373,8 @@ pub struct UploadResponseService {
     response_started: Vec<AtomicBool>,
     /// Per-stream worker sets: which worker IDs are reading/processing each stream
     stream_workers: Arc<RwLock<Vec<std::collections::HashSet<String>>>>,
+    request_reader_positions: Arc<RwLock<Vec<HashMap<String, usize>>>>,
+    request_reader_notifies: Vec<Arc<Notify>>,
     /// Per-stream response claim: None = unclaimed, Some(worker_id) = exclusive write access
     response_claims: Arc<RwLock<Vec<Option<String>>>>,
     /// Worker heartbeat/capacity registry keyed by worker id.
@@ -400,6 +423,8 @@ impl UploadResponseService {
             request_started,
             response_started,
             stream_workers: Arc::new(RwLock::new(stream_workers)),
+            request_reader_positions: new_reader_positions(config.num_streams),
+            request_reader_notifies: new_reader_notifies(config.num_streams),
             response_claims: Arc::new(RwLock::new(response_claims)),
             workers: Arc::new(RwLock::new(HashMap::new())),
             config,
@@ -463,6 +488,125 @@ impl UploadResponseService {
         stages.get(stage).cloned()
     }
 
+    async fn wait_for_reader_capacity(
+        &self,
+        stream_id: u64,
+        stream_idx: usize,
+        next_slot: usize,
+        positions: &Arc<RwLock<Vec<HashMap<String, usize>>>>,
+        notifies: &[Arc<Notify>],
+        lane: &str,
+    ) -> Result<(), String> {
+        let capacity = self.config.slots_per_stream.max(1);
+        if next_slot <= capacity {
+            return Ok(());
+        }
+
+        let overwrite_slot = next_slot - capacity;
+        loop {
+            let notified = notifies[stream_idx].notified();
+            if self.slot_stream_ids[stream_idx].load(Ordering::Acquire) != stream_id {
+                return Err(format!("{lane} stream closed: {stream_id}"));
+            }
+
+            let can_append = {
+                let positions = positions.read().await;
+                let readers = &positions[stream_idx];
+                readers
+                    .values()
+                    .copied()
+                    .min()
+                    .is_some_and(|min_consumed| min_consumed >= overwrite_slot)
+            };
+            if can_append {
+                return Ok(());
+            }
+
+            notified.await;
+        }
+    }
+
+    async fn append_cache_with_backpressure(
+        &self,
+        stream_id: u64,
+        stream_idx: usize,
+        cache: &ChunkCache,
+        positions: &Arc<RwLock<Vec<HashMap<String, usize>>>>,
+        notifies: &[Arc<Notify>],
+        lane: &str,
+        data: Bytes,
+    ) -> Result<(), String> {
+        let next_slot = cache.last(stream_idx).unwrap_or(0) + 1;
+        self.wait_for_reader_capacity(stream_id, stream_idx, next_slot, positions, notifies, lane)
+            .await?;
+        cache
+            .add(stream_idx, next_slot, data)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn register_stream_reader(
+        &self,
+        stream_id: u64,
+        worker_id: &str,
+    ) -> Option<(usize, bool)> {
+        let stream_idx = self.stream_idx(stream_id)?;
+        let mut workers = self.stream_workers.write().await;
+        let inserted = workers[stream_idx].insert(worker_id.to_string());
+        if inserted {
+            self.stream_worker_counts[stream_idx].fetch_add(1, Ordering::SeqCst);
+        }
+        Some((stream_idx, inserted))
+    }
+
+    async fn register_lane_reader(
+        &self,
+        stream_id: u64,
+        stream_idx: usize,
+        worker_id: &str,
+        positions: &Arc<RwLock<Vec<HashMap<String, usize>>>>,
+        notifies: &[Arc<Notify>],
+        lane: &str,
+    ) {
+        let mut positions = positions.write().await;
+        positions[stream_idx]
+            .entry(worker_id.to_string())
+            .or_insert(0);
+        debug!(stream_id, worker_id, lane, "Reader registered");
+        notifies[stream_idx].notify_waiters();
+    }
+
+    async fn mark_lane_reader_position(
+        &self,
+        stream_id: u64,
+        worker_id: &str,
+        slot_id: usize,
+        positions: &Arc<RwLock<Vec<HashMap<String, usize>>>>,
+        notifies: &[Arc<Notify>],
+        lane: &str,
+    ) -> bool {
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        let advanced = {
+            let mut positions = positions.write().await;
+            let Some(position) = positions[stream_idx].get_mut(worker_id) else {
+                return false;
+            };
+            if slot_id > *position {
+                *position = slot_id;
+                true
+            } else {
+                false
+            }
+        };
+        if advanced {
+            debug!(stream_id, worker_id, slot_id, lane, "Reader advanced");
+            notifies[stream_idx].notify_waiters();
+        }
+        true
+    }
+
     pub async fn stage_names(&self) -> Vec<String> {
         let stages = self.stages.read().await;
         let mut names: Vec<_> = stages.keys().cloned().collect();
@@ -509,6 +653,11 @@ impl UploadResponseService {
             let mut workers = self.stream_workers.write().await;
             workers[stream_idx].clear();
         }
+        {
+            let mut positions = self.request_reader_positions.write().await;
+            positions[stream_idx].clear();
+        }
+        self.request_reader_notifies[stream_idx].notify_waiters();
         self.stream_worker_counts[stream_idx].store(0, Ordering::SeqCst);
         self.request_started[stream_idx].store(false, Ordering::SeqCst);
         self.response_started[stream_idx].store(false, Ordering::SeqCst);
@@ -587,16 +736,95 @@ impl UploadResponseService {
     /// Returns `true` if this worker was newly registered.
     /// Returns `false` if this worker was already registered on this stream.
     pub async fn register_reader(&self, stream_id: u64, worker_id: &str) -> bool {
-        let Some(stream_idx) = self.stream_idx(stream_id) else {
+        self.register_stream_reader(stream_id, worker_id)
+            .await
+            .map(|(_, inserted)| inserted)
+            .unwrap_or(false)
+    }
+
+    /// Register a worker as a request-stream reader.
+    ///
+    /// Request readers drive backpressure for request body producers. Slot `1`
+    /// remains protected until the worker marks it consumed.
+    pub async fn register_request_reader(&self, stream_id: u64, worker_id: &str) -> bool {
+        let Some((stream_idx, inserted)) = self.register_stream_reader(stream_id, worker_id).await
+        else {
             return false;
         };
-        let mut workers = self.stream_workers.write().await;
-        let inserted = workers[stream_idx].insert(worker_id.to_string());
-        if inserted {
-            self.stream_worker_counts[stream_idx].fetch_add(1, Ordering::SeqCst);
-            debug!(stream_id, worker_id, "Reader registered");
-        }
+        self.register_lane_reader(
+            stream_id,
+            stream_idx,
+            worker_id,
+            &self.request_reader_positions,
+            &self.request_reader_notifies,
+            "request",
+        )
+        .await;
         inserted
+    }
+
+    /// Register a worker as a reader of a named stage stream.
+    pub async fn register_stage_reader(
+        &self,
+        stream_id: u64,
+        stage: &str,
+        worker_id: &str,
+    ) -> bool {
+        let Some((stream_idx, inserted)) = self.register_stream_reader(stream_id, worker_id).await
+        else {
+            return false;
+        };
+        let lane = self.get_or_create_stage_lane(stage).await;
+        self.register_lane_reader(
+            stream_id,
+            stream_idx,
+            worker_id,
+            &lane.reader_positions,
+            &lane.reader_notifies,
+            stage,
+        )
+        .await;
+        inserted
+    }
+
+    /// Mark a request-stream slot as consumed by a request reader.
+    pub async fn mark_request_reader_position(
+        &self,
+        stream_id: u64,
+        worker_id: &str,
+        slot_id: usize,
+    ) -> bool {
+        self.mark_lane_reader_position(
+            stream_id,
+            worker_id,
+            slot_id,
+            &self.request_reader_positions,
+            &self.request_reader_notifies,
+            "request",
+        )
+        .await
+    }
+
+    /// Mark a stage-stream slot as consumed by a stage reader.
+    pub async fn mark_stage_reader_position(
+        &self,
+        stream_id: u64,
+        stage: &str,
+        worker_id: &str,
+        slot_id: usize,
+    ) -> bool {
+        let Some(lane) = self.get_stage_lane(stage).await else {
+            return false;
+        };
+        self.mark_lane_reader_position(
+            stream_id,
+            worker_id,
+            slot_id,
+            &lane.reader_positions,
+            &lane.reader_notifies,
+            stage,
+        )
+        .await
     }
 
     /// Unregister a reader worker from a stream.
@@ -612,6 +840,21 @@ impl UploadResponseService {
         if removed {
             self.stream_worker_counts[stream_idx].fetch_sub(1, Ordering::SeqCst);
             debug!(stream_id, worker_id, "Reader unregistered");
+        }
+        {
+            let mut positions = self.request_reader_positions.write().await;
+            positions[stream_idx].remove(worker_id);
+        }
+        self.request_reader_notifies[stream_idx].notify_waiters();
+        {
+            let stages = self.stages.read().await;
+            let lanes: Vec<_> = stages.values().cloned().collect();
+            drop(stages);
+            for lane in lanes {
+                let mut positions = lane.reader_positions.write().await;
+                positions[stream_idx].remove(worker_id);
+                lane.reader_notifies[stream_idx].notify_waiters();
+            }
         }
         removed
     }
@@ -653,6 +896,21 @@ impl UploadResponseService {
         };
         let mut workers = self.stream_workers.write().await;
         workers[stream_idx].clear();
+        {
+            let mut positions = self.request_reader_positions.write().await;
+            positions[stream_idx].clear();
+        }
+        self.request_reader_notifies[stream_idx].notify_waiters();
+        {
+            let stages = self.stages.read().await;
+            let lanes: Vec<_> = stages.values().cloned().collect();
+            drop(stages);
+            for lane in lanes {
+                let mut positions = lane.reader_positions.write().await;
+                positions[stream_idx].clear();
+                lane.reader_notifies[stream_idx].notify_waiters();
+            }
+        }
         self.stream_worker_counts[stream_idx].store(0, Ordering::SeqCst);
         debug!(stream_id, "All readers cleared");
     }
@@ -925,10 +1183,16 @@ impl UploadResponseService {
                 "request headers not written for stream: {stream_id}"
             ));
         }
-        self.request_cache
-            .append(stream_idx, data)
-            .await
-            .map_err(|e| e.to_string())
+        self.append_cache_with_backpressure(
+            stream_id,
+            stream_idx,
+            &self.request_cache,
+            &self.request_reader_positions,
+            &self.request_reader_notifies,
+            "request",
+            data,
+        )
+        .await
     }
 
     /// Append a request control marker after the headers slot.
@@ -945,10 +1209,16 @@ impl UploadResponseService {
                 "request headers not written for stream: {stream_id}"
             ));
         }
-        self.request_cache
-            .append(stream_idx, encode_request_control(control))
-            .await
-            .map_err(|e| e.to_string())
+        self.append_cache_with_backpressure(
+            stream_id,
+            stream_idx,
+            &self.request_cache,
+            &self.request_reader_positions,
+            &self.request_reader_notifies,
+            "request",
+            encode_request_control(control),
+        )
+        .await
     }
 
     /// Write end marker to request stream
@@ -961,10 +1231,16 @@ impl UploadResponseService {
                 "request headers not written for stream: {stream_id}"
             ));
         }
-        self.request_cache
-            .append(stream_idx, Bytes::from_static(END_MARKER))
-            .await
-            .map_err(|e| e.to_string())
+        self.append_cache_with_backpressure(
+            stream_id,
+            stream_idx,
+            &self.request_cache,
+            &self.request_reader_positions,
+            &self.request_reader_notifies,
+            "request",
+            Bytes::from_static(END_MARKER),
+        )
+        .await
     }
 
     /// Write opaque stage head bytes to slot 1 of a named stage stream.
@@ -1006,10 +1282,16 @@ impl UploadResponseService {
         if !lane.started[stream_idx].load(Ordering::SeqCst) {
             return Err(format!("stage head not written for stream: {stream_id}"));
         }
-        lane.cache
-            .append(stream_idx, data)
-            .await
-            .map_err(|e| e.to_string())
+        self.append_cache_with_backpressure(
+            stream_id,
+            stream_idx,
+            &lane.cache,
+            &lane.reader_positions,
+            &lane.reader_notifies,
+            stage,
+            data,
+        )
+        .await
     }
 
     /// Append a stage control marker after the stage head slot.
@@ -1026,10 +1308,16 @@ impl UploadResponseService {
         if !lane.started[stream_idx].load(Ordering::SeqCst) {
             return Err(format!("stage head not written for stream: {stream_id}"));
         }
-        lane.cache
-            .append(stream_idx, encode_request_control(control))
-            .await
-            .map_err(|e| e.to_string())
+        self.append_cache_with_backpressure(
+            stream_id,
+            stream_idx,
+            &lane.cache,
+            &lane.reader_positions,
+            &lane.reader_notifies,
+            stage,
+            encode_request_control(control),
+        )
+        .await
     }
 
     /// Write end marker to a named stage stream.
@@ -1041,10 +1329,16 @@ impl UploadResponseService {
         if !lane.started[stream_idx].load(Ordering::SeqCst) {
             return Err(format!("stage head not written for stream: {stream_id}"));
         }
-        lane.cache
-            .append(stream_idx, Bytes::from_static(END_MARKER))
-            .await
-            .map_err(|e| e.to_string())
+        self.append_cache_with_backpressure(
+            stream_id,
+            stream_idx,
+            &lane.cache,
+            &lane.reader_positions,
+            &lane.reader_notifies,
+            stage,
+            Bytes::from_static(END_MARKER),
+        )
+        .await
     }
 
     /// Write HPKS headers frame to slot 1 of response stream
@@ -1513,6 +1807,88 @@ impl UploadResponseRouter {
                     StatusCode::NO_CONTENT
                 };
                 Ok(Self::text_response(status, "ok"))
+            }
+            (
+                "PUT",
+                ["_upload_response", "streams", stream_id, "request", "readers", worker_id],
+            ) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
+                }
+                let inserted = self
+                    .service
+                    .register_request_reader(stream_id, worker_id)
+                    .await;
+                let status = if inserted {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NO_CONTENT
+                };
+                Ok(Self::text_response(status, "ok"))
+            }
+            (
+                "PUT",
+                ["_upload_response", "streams", stream_id, "request", "readers", worker_id, "slots", slot_id],
+            ) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                let slot_id = Self::parse_usize_component(slot_id, "slot_id")?;
+                if self
+                    .service
+                    .mark_request_reader_position(stream_id, worker_id, slot_id)
+                    .await
+                {
+                    Ok(Self::text_response(StatusCode::OK, "ok"))
+                } else {
+                    Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "reader not found",
+                    ))
+                }
+            }
+            (
+                "PUT",
+                ["_upload_response", "streams", stream_id, "stages", stage, "readers", worker_id],
+            ) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                if self.service.stream_idx(stream_id).is_none() {
+                    return Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "stream not found",
+                    ));
+                }
+                let inserted = self
+                    .service
+                    .register_stage_reader(stream_id, stage, worker_id)
+                    .await;
+                let status = if inserted {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NO_CONTENT
+                };
+                Ok(Self::text_response(status, "ok"))
+            }
+            (
+                "PUT",
+                ["_upload_response", "streams", stream_id, "stages", stage, "readers", worker_id, "slots", slot_id],
+            ) => {
+                let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
+                let slot_id = Self::parse_usize_component(slot_id, "slot_id")?;
+                if self
+                    .service
+                    .mark_stage_reader_position(stream_id, stage, worker_id, slot_id)
+                    .await
+                {
+                    Ok(Self::text_response(StatusCode::OK, "ok"))
+                } else {
+                    Ok(Self::text_response(
+                        StatusCode::NOT_FOUND,
+                        "reader not found",
+                    ))
+                }
             }
             ("DELETE", ["_upload_response", "streams", stream_id, "readers", worker_id]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
@@ -2264,6 +2640,127 @@ mod tests {
 
         let slot3 = service.tail_request(stream_id, 3).await.unwrap();
         assert!(matches!(slot3, TailSlot::End));
+
+        upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_request_backpressure_waits_for_reader_progress() {
+        let config = UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 3,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+
+        let headers = StreamHeaders::Request(StreamRequestHeaders {
+            stream_id,
+            version: http_pack::HttpVersion::Http11,
+            method: b"POST".to_vec(),
+            scheme: None,
+            authority: Some(b"example.com".to_vec()),
+            path: b"/upload".to_vec(),
+            headers: vec![],
+        });
+        service
+            .write_request_headers(stream_id, headers)
+            .await
+            .unwrap();
+        assert!(service.register_request_reader(stream_id, "worker-1").await);
+
+        service
+            .append_request_body(stream_id, Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        service
+            .append_request_body(stream_id, Bytes::from_static(b"b"))
+            .await
+            .unwrap();
+
+        let append_service = Arc::clone(&service);
+        let append = tokio::spawn(async move {
+            append_service
+                .append_request_body(stream_id, Bytes::from_static(b"c"))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!append.is_finished());
+
+        assert!(
+            service
+                .mark_request_reader_position(stream_id, "worker-1", 1)
+                .await
+        );
+        timeout(Duration::from_millis(250), append)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service.request_get(stream_id, 4).await.unwrap(),
+            Bytes::from_static(b"c")
+        );
+
+        upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_stage_backpressure_waits_for_reader_progress() {
+        let config = UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 3,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+
+        service
+            .write_stage_head(stream_id, "pcm", Bytes::from_static(b"head"))
+            .await
+            .unwrap();
+        assert!(
+            service
+                .register_stage_reader(stream_id, "pcm", "worker-1")
+                .await
+        );
+
+        service
+            .append_stage_body(stream_id, "pcm", Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        service
+            .append_stage_body(stream_id, "pcm", Bytes::from_static(b"b"))
+            .await
+            .unwrap();
+
+        let append_service = Arc::clone(&service);
+        let append = tokio::spawn(async move {
+            append_service
+                .append_stage_body(stream_id, "pcm", Bytes::from_static(b"c"))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!append.is_finished());
+
+        assert!(
+            service
+                .mark_stage_reader_position(stream_id, "pcm", "worker-1", 1)
+                .await
+        );
+        timeout(Duration::from_millis(250), append)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service.stage_get(stream_id, "pcm", 4).await.unwrap(),
+            Bytes::from_static(b"c")
+        );
 
         upload_stream.close().await;
     }

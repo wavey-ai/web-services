@@ -351,6 +351,106 @@ impl RemoteIngressClient {
         Ok(())
     }
 
+    pub async fn register_request_reader(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        worker_id: &str,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .put(format!(
+                "{origin}/_upload_response/streams/{stream_id}/request/readers/{worker_id}"
+            ))
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!("failed to register request reader for {stream_id}: {error}")
+            })?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "request reader registration failed for stream {stream_id} with status {}",
+            response.status()
+        );
+        Ok(())
+    }
+
+    pub async fn mark_request_reader_position(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        worker_id: &str,
+        slot_id: usize,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .put(format!(
+                "{origin}/_upload_response/streams/{stream_id}/request/readers/{worker_id}/slots/{slot_id}"
+            ))
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!("failed to mark request reader position for {stream_id}: {error}")
+            })?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "request reader position update failed for stream {stream_id} slot {slot_id} with status {}",
+            response.status()
+        );
+        Ok(())
+    }
+
+    pub async fn register_stage_reader(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        stage: &str,
+        worker_id: &str,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .put(format!(
+                "{origin}/_upload_response/streams/{stream_id}/stages/{stage}/readers/{worker_id}"
+            ))
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!("failed to register stage {stage} reader for {stream_id}: {error}")
+            })?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "stage {stage} reader registration failed for stream {stream_id} with status {}",
+            response.status()
+        );
+        Ok(())
+    }
+
+    pub async fn mark_stage_reader_position(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        stage: &str,
+        worker_id: &str,
+        slot_id: usize,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .put(format!(
+                "{origin}/_upload_response/streams/{stream_id}/stages/{stage}/readers/{worker_id}/slots/{slot_id}"
+            ))
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!("failed to mark stage {stage} reader position for {stream_id}: {error}")
+            })?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "stage {stage} reader position update failed for stream {stream_id} slot {slot_id} with status {}",
+            response.status()
+        );
+        Ok(())
+    }
+
     pub async fn unregister_reader(
         &self,
         origin: &str,
