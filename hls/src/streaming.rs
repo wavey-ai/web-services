@@ -66,10 +66,10 @@ impl StreamingHandler for TailStreamHandler {
 
         loop {
             if let Some((data, _)) = self.get_part_with_timeout(idx, last).await {
-                writer.send_data(data).await.map_err(|e| {
-                    error!("Error sending on stream: {}", e);
-                    ServerError::Handler(Box::new(e))
-                })?;
+                if let Err(e) = writer.send_data(data).await {
+                    info!("tail client disconnected for stream {} [{}]: {}", stream_id, idx, e);
+                    return Ok(());
+                }
                 last += 1;
             } else {
                 sleep(Duration::from_millis(5)).await;
