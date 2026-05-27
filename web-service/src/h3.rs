@@ -9,7 +9,7 @@ use h3::ext::Protocol;
 use h3::server::{Connection, RequestStream};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
 use h3_webtransport::server::WebTransportSession;
-use http::{Method, Response};
+use http::{Method, Response, StatusCode};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
@@ -200,9 +200,11 @@ impl Http3Server {
                 res = endpoint.accept() => {
                     if let Some(new_conn) = res {
                         let router = Arc::clone(&router);
+                        let config = self.config.clone();
                         tokio::spawn(async move {
                             if let Ok(conn) = new_conn.await {
-                                let builder = configure_h3_connection(h3::server::builder(), &Http3Config::default());
+                                let h3_config = Http3Config::from_server_config(&config);
+                                let builder = configure_h3_connection(h3::server::builder(), &h3_config);
                                 if let Ok(h3_conn) = builder.build(h3_quinn::Connection::new(conn)).await {
                                     if let Err(e) = handle_h3_connection(h3_conn, router).await {
                                         tracing::error!("Failed to handle HTTP/3 connection: {}", e);
@@ -243,9 +245,8 @@ async fn handle_h3_connection(
                             .await
                             .map_err(H3Error::Router)?;
                     } else {
-                        return Err(H3Error::Transport(
-                            "No WebTransport handler configured".into(),
-                        ));
+                        send_h3_empty_response(StatusCode::NOT_FOUND, stream).await?;
+                        continue;
                     }
                     return Ok(());
                 }
@@ -400,6 +401,15 @@ impl Default for Http3Config {
     }
 }
 
+impl Http3Config {
+    fn from_server_config(config: &ServerConfig) -> Self {
+        Self {
+            enable_webtransport: config.enable_webtransport,
+            ..Self::default()
+        }
+    }
+}
+
 fn configure_h3_connection(
     mut builder: h3::server::Builder,
     config: &Http3Config,
@@ -412,6 +422,24 @@ fn configure_h3_connection(
         builder.max_webtransport_sessions(config.max_webtransport_sessions);
     }
     builder
+}
+
+async fn send_h3_empty_response(
+    status: StatusCode,
+    mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+) -> Result<(), H3Error> {
+    let response = Response::builder()
+        .status(status)
+        .body(())
+        .map_err(H3Error::Header)?;
+    stream
+        .send_response(response)
+        .await
+        .map_err(|e| H3Error::Transport(e.to_string()))?;
+    stream
+        .finish()
+        .await
+        .map_err(|e| H3Error::Transport(e.to_string()))
 }
 
 fn build_quic_transport_config() -> quinn::TransportConfig {

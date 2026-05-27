@@ -154,10 +154,16 @@ async fn process_stream_request(
         Ok(lease) => lease,
         Err(err) => {
             error!(worker_id, stream_id, "No backend available: {:?}", err);
+            let status = match err {
+                super::pool::AcquireError::NoAvailable | super::pool::AcquireError::QueueFull => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            };
             send_stream_error(
                 &queue,
                 response_tx,
                 stream_id,
+                status,
                 "No backend available".to_string(),
             )
             .await;
@@ -173,6 +179,7 @@ async fn process_stream_request(
                 &queue,
                 response_tx,
                 stream_id,
+                StatusCode::BAD_GATEWAY,
                 "No HTTP client configured".to_string(),
             )
             .await;
@@ -187,6 +194,7 @@ async fn process_stream_request(
                 &queue,
                 response_tx,
                 stream_id,
+                StatusCode::BAD_REQUEST,
                 "Invalid request method".to_string(),
             )
             .await;
@@ -204,6 +212,7 @@ async fn process_stream_request(
                     &queue,
                     response_tx,
                     stream_id,
+                    StatusCode::BAD_REQUEST,
                     "Invalid request path".to_string(),
                 )
                 .await;
@@ -272,6 +281,7 @@ async fn process_stream_request(
                 &queue,
                 response_tx,
                 stream_id,
+                StatusCode::BAD_REQUEST,
                 format!("Failed to build request: {err}"),
             )
             .await;
@@ -293,6 +303,7 @@ async fn process_stream_request(
                 &queue,
                 response_tx,
                 stream_id,
+                StatusCode::BAD_GATEWAY,
                 format!("Backend request failed: {err}"),
             )
             .await;
@@ -331,6 +342,7 @@ async fn process_stream_request(
                     &queue,
                     response_tx,
                     stream_id,
+                    StatusCode::BAD_GATEWAY,
                     format!("Failed to read response body: {err}"),
                 )
                 .await;
@@ -373,9 +385,9 @@ async fn send_stream_error(
     queue: &ProxyQueue,
     response_tx: Option<tokio::sync::oneshot::Sender<Result<(StatusCode, Bytes), String>>>,
     stream_id: u64,
+    status: StatusCode,
     message: String,
 ) {
-    let status = StatusCode::INTERNAL_SERVER_ERROR;
     let body = Bytes::from(message.clone());
 
     let response = Response::builder().status(status).body(());
@@ -406,7 +418,7 @@ async fn send_stream_error(
         .await;
 
     if let Some(tx) = response_tx {
-        let _ = tx.send(Err(message));
+        let _ = tx.send(Ok((status, body)));
     }
 }
 

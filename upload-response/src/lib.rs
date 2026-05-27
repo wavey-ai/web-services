@@ -512,11 +512,12 @@ impl UploadResponseService {
             let can_append = {
                 let positions = positions.read().await;
                 let readers = &positions[stream_idx];
-                readers
-                    .values()
-                    .copied()
-                    .min()
-                    .is_some_and(|min_consumed| min_consumed >= overwrite_slot)
+                readers.is_empty()
+                    || readers
+                        .values()
+                        .copied()
+                        .min()
+                        .is_some_and(|min_consumed| min_consumed >= overwrite_slot)
             };
             if can_append {
                 return Ok(());

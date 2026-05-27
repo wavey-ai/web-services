@@ -42,11 +42,13 @@ impl StreamingHandler for TailStreamHandler {
         let stream_id = parts[0]
             .parse::<u64>()
             .map_err(|_| ServerError::Config("Invalid stream ID".into()))?;
-        let idx = self
-            .chunk_cache
-            .get_stream_idx(stream_id)
-            .await
-            .ok_or(ServerError::Config("Stream not found".into()))?;
+        let requested_idx = usize::try_from(stream_id)
+            .map_err(|_| ServerError::Config("Stream ID cannot fit this platform".into()))?;
+        let idx = match self.chunk_cache.get_stream_idx(stream_id).await {
+            Some(idx) => idx,
+            None if requested_idx < self.chunk_cache.options.num_playlists => requested_idx,
+            None => return Err(ServerError::Config("Stream not found".into())),
+        };
         let mut last = self
             .chunk_cache
             .last(idx)
@@ -186,6 +188,89 @@ async fn handle_transport_session(
     Ok(())
 }
 
+/// WebTransport handler for streams that are already MPEG-TS chunks.
+pub struct RawTsWebTransportHandler {
+    chunk_cache: Arc<ChunkCache>,
+}
+
+impl RawTsWebTransportHandler {
+    pub fn new(chunk_cache: Arc<ChunkCache>) -> Self {
+        Self { chunk_cache }
+    }
+}
+
+#[async_trait]
+impl WebTransportHandler for RawTsWebTransportHandler {
+    async fn handle_session(
+        &self,
+        session: WebTransportSession<QuinnConnection, Bytes>,
+    ) -> HandlerResult<()> {
+        handle_raw_ts_transport_session(session, Arc::clone(&self.chunk_cache)).await
+    }
+}
+
+async fn handle_raw_ts_transport_session(
+    session: WebTransportSession<QuinnConnection, Bytes>,
+    chunk_cache: Arc<ChunkCache>,
+) -> HandlerResult<()> {
+    let mut reader = session.datagram_reader();
+    let mut sender = session.datagram_sender();
+
+    let datagram = match reader.read_datagram().await {
+        Ok(d) => d,
+        Err(e) => {
+            error!("Failed to read stream subscription datagram: {}", e);
+            let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+            return Err(ServerError::Handler(Box::new(io_err)));
+        }
+    };
+
+    let mut buf = datagram.into_payload();
+    if buf.remaining() < 8 {
+        return Err(ServerError::Config(
+            "WebTransport subscription datagram missing stream id".into(),
+        ));
+    }
+
+    let stream_id_u64 = buf.get_u64();
+    let stream_idx = usize::try_from(stream_id_u64).map_err(|_| {
+        ServerError::Config(format!(
+            "WebTransport stream id {} cannot fit this platform",
+            stream_id_u64
+        ))
+    })?;
+    if stream_idx >= chunk_cache.options.num_playlists {
+        return Err(ServerError::Config(format!(
+            "WebTransport stream index {} exceeds configured stream count {}",
+            stream_idx, chunk_cache.options.num_playlists
+        )));
+    }
+
+    let mut next = match chunk_cache.last(stream_idx) {
+        Some(0) | None => 1,
+        Some(last) => last,
+    };
+    info!(
+        "WebTransport raw TS tail started for stream {}",
+        stream_id_u64
+    );
+
+    loop {
+        if let Some((data, _seq)) = chunk_cache.get(stream_idx, next).await {
+            for chunk in data.chunks(188 * 6) {
+                if let Err(e) = sender.send_datagram(Bytes::copy_from_slice(chunk)) {
+                    error!("Failed to send raw TS datagram: {:?}", e);
+                    let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+                    return Err(ServerError::Handler(Box::new(io_err)));
+                }
+            }
+            next += 1;
+        } else {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
 /// WebSocket tail handler (binary frames carrying fMP4 parts)
 pub struct TailWebSocketHandler {
     chunk_cache: Arc<ChunkCache>,
@@ -218,11 +303,13 @@ impl WebSocketHandler for TailWebSocketHandler {
             .parse::<u64>()
             .map_err(|_| ServerError::Config("Invalid stream ID".into()))?;
 
-        let idx = self
-            .chunk_cache
-            .get_stream_idx(stream_id)
-            .await
-            .ok_or(ServerError::Config("Stream not found".into()))?;
+        let requested_idx = usize::try_from(stream_id)
+            .map_err(|_| ServerError::Config("Stream ID cannot fit this platform".into()))?;
+        let idx = match self.chunk_cache.get_stream_idx(stream_id).await {
+            Some(idx) => idx,
+            None if requested_idx < self.chunk_cache.options.num_playlists => requested_idx,
+            None => return Err(ServerError::Config("Stream not found".into())),
+        };
         let mut last = self.chunk_cache.last(idx).unwrap_or(0);
 
         loop {
