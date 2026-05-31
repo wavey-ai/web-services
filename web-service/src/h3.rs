@@ -9,7 +9,7 @@ use h3::ext::Protocol;
 use h3::server::{Connection, RequestStream};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
 use h3_webtransport::server::WebTransportSession;
-use http::{Method, Response, StatusCode};
+use http::{HeaderName, HeaderValue, Method, Response, StatusCode};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
@@ -29,7 +29,8 @@ pub struct H3StreamWriter {
 
 #[async_trait::async_trait]
 impl StreamWriter for H3StreamWriter {
-    async fn send_response(&mut self, response: Response<()>) -> Result<(), ServerError> {
+    async fn send_response(&mut self, mut response: Response<()>) -> Result<(), ServerError> {
+        add_cors_headers(&mut response);
         self.stream
             .send_response(response)
             .await
@@ -77,7 +78,8 @@ pub struct H3SharedStreamWriter {
 
 #[async_trait::async_trait]
 impl StreamWriter for H3SharedStreamWriter {
-    async fn send_response(&mut self, response: Response<()>) -> Result<(), ServerError> {
+    async fn send_response(&mut self, mut response: Response<()>) -> Result<(), ServerError> {
+        add_cors_headers(&mut response);
         let mut guard = self.stream.lock().await;
         guard
             .send_response(response)
@@ -124,7 +126,8 @@ pub struct H3SplitStreamWriter {
 
 #[async_trait::async_trait]
 impl StreamWriter for H3SplitStreamWriter {
-    async fn send_response(&mut self, response: Response<()>) -> Result<(), ServerError> {
+    async fn send_response(&mut self, mut response: Response<()>) -> Result<(), ServerError> {
+        add_cors_headers(&mut response);
         let mut guard = self.stream.lock().await;
         guard
             .send_response(response)
@@ -355,15 +358,8 @@ async fn send_h3_response(
     for (key, value) in handler_response.headers {
         builder = builder.header(&key, &value);
     }
-    let resp = builder
-        .header("access-control-allow-origin", "*")
-        .header(
-            "access-control-allow-methods",
-            "GET, POST, PUT, DELETE, OPTIONS",
-        )
-        .header("access-control-allow-headers", "*")
-        .body(())
-        .map_err(H3Error::Header)?;
+    let mut resp = builder.body(()).map_err(H3Error::Header)?;
+    add_cors_headers(&mut resp);
 
     stream
         .send_response(resp)
@@ -428,10 +424,11 @@ async fn send_h3_empty_response(
     status: StatusCode,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
 ) -> Result<(), H3Error> {
-    let response = Response::builder()
+    let mut response = Response::builder()
         .status(status)
         .body(())
         .map_err(H3Error::Header)?;
+    add_cors_headers(&mut response);
     stream
         .send_response(response)
         .await
@@ -440,6 +437,25 @@ async fn send_h3_empty_response(
         .finish()
         .await
         .map_err(|e| H3Error::Transport(e.to_string()))
+}
+
+fn add_cors_headers<B>(res: &mut Response<B>) {
+    res.headers_mut().insert(
+        HeaderName::from_static("access-control-allow-origin"),
+        HeaderValue::from_static("*"),
+    );
+    res.headers_mut().insert(
+        HeaderName::from_static("access-control-allow-methods"),
+        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+    );
+    res.headers_mut().insert(
+        HeaderName::from_static("access-control-allow-headers"),
+        HeaderValue::from_static("*"),
+    );
+    res.headers_mut().insert(
+        HeaderName::from_static("access-control-expose-headers"),
+        HeaderValue::from_static("x-sequence, stream-id, etag, content-length"),
+    );
 }
 
 fn build_quic_transport_config() -> quinn::TransportConfig {
