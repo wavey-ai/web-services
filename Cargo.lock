@@ -3126,6 +3126,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
+name = "raptorq-datagram-fec"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "520a1e20b4d49714421c155dde5bf8b25fa265e6f247d86f889efbbc6e1e6f32"
+dependencies = [
+ "raptorq",
+ "tokio",
+]
+
+[[package]]
 name = "rcgen"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4625,7 +4635,7 @@ dependencies = [
  "playlists",
  "portpicker",
  "quinn",
- "raptorq",
+ "raptorq-datagram-fec",
  "reqwest",
  "rist",
  "rist-core",

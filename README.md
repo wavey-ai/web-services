@@ -164,7 +164,7 @@ Each request and response stream uses a simple slot-based format:
 
 ### UDP+FEC Payload Format
 
-UDP+FEC, enabled by the `udp-fec` feature, uses [RaptorQ](https://www.rfc-editor.org/rfc/rfc6330) forward error correction over plain UDP. Each datagram carries a 12-byte wire header followed by a serialized RaptorQ `EncodingPacket`.
+UDP+FEC, enabled by the `udp-fec` feature, uses the extracted [`raptorq-datagram-fec`](https://github.com/wavey-ai/raptor-fec) crate for [RaptorQ](https://www.rfc-editor.org/rfc/rfc6330) forward error correction over plain UDP. Each datagram carries a 12-byte wire header followed by a serialized RaptorQ `EncodingPacket`.
 
 ```text
 0               4               8              12
@@ -479,4 +479,4 @@ cargo check -p upload-response --features rist-pure
 - `web-service` provides server traits such as `Router` and `StreamWriter`.
 - [`playlists`](https://github.com/wavey-ai/playlists) provides the shared-memory `ChunkCache`.
 - [`http-pack`](https://github.com/wavey-ai/http-pack) provides the HPKS framing used for headers.
-- `raptorq` is optional and only needed for `udp-fec`.
+- `raptorq-datagram-fec` is optional and only needed for `udp-fec`.
