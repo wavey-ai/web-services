@@ -24,3 +24,6 @@ tokio-tungstenite = "0.27"
 futures-util = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 hyper = { version = "1.6", features = ["full"] }
+
+[dev-dependencies]
+flate2 = "1.0.28"
