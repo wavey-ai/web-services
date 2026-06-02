@@ -145,6 +145,11 @@ impl ServerBuilder for H2H3ServerBuilder {
         self
     }
 
+    fn enable_webtransport(mut self, enable: bool) -> Self {
+        self.config.enable_webtransport = enable;
+        self
+    }
+
     fn enable_raw_tcp(mut self, enable: bool) -> Self {
         self.config.enable_raw_tcp = enable;
         self

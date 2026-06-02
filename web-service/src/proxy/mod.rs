@@ -3,6 +3,7 @@ pub mod backend;
 pub mod balancer;
 pub mod config;
 pub mod context;
+#[allow(dead_code)]
 mod h3_pool;
 mod id;
 pub mod ingress;

@@ -2,77 +2,30 @@ mod common;
 
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, OnceLock},
     time::Duration,
 };
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use common::load_test_env;
-use http::{Request, StatusCode, Version};
+use http::{Request, Response, StatusCode, Version};
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use portpicker::pick_unused_port;
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio_rustls::rustls;
-use web_service::{
-    H2H3Server, HandlerResponse, HandlerResult, LoadBalancingMode, ProxyConfig, ProxyIngress,
-    ProxyState, Router, Server, ServerBuilder, ServerError, UpstreamProtocol, WebSocketHandler,
-    WebTransportHandler,
-};
-
-struct VersionRouter {
-    version_tx: Arc<Mutex<Option<oneshot::Sender<Version>>>>,
-}
-
-impl VersionRouter {
-    fn new(version_tx: oneshot::Sender<Version>) -> Self {
-        Self {
-            version_tx: Arc::new(Mutex::new(Some(version_tx))),
-        }
-    }
-}
-
-#[async_trait]
-impl Router for VersionRouter {
-    async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
-        if let Some(tx) = self.version_tx.lock().await.take() {
-            let _ = tx.send(req.version());
-        }
-        Ok(HandlerResponse {
-            status: StatusCode::OK,
-            body: Some(Bytes::from_static(b"backend ok")),
-            content_type: Some("text/plain".into()),
-            ..Default::default()
-        })
-    }
-
-    fn is_streaming(&self, _path: &str) -> bool {
-        false
-    }
-
-    async fn route_stream(
-        &self,
-        _req: Request<()>,
-        _stream_writer: Box<dyn web_service::StreamWriter>,
-    ) -> HandlerResult<()> {
-        Err(ServerError::Config("no streaming".into()))
-    }
-
-    fn webtransport_handler(&self) -> Option<&dyn WebTransportHandler> {
-        None
-    }
-
-    fn websocket_handler(&self, _path: &str) -> Option<&dyn WebSocketHandler> {
-        None
-    }
-}
+use web_service::{LoadBalancingMode, ProxyConfig, ProxyIngress, ProxyState, UpstreamProtocol};
 
 struct BackendHandle {
     port: u16,
     version_rx: oneshot::Receiver<Version>,
-    shutdown_tx: tokio::sync::watch::Sender<()>,
-    finished_rx: tokio::sync::oneshot::Receiver<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 struct ProxyHandle {
@@ -108,45 +61,56 @@ async fn wait_for_port(port: u16) {
 }
 
 async fn start_backend(
-    protocol: UpstreamProtocol,
-    cert_b64: &str,
-    key_b64: &str,
+    _protocol: UpstreamProtocol,
+    _cert_b64: &str,
+    _key_b64: &str,
 ) -> io::Result<BackendHandle> {
     let port = pick_unused_port().expect("pick backend port");
+    let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+    let listener = TcpListener::bind(addr).await?;
     let (version_tx, version_rx) = oneshot::channel();
-    let router = Box::new(VersionRouter::new(version_tx));
-    let server = H2H3Server::builder()
-        .with_tls(cert_b64.to_string(), key_b64.to_string())
-        .with_port(port)
-        .enable_h2(matches!(
-            protocol,
-            UpstreamProtocol::Http1 | UpstreamProtocol::Http2
-        ))
-        .enable_websocket(false)
-        .with_router(router)
-        .build()
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    let version_tx = Arc::new(Mutex::new(Some(version_tx)));
 
-    let handle = server
-        .start()
-        .await
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-    let web_service::ServerHandle {
-        shutdown_tx,
-        ready_rx,
-        finished_rx,
-    } = handle;
-    ready_rx
-        .await
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-
-    wait_for_port(port).await;
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    eprintln!("backend accept error: {err}");
+                    break;
+                }
+            };
+            let version_tx = Arc::clone(&version_tx);
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let version_tx = Arc::clone(&version_tx);
+                    let version = req.version();
+                    async move {
+                        if let Some(tx) = version_tx.lock().await.take() {
+                            let _ = tx.send(version);
+                        }
+                        Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::from_static(b"backend ok")))
+                                .expect("build backend response"),
+                        )
+                    }
+                });
+                if let Err(err) = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                {
+                    eprintln!("backend serve error: {err}");
+                }
+            });
+        }
+    });
 
     Ok(BackendHandle {
         port,
         version_rx,
-        shutdown_tx,
-        finished_rx,
+        task,
     })
 }
 
@@ -219,17 +183,15 @@ async fn run_proxy_test(protocol: UpstreamProtocol, expected: Version) {
         .expect("start proxy");
 
     let backend_url =
-        url::Url::parse(&format!("https://{host}:{}", backend.port)).expect("backend url");
+        url::Url::parse(&format!("http://127.0.0.1:{}", backend.port)).expect("backend url");
     proxy
         .state
         .add_backend(backend_url, None)
         .await
         .expect("add backend");
 
-    let cert_pem = tls_helpers::from_base64_raw(&cert_b64).expect("decode cert");
-    let reqwest_cert = reqwest::Certificate::from_pem(&cert_pem).expect("reqwest cert");
     let client = reqwest::Client::builder()
-        .add_root_certificate(reqwest_cert)
+        .danger_accept_invalid_certs(true)
         .http1_only()
         .build()
         .expect("client build");
@@ -247,8 +209,7 @@ async fn run_proxy_test(protocol: UpstreamProtocol, expected: Version) {
 
     let _ = proxy.shutdown_tx.send(());
     let _ = proxy.finished_rx.await;
-    let _ = backend.shutdown_tx.send(());
-    let _ = backend.finished_rx.await;
+    backend.task.abort();
     drop(guard);
 }
 

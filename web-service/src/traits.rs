@@ -183,6 +183,9 @@ pub trait ServerBuilder: Sized {
     fn enable_h2(self, enable: bool) -> Self;
     fn enable_h3(self, enable: bool) -> Self;
     fn enable_websocket(self, enable: bool) -> Self;
+    fn enable_webtransport(self, _enable: bool) -> Self {
+        self
+    }
     fn enable_raw_tcp(self, enable: bool) -> Self;
     fn with_raw_tcp_port(self, port: u16) -> Self;
     fn with_raw_tcp_tls(self, enable: bool) -> Self;

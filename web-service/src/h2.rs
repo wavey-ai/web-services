@@ -427,6 +427,10 @@ fn add_cors_headers<B>(res: &mut Response<B>) {
         HeaderName::from_static("access-control-allow-headers"),
         HeaderValue::from_static("*"),
     );
+    res.headers_mut().insert(
+        HeaderName::from_static("access-control-expose-headers"),
+        HeaderValue::from_static("x-sequence, stream-id, etag, content-length"),
+    );
 }
 
 fn is_websocket_upgrade(req: &http::Request<Incoming>) -> bool {

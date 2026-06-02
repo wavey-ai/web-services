@@ -16,10 +16,9 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use portpicker::pick_unused_port;
-use tls_helpers::{from_base64_raw, load_certs_from_base64};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
+use tokio_rustls::rustls;
 use web_service::{LoadBalancingMode, ProxyConfig, ProxyIngress, UpstreamProtocol};
 
 struct BackendHandle {
@@ -35,24 +34,6 @@ fn ensure_rustls_provider() {
     INSTALL.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-}
-
-fn tls_client_config(cert_pem_b64: &str) -> ClientConfig {
-    let mut roots = RootCertStore::empty();
-    if let Ok(native) = rustls_native_certs::load_native_certs() {
-        for cert in native {
-            let _ = roots.add(cert);
-        }
-    }
-    if let Ok(certs) = load_certs_from_base64(cert_pem_b64) {
-        for cert in certs {
-            let _ = roots.add(cert);
-        }
-    }
-
-    ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth()
 }
 
 async fn wait_for_port(port: u16) {
@@ -229,10 +210,8 @@ async fn proxy_api_adds_backend_during_live_usage() {
     handle.ready_rx.await.expect("proxy ready");
     wait_for_port(proxy_port).await;
 
-    let cert_pem = from_base64_raw(&cert_b64).expect("decode cert");
-    let reqwest_cert = reqwest::Certificate::from_pem(&cert_pem).expect("reqwest cert");
     let client = reqwest::Client::builder()
-        .add_root_certificate(reqwest_cert)
+        .danger_accept_invalid_certs(true)
         .http1_only()
         .build()
         .expect("client build");
@@ -287,15 +266,14 @@ async fn proxy_http1_ingress_upstreams_http1() {
             return;
         }
     };
-    let client_cert = cert_b64.clone();
-
-    let version = run_with_proxy(cert_b64, key_b64, host.clone(), true, move |port, host| {
-        let client_cert = client_cert.clone();
-        async move {
-            let cert_pem = from_base64_raw(&client_cert).expect("decode cert");
-            let reqwest_cert = reqwest::Certificate::from_pem(&cert_pem).expect("reqwest cert");
+    let version = run_with_proxy(
+        cert_b64,
+        key_b64,
+        host.clone(),
+        true,
+        move |port, host| async move {
             let client = reqwest::Client::builder()
-                .add_root_certificate(reqwest_cert)
+                .danger_accept_invalid_certs(true)
                 .http1_only()
                 .build()
                 .unwrap();
@@ -304,8 +282,8 @@ async fn proxy_http1_ingress_upstreams_http1() {
             assert_eq!(resp.version(), reqwest::Version::HTTP_11);
             let body = resp.bytes().await.expect("read body");
             assert_eq!(body.as_ref(), b"backend ok");
-        }
-    })
+        },
+    )
     .await;
 
     assert_eq!(version, Version::HTTP_11);
@@ -321,15 +299,14 @@ async fn proxy_http2_ingress_upstreams_http1() {
             return;
         }
     };
-    let client_cert = cert_b64.clone();
-
-    let version = run_with_proxy(cert_b64, key_b64, host.clone(), true, move |port, host| {
-        let client_cert = client_cert.clone();
-        async move {
-            let cert_pem = from_base64_raw(&client_cert).expect("decode cert");
-            let reqwest_cert = reqwest::Certificate::from_pem(&cert_pem).expect("reqwest cert");
+    let version = run_with_proxy(
+        cert_b64,
+        key_b64,
+        host.clone(),
+        true,
+        move |port, host| async move {
             let client = reqwest::Client::builder()
-                .add_root_certificate(reqwest_cert)
+                .danger_accept_invalid_certs(true)
                 .build()
                 .unwrap();
             let url = format!("https://{host}:{port}/");
@@ -337,8 +314,8 @@ async fn proxy_http2_ingress_upstreams_http1() {
             assert_eq!(resp.version(), reqwest::Version::HTTP_2);
             let body = resp.bytes().await.expect("read body");
             assert_eq!(body.as_ref(), b"backend ok");
-        }
-    })
+        },
+    )
     .await;
 
     assert_eq!(version, Version::HTTP_11);

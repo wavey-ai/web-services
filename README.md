@@ -2,6 +2,10 @@
 
 `web-services` is the Rust workspace for Wavey's transport, proxy, and low-latency delivery services. It combines a reusable multi-protocol server foundation with cache-backed streaming crates and the `upload-response` request/response pipeline.
 
+The `web-service` crate owns protocol plumbing only. Raw TCP helpers expose
+generic `[u32_be length][payload]` frame reads/writes; callers decide whether a
+frame is mesh JSON, media access-unit bytes, or another application payload.
+
 ## Workspace Overview
 
 | Crate | Purpose |
@@ -164,24 +168,25 @@ Each request and response stream uses a simple slot-based format:
 
 ### UDP+FEC Payload Format
 
-UDP+FEC, enabled by the `udp-fec` feature, uses [RaptorQ](https://www.rfc-editor.org/rfc/rfc6330) forward error correction over plain UDP. Each datagram carries a 12-byte wire header followed by a serialized RaptorQ `EncodingPacket`.
+UDP+FEC, enabled by the `udp-fec` feature, uses the extracted [`raptorq-datagram-fec`](https://github.com/wavey-ai/raptor-fec) crate for [RaptorQ](https://www.rfc-editor.org/rfc/rfc6330) forward error correction over plain UDP. Each datagram carries the current 16-byte sequenced wire header followed by a serialized RaptorQ `EncodingPacket`.
 
 ```text
-0               4               8              12
-+---------------+---------------+---------------+
-|   block_id    |transfer_length|src_syms|sym_sz|  header (12 bytes)
-+---------------+---------------+---------------+
-|       EncodingPacket bytes ...               |  variable
+0               4               8              12              16
++---------------+---------------+---------------+---------------+
+|   block_id    |transfer_length| packet_seq    |src_syms|sym_sz |
++---------------+---------------+---------------+---------------+
+|             RaptorQ EncodingPacket bytes ...                   |
 ```
 
 | Field | Size | Description |
 | --- | --- | --- |
 | `block_id` | `u32` LE | Monotonically increasing block counter |
 | `transfer_length` | `u32` LE | Total source bytes in this block |
+| `packet_seq` | `u32` LE | Monotonic datagram sequence used for gap/reorder tracking |
 | `src_syms` | `u16` LE | `K`, source symbols per block |
 | `sym_sz` | `u16` LE | `T`, symbol size in bytes, default `1316` |
 
-Defaults: `K=4`, `T=1316`, `R=1` repair symbol. That recovers any single datagram loss per block with about `80 ms` latency overhead at `48 kHz` and `960`-sample frames.
+Defaults: `K=4`, `T=1316`, `R=1` repair symbol. That recovers any single datagram loss per block with about `80 ms` latency overhead at `48 kHz` and `960`-sample frames. The sequenced header also lets receivers report missing/reordered datagrams while RaptorQ repairs complete blocks.
 
 ```rust
 use upload_response::{UdpFecIngest, UdpFecSender};
@@ -350,13 +355,10 @@ Latency characteristics for streaming and real-time delivery, such as audio fram
 
 SRT and RIST trade latency for reliability via retransmission. A lost packet always costs at least one additional RTT. UDP+FEC pays the latency cost up front and deterministically, so worst-case latency is fixed at block-fill time regardless of packet loss.
 
-For small audio frames at `48 kHz` and `960` samples, about `20 ms` per frame, `K=1` yields a fixed `~20 ms` overhead with single-packet loss recovery when `R=1`:
+Avoid `K=1, R=1` for live media unless you explicitly want 100% repair overhead on each tiny packet. The reusable RaptorQ crates now carry packet sequencing in the compact FEC header and expose media-aware adaptive repair so small delta/data packets can avoid unnecessary repair while keyframes/audio can receive more protection:
 
 ```rust
-let sender = UdpFecSender::new(target)
-    .await?
-    .with_source_symbols(1)
-    .with_repair_symbols(1);
+let sender = UdpFecSender::new(target).await?;
 ```
 
 #### Protocol Throughput
@@ -479,4 +481,4 @@ cargo check -p upload-response --features rist-pure
 - `web-service` provides server traits such as `Router` and `StreamWriter`.
 - [`playlists`](https://github.com/wavey-ai/playlists) provides the shared-memory `ChunkCache`.
 - [`http-pack`](https://github.com/wavey-ai/http-pack) provides the HPKS framing used for headers.
-- `raptorq` is optional and only needed for `udp-fec`.
+- `raptorq-datagram-fec` is optional and only needed for `udp-fec`.

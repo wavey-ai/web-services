@@ -150,6 +150,7 @@ async fn proxy_http_hyper(
     map_upstream_response(response).await
 }
 
+#[allow(dead_code)]
 async fn proxy_http_h3(
     state: &ProxyState,
     req: Request<()>,
@@ -257,6 +258,7 @@ async fn proxy_http_h3(
     }
 }
 
+#[allow(dead_code)]
 fn build_h3_request(req: Request<()>, backend_url: &url::Url) -> Result<http::Request<()>, String> {
     let mut builder = http::Request::builder()
         .method(req.method().clone())

@@ -244,6 +244,9 @@ where
     let slot_bytes = service.config.slot_bytes();
     let mut buf = vec![0u8; slot_bytes];
     let mut pending = Vec::new();
+    let mut reads: u64 = 0;
+    let mut bytes_read: u64 = 0;
+    let mut body_slots_written: u64 = 0;
 
     // Read data and write to cache
     loop {
@@ -258,15 +261,34 @@ where
                 break;
             }
             Ok(Ok(n)) => {
+                reads = reads.saturating_add(1);
+                bytes_read = bytes_read.saturating_add(n as u64);
                 pending.extend_from_slice(&buf[..n]);
+                debug!(
+                    stream_id,
+                    read_bytes = n,
+                    pending_bytes = pending.len(),
+                    reads,
+                    bytes_read,
+                    "TCP bytes read"
+                );
 
                 // Write full slots
                 while pending.len() >= slot_bytes {
                     let chunk: Vec<u8> = pending.drain(..slot_bytes).collect();
+                    let chunk_bytes = chunk.len();
                     service
                         .append_request_body(stream_id, Bytes::from(chunk))
                         .await
                         .map_err(|e| format!("Failed to write body: {}", e))?;
+                    body_slots_written = body_slots_written.saturating_add(1);
+                    debug!(
+                        stream_id,
+                        chunk_bytes,
+                        pending_bytes = pending.len(),
+                        body_slots_written,
+                        "TCP body slot written"
+                    );
                 }
             }
             Ok(Err(e)) => {
@@ -282,10 +304,16 @@ where
 
     // Flush remaining data
     if !pending.is_empty() {
+        let final_bytes = pending.len();
         service
             .append_request_body(stream_id, Bytes::from(pending))
             .await
             .map_err(|e| format!("Failed to write final body: {}", e))?;
+        body_slots_written = body_slots_written.saturating_add(1);
+        debug!(
+            stream_id,
+            final_bytes, body_slots_written, "TCP final body slot written"
+        );
     }
 
     // End marker
@@ -294,7 +322,10 @@ where
         .await
         .map_err(|e| format!("Failed to end request: {}", e))?;
 
-    debug!(stream_id, "TCP request complete, waiting for response");
+    debug!(
+        stream_id,
+        reads, bytes_read, body_slots_written, "TCP request complete, waiting for response"
+    );
 
     let timeout_duration = Duration::from_millis(service.config.response_timeout_ms);
     let result = match timeout(timeout_duration, rx).await {

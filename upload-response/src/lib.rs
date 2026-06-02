@@ -70,7 +70,7 @@ pub use tcp::{AllowAllTcp, RequireClientCert, TcpAuth, TcpIngest};
 mod udp_fec;
 #[cfg(feature = "udp-fec")]
 pub use udp_fec::{
-    UdpFecIngest, UdpFecSender, DEFAULT_REPAIR_SYMBOLS, DEFAULT_SOURCE_SYMBOLS,
+    SequenceStats, UdpFecIngest, UdpFecSender, DEFAULT_REPAIR_SYMBOLS, DEFAULT_SOURCE_SYMBOLS,
     DEFAULT_SYMBOL_SIZE, HEADER_LEN,
 };
 
@@ -509,19 +509,31 @@ impl UploadResponseService {
                 return Err(format!("{lane} stream closed: {stream_id}"));
             }
 
-            let can_append = {
+            let (can_append, reader_count, min_consumed) = {
                 let positions = positions.read().await;
                 let readers = &positions[stream_idx];
-                readers
-                    .values()
-                    .copied()
-                    .min()
-                    .is_some_and(|min_consumed| min_consumed >= overwrite_slot)
+                let min_consumed = readers.values().copied().min();
+                (
+                    readers.is_empty()
+                        || min_consumed.is_some_and(|min_consumed| min_consumed >= overwrite_slot),
+                    readers.len(),
+                    min_consumed,
+                )
             };
             if can_append {
                 return Ok(());
             }
 
+            debug!(
+                stream_id,
+                stream_idx,
+                lane,
+                next_slot,
+                overwrite_slot,
+                reader_count,
+                min_consumed = min_consumed.unwrap_or(0),
+                "waiting for upload-response reader capacity"
+            );
             notified.await;
         }
     }
@@ -537,12 +549,22 @@ impl UploadResponseService {
         data: Bytes,
     ) -> Result<(), String> {
         let next_slot = cache.last(stream_idx).unwrap_or(0) + 1;
+        let bytes = data.len();
         self.wait_for_reader_capacity(stream_id, stream_idx, next_slot, positions, notifies, lane)
             .await?;
         cache
             .add(stream_idx, next_slot, data)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        debug!(
+            stream_id,
+            stream_idx,
+            lane,
+            slot_id = next_slot,
+            bytes,
+            "upload-response slot written"
+        );
+        Ok(())
     }
 
     async fn register_stream_reader(
@@ -1167,6 +1189,13 @@ impl UploadResponseService {
             .await
             .map_err(|e| e.to_string())?;
         self.request_started[stream_idx].store(true, Ordering::SeqCst);
+        debug!(
+            stream_id,
+            stream_idx,
+            lane = "request",
+            slot_id = 1,
+            "upload-response request headers written"
+        );
         Ok(())
     }
 
@@ -1439,9 +1468,34 @@ impl UploadResponseService {
     pub async fn request_get(&self, stream_id: u64, slot_id: usize) -> Option<Bytes> {
         let stream_idx = self.stream_idx(stream_id)?;
         if !self.request_started[stream_idx].load(Ordering::SeqCst) {
+            debug!(
+                stream_id,
+                stream_idx,
+                slot_id,
+                lane = "request",
+                "upload-response request slot miss: stream not started"
+            );
             return None;
         }
-        let (bytes, _hash) = self.request_cache.get(stream_idx, slot_id).await?;
+        let Some((bytes, hash)) = self.request_cache.get(stream_idx, slot_id).await else {
+            debug!(
+                stream_id,
+                stream_idx,
+                slot_id,
+                lane = "request",
+                "upload-response request slot miss"
+            );
+            return None;
+        };
+        debug!(
+            stream_id,
+            stream_idx,
+            slot_id,
+            lane = "request",
+            bytes = bytes.len(),
+            hash,
+            "upload-response request slot read"
+        );
         Some(bytes)
     }
 
@@ -1469,9 +1523,34 @@ impl UploadResponseService {
         let stream_idx = self.stream_idx(stream_id)?;
         let lane = self.get_stage_lane(stage).await?;
         if !lane.started[stream_idx].load(Ordering::SeqCst) {
+            debug!(
+                stream_id,
+                stream_idx,
+                slot_id,
+                lane = stage,
+                "upload-response stage slot miss: stream not started"
+            );
             return None;
         }
-        let (bytes, _hash) = lane.cache.get(stream_idx, slot_id).await?;
+        let Some((bytes, hash)) = lane.cache.get(stream_idx, slot_id).await else {
+            debug!(
+                stream_id,
+                stream_idx,
+                slot_id,
+                lane = stage,
+                "upload-response stage slot miss"
+            );
+            return None;
+        };
+        debug!(
+            stream_id,
+            stream_idx,
+            slot_id,
+            lane = stage,
+            bytes = bytes.len(),
+            hash,
+            "upload-response stage slot read"
+        );
         Some(bytes)
     }
 

@@ -206,6 +206,9 @@ async fn handle_srt_connection(
     let slot_bytes = service.config.slot_bytes();
     let mut buf = vec![0u8; MAX_SRT_PACKET_SIZE];
     let mut pending = Vec::new();
+    let mut packets_read: u64 = 0;
+    let mut bytes_read: u64 = 0;
+    let mut body_slots_written: u64 = 0;
 
     // Read SRT packets and write to request cache
     loop {
@@ -221,15 +224,34 @@ async fn handle_srt_connection(
                 break;
             }
             Ok(Ok(n)) => {
+                packets_read = packets_read.saturating_add(1);
+                bytes_read = bytes_read.saturating_add(n as u64);
                 pending.extend_from_slice(&buf[..n]);
+                debug!(
+                    stream_id,
+                    packet_bytes = n,
+                    pending_bytes = pending.len(),
+                    packets_read,
+                    bytes_read,
+                    "SRT packet read"
+                );
 
                 // Write full slots
                 while pending.len() >= slot_bytes {
                     let chunk: Vec<u8> = pending.drain(..slot_bytes).collect();
+                    let chunk_bytes = chunk.len();
                     service
                         .append_request_body(stream_id, Bytes::from(chunk))
                         .await
                         .map_err(|e| format!("Failed to write body: {}", e))?;
+                    body_slots_written = body_slots_written.saturating_add(1);
+                    debug!(
+                        stream_id,
+                        chunk_bytes,
+                        pending_bytes = pending.len(),
+                        body_slots_written,
+                        "SRT body slot written"
+                    );
                 }
             }
             Ok(Err(e)) => {
@@ -245,10 +267,16 @@ async fn handle_srt_connection(
 
     // Flush remaining data
     if !pending.is_empty() {
+        let final_bytes = pending.len();
         service
             .append_request_body(stream_id, Bytes::from(pending))
             .await
             .map_err(|e| format!("Failed to write final body: {}", e))?;
+        body_slots_written = body_slots_written.saturating_add(1);
+        debug!(
+            stream_id,
+            final_bytes, body_slots_written, "SRT final body slot written"
+        );
     }
 
     // End marker
@@ -257,7 +285,10 @@ async fn handle_srt_connection(
         .await
         .map_err(|e| format!("Failed to end request: {}", e))?;
 
-    debug!(stream_id, "SRT request complete, waiting for response");
+    debug!(
+        stream_id,
+        packets_read, bytes_read, body_slots_written, "SRT request complete, waiting for response"
+    );
 
     let timeout_duration = Duration::from_millis(service.config.response_timeout_ms);
     let result = match timeout(timeout_duration, rx).await {
