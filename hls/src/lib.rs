@@ -16,7 +16,6 @@ pub mod streaming;
 
 const BLOCKING_RELOAD_TIMEOUT: Duration = Duration::from_secs(18);
 const BLOCKING_RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(3);
-const DEFAULT_ADVANCE_PART_LIMIT: usize = 3;
 
 enum BlockingPlaylistReload {
     Found(Bytes, u64),
@@ -256,21 +255,6 @@ impl HlsHandler {
         msn < last_msn || (msn == last_msn && part.unwrap_or(0) <= last_part)
     }
 
-    fn blocking_request_is_too_far_ahead(&self, sid: u64, msn: usize, part: Option<usize>) -> bool {
-        let Some((last_msn, last_part)) = self.m3u8_cache.last_position(sid) else {
-            return false;
-        };
-        if msn > last_msn.saturating_add(2) {
-            return true;
-        }
-        matches!(
-            part,
-            Some(part)
-                if msn == last_msn
-                    && part > last_part.saturating_add(DEFAULT_ADVANCE_PART_LIMIT)
-        )
-    }
-
     fn get_m3u8_snapshot(
         &self,
         sid: u64,
@@ -317,9 +301,6 @@ impl HlsHandler {
         part: Option<usize>,
         skip: bool,
     ) -> BlockingPlaylistReload {
-        if self.blocking_request_is_too_far_ahead(sid, msn, part) {
-            return BlockingPlaylistReload::Status(StatusCode::BAD_REQUEST);
-        }
         if self.blocking_request_is_behind_latest(sid, msn, part) {
             return self
                 .latest_m3u8(sid, skip)
@@ -723,23 +704,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn far_future_blocking_playlist_reload_returns_bad_request() {
+    async fn future_blocking_playlist_reload_waits_for_snapshot() {
         let options = Options::default();
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let m3u8_cache = Arc::new(M3u8Cache::new(options));
+        let writer_cache = Arc::clone(&m3u8_cache);
         m3u8_cache
             .add(1, 137, 0, 0, Bytes::from_static(b"latest-playlist"))
             .unwrap();
         let handler = HlsHandler::new(chunk_cache, m3u8_cache);
 
+        let response_fut = handler.handle(
+            Request::builder()
+                .uri("/1/stream.m3u8?_HLS_msn=140&_HLS_part=0")
+                .body(())
+                .unwrap(),
+            vec!["1", "stream.m3u8"],
+            Some("_HLS_msn=140&_HLS_part=0"),
+        );
+        let publish_fut = async move {
+            sleep(Duration::from_millis(10)).await;
+            writer_cache
+                .add(1, 140, 0, 0, Bytes::from_static(b"future-playlist"))
+                .unwrap();
+        };
+
+        let (response, _) = tokio::join!(response_fut, publish_fut);
+        let response = response.unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_ne!(response.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn non_numeric_blocking_reload_directives_return_bad_request() {
+        let options = Options::default();
+        let handler = HlsHandler::new(
+            Arc::new(ChunkCache::new(options)),
+            Arc::new(M3u8Cache::new(options)),
+        );
+
         let response = handler
             .handle(
                 Request::builder()
-                    .uri("/1/stream.m3u8?_HLS_msn=140&_HLS_part=0")
+                    .uri("/1/stream.m3u8?_HLS_msn=bad&_HLS_part=0")
                     .body(())
                     .unwrap(),
                 vec!["1", "stream.m3u8"],
-                Some("_HLS_msn=140&_HLS_part=0"),
+                Some("_HLS_msn=bad&_HLS_part=0"),
             )
             .await
             .unwrap();
