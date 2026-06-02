@@ -1,6 +1,7 @@
 use crate::{
     config::ServerConfig,
     error::{H3Error, ServerError, ServerResult},
+    http_range::apply_byte_range,
     traits::{BodyStream, Router, StreamWriter},
 };
 use bytes::{Buf, Bytes};
@@ -315,6 +316,7 @@ async fn handle_h3_request(
     router: Arc<dyn Router>,
 ) -> Result<(), H3Error> {
     let path = req.uri().path().to_string();
+    let request_headers = req.headers().clone();
     if router.has_body_handler(&path) {
         let shared_stream = Arc::new(Mutex::new(stream));
         let body_stream: BodyStream =
@@ -337,11 +339,19 @@ async fn handle_h3_request(
             .await
             .map_err(H3Error::Router)?;
         let mut guard = shared_stream.lock().await;
-        return send_h3_response(handler_response, &mut *guard).await;
+        return send_h3_response(
+            apply_byte_range(&request_headers, handler_response),
+            &mut *guard,
+        )
+        .await;
     }
 
     let handler_response = router.route(req).await.map_err(H3Error::Router)?;
-    send_h3_response(handler_response, &mut stream).await
+    send_h3_response(
+        apply_byte_range(&request_headers, handler_response),
+        &mut stream,
+    )
+    .await
 }
 
 async fn send_h3_response(
@@ -454,7 +464,9 @@ fn add_cors_headers<B>(res: &mut Response<B>) {
     );
     res.headers_mut().insert(
         HeaderName::from_static("access-control-expose-headers"),
-        HeaderValue::from_static("x-sequence, stream-id, etag, content-length"),
+        HeaderValue::from_static(
+            "x-sequence, stream-id, etag, content-length, accept-ranges, content-range",
+        ),
     );
 }
 

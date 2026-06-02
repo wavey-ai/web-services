@@ -805,6 +805,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocking_playlist_reload_waits_for_high_part_index_snapshot() {
+        let options = Options::default();
+        let chunk_cache = Arc::new(ChunkCache::new(options));
+        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+        let writer_cache = Arc::clone(&m3u8_cache);
+        m3u8_cache
+            .add(1, 9, 49, 49, Bytes::from_static(b"part-49-playlist"))
+            .unwrap();
+        let handler = HlsHandler::new(chunk_cache, m3u8_cache);
+
+        let response_fut = handler.handle(
+            Request::builder()
+                .uri("/1/stream.m3u8?_HLS_msn=9&_HLS_part=50")
+                .body(())
+                .unwrap(),
+            vec!["1", "stream.m3u8"],
+            Some("_HLS_msn=9&_HLS_part=50"),
+        );
+        let publish_fut = async move {
+            sleep(Duration::from_millis(10)).await;
+            writer_cache
+                .add(1, 9, 50, 50, Bytes::from_static(b"part-50-playlist"))
+                .unwrap();
+        };
+
+        let (response, _) = timeout(Duration::from_secs(1), async {
+            tokio::join!(response_fut, publish_fut)
+        })
+        .await
+        .expect("blocking reload resolved before server timeout");
+        let response = response.unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_ne!(response.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn blocking_playlist_reload_for_missing_part_resolves_on_next_segment() {
+        let options = Options::default();
+        let chunk_cache = Arc::new(ChunkCache::new(options));
+        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+        let writer_cache = Arc::clone(&m3u8_cache);
+        m3u8_cache
+            .add(1, 9, 49, 49, Bytes::from_static(b"part-49-playlist"))
+            .unwrap();
+        let handler = HlsHandler::new(chunk_cache, m3u8_cache);
+
+        let response_fut = handler.handle(
+            Request::builder()
+                .uri("/1/stream.m3u8?_HLS_msn=9&_HLS_part=50")
+                .body(())
+                .unwrap(),
+            vec!["1", "stream.m3u8"],
+            Some("_HLS_msn=9&_HLS_part=50"),
+        );
+        let publish_fut = async move {
+            sleep(Duration::from_millis(10)).await;
+            writer_cache
+                .add(1, 10, 50, 0, Bytes::from_static(b"segment-10-playlist"))
+                .unwrap();
+        };
+
+        let (response, _) = timeout(Duration::from_secs(1), async {
+            tokio::join!(response_fut, publish_fut)
+        })
+        .await
+        .expect("blocking reload resolved on next segment");
+        let response = response.unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_ne!(response.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn non_numeric_blocking_reload_directives_return_bad_request() {
         let options = Options::default();
         let handler = HlsHandler::new(

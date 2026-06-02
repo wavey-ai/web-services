@@ -1,6 +1,7 @@
 use crate::{
     config::ServerConfig,
     error::{H2Error, ServerError, ServerResult},
+    http_range::apply_byte_range,
     traits::{BodyStream, HandlerResponse, Router, StreamWriter},
 };
 use bytes::Bytes;
@@ -273,6 +274,7 @@ async fn handle_h2_request(
 
     let (parts, body) = req.into_parts();
     let path = parts.uri.path().to_string();
+    let request_headers = parts.headers.clone();
     if router.has_body_stream_handler(&path) {
         let stream = incoming_body_stream(body);
         let req = http::Request::from_parts(parts, ());
@@ -291,7 +293,7 @@ async fn handle_h2_request(
             .route_body(req, stream)
             .await
             .map_err(H2Error::Router)?;
-        return build_buffered_response(handler_response);
+        return build_buffered_response(apply_byte_range(&request_headers, handler_response));
     }
 
     let mut body = body;
@@ -303,7 +305,7 @@ async fn handle_h2_request(
 
     let req = http::Request::from_parts(parts, ());
     let handler_response = router.route(req).await.map_err(H2Error::Router)?;
-    build_buffered_response(handler_response)
+    build_buffered_response(apply_byte_range(&request_headers, handler_response))
 }
 
 fn incoming_body_stream(body: Incoming) -> BodyStream {
@@ -429,7 +431,9 @@ fn add_cors_headers<B>(res: &mut Response<B>) {
     );
     res.headers_mut().insert(
         HeaderName::from_static("access-control-expose-headers"),
-        HeaderValue::from_static("x-sequence, stream-id, etag, content-length"),
+        HeaderValue::from_static(
+            "x-sequence, stream-id, etag, content-length, accept-ranges, content-range",
+        ),
     );
 }
 
