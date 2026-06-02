@@ -51,7 +51,7 @@ use std::fs;
 
 const SLOT_SIZE_KB: usize = 64;
 #[cfg(feature = "rist-pure")]
-const PURE_RIST_FLOW_ID: u32 = 0x7273_7401;
+const PURE_RIST_FLOW_ID: u32 = 0x1122_3344;
 
 // Local cert paths (checked into repo)
 const LOCAL_CERT_PATH: &str = concat!(

@@ -135,7 +135,7 @@ impl<A: RistAuth> RistIngest<A> {
                         info!("RIST ingest server shutting down");
                         break;
                     }
-                    result = receiver.recv_timeout(Duration::from_secs(1)) => {
+                    result = receiver.recv() => {
                         match result {
                             Ok(Some(data)) => {
                                 let payload = data.payload();
@@ -154,7 +154,7 @@ impl<A: RistAuth> RistIngest<A> {
                                 }
                             }
                             Ok(None) => {
-                                // Timeout, continue
+                                // No data was immediately available; wait for the next receiver notification.
                             }
                             Err(e) => {
                                 error!(stream_id, error = %e, "RIST read error");

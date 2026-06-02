@@ -14,7 +14,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
-const DEFAULT_FLOW_ID: u32 = 0x7273_7401;
+const DEFAULT_FLOW_ID: u32 = 0x1122_3344;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const DEFAULT_RTCP_INTERVAL: Duration = Duration::from_millis(20);
 
