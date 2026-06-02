@@ -168,7 +168,18 @@ impl HlsHandler {
         id: u64,
         qp: HashMap<&str, &str>,
     ) -> HandlerResult<HandlerResponse> {
+        debug!(
+            stream_id = id,
+            hls_msn = qp.get("_HLS_msn").copied().unwrap_or(""),
+            hls_part = qp.get("_HLS_part").copied().unwrap_or(""),
+            hls_skip = qp.get("_HLS_skip").copied().unwrap_or(""),
+            "LL-HLS playlist request received"
+        );
         if qp.contains_key("_HLS_part") && !qp.contains_key("_HLS_msn") {
+            debug!(
+                stream_id = id,
+                "rejecting LL-HLS playlist request with _HLS_part but no _HLS_msn"
+            );
             return Ok(HandlerResponse {
                 status: StatusCode::BAD_REQUEST,
                 ..Default::default()
@@ -178,6 +189,11 @@ impl HlsHandler {
 
         let data = if let Some(msn) = qp.get("_HLS_msn") {
             let Ok(msn) = msn.parse::<usize>() else {
+                debug!(
+                    stream_id = id,
+                    hls_msn = *msn,
+                    "rejecting LL-HLS playlist request with invalid _HLS_msn"
+                );
                 return Ok(HandlerResponse {
                     status: StatusCode::BAD_REQUEST,
                     ..Default::default()
@@ -187,6 +203,11 @@ impl HlsHandler {
                 Some(part) => match part.parse::<usize>() {
                     Ok(part) => Some(part),
                     Err(_) => {
+                        debug!(
+                            stream_id = id,
+                            hls_part = *part,
+                            "rejecting LL-HLS playlist request with invalid _HLS_part"
+                        );
                         return Ok(HandlerResponse {
                             status: StatusCode::BAD_REQUEST,
                             ..Default::default()
@@ -196,8 +217,27 @@ impl HlsHandler {
                 None => None,
             };
             match self.get_m3u8_with_blocking(id, msn, part, skip).await {
-                BlockingPlaylistReload::Found(bytes, hash) => Some((bytes, hash)),
+                BlockingPlaylistReload::Found(bytes, hash) => {
+                    debug!(
+                        stream_id = id,
+                        msn,
+                        part = part.unwrap_or(0),
+                        skip,
+                        bytes = bytes.len(),
+                        hash,
+                        "LL-HLS blocking playlist request resolved"
+                    );
+                    Some((bytes, hash))
+                }
                 BlockingPlaylistReload::Status(status) => {
+                    debug!(
+                        stream_id = id,
+                        msn,
+                        part = part.unwrap_or(0),
+                        skip,
+                        status = status.as_u16(),
+                        "LL-HLS blocking playlist request returned status"
+                    );
                     return Ok(HandlerResponse {
                         status,
                         ..Default::default()
@@ -209,6 +249,13 @@ impl HlsHandler {
         };
 
         if let Some((bytes, hash)) = data {
+            debug!(
+                stream_id = id,
+                skip,
+                bytes = bytes.len(),
+                hash,
+                "LL-HLS playlist response ready"
+            );
             Ok(HandlerResponse {
                 status: StatusCode::OK,
                 body: Some(bytes),
@@ -220,6 +267,7 @@ impl HlsHandler {
                 etag: Some(hash),
             })
         } else {
+            debug!(stream_id = id, skip, "LL-HLS playlist response not found");
             Ok(HandlerResponse {
                 status: StatusCode::NOT_FOUND,
                 ..Default::default()
@@ -234,8 +282,21 @@ impl HlsHandler {
     fn latest_m3u8(&self, sid: u64, skip: bool) -> Option<(Bytes, u64)> {
         if skip {
             match self.m3u8_cache.last_delta(sid) {
-                Ok(Some(delta)) => return Some(delta),
-                Ok(None) => {}
+                Ok(Some(delta)) => {
+                    debug!(
+                        stream_id = sid,
+                        bytes = delta.0.len(),
+                        hash = delta.1,
+                        "serving latest LL-HLS delta playlist"
+                    );
+                    return Some(delta);
+                }
+                Ok(None) => {
+                    debug!(
+                        stream_id = sid,
+                        "latest LL-HLS delta unavailable; falling back to full playlist"
+                    );
+                }
                 Err(error) => {
                     debug!(
                         stream_id = sid,
@@ -302,6 +363,13 @@ impl HlsHandler {
         skip: bool,
     ) -> BlockingPlaylistReload {
         if self.blocking_request_is_behind_latest(sid, msn, part) {
+            debug!(
+                stream_id = sid,
+                msn,
+                part = part.unwrap_or(0),
+                skip,
+                "LL-HLS blocking playlist request is behind latest cache"
+            );
             return self
                 .latest_m3u8(sid, skip)
                 .map(|(bytes, hash)| BlockingPlaylistReload::Found(bytes, hash))

@@ -321,9 +321,16 @@ async fn append_payload(
     let stream_id = request.stream.stream_id();
     let slot_bytes = service.config().slot_bytes().max(1);
     request.pending.extend_from_slice(payload);
+    debug!(
+        stream_id,
+        payload_bytes = payload.len(),
+        pending_bytes = request.pending.len(),
+        "pure Rust RIST payload buffered"
+    );
 
     while request.pending.len() >= slot_bytes {
         let chunk: Vec<u8> = request.pending.drain(..slot_bytes).collect();
+        let chunk_bytes = chunk.len();
         if let Err(error) = service
             .append_request_body(stream_id, Bytes::from(chunk))
             .await
@@ -331,6 +338,12 @@ async fn append_payload(
             error!(stream_id, error = %error, "failed to write pure Rust RIST body");
             break;
         }
+        debug!(
+            stream_id,
+            chunk_bytes,
+            pending_bytes = request.pending.len(),
+            "pure Rust RIST body slot written"
+        );
     }
 }
 
@@ -338,11 +351,17 @@ async fn finish_request(service: &UploadResponseService, mut request: PureRistRe
     let stream_id = request.stream.stream_id();
 
     if !request.pending.is_empty() {
+        let final_bytes = request.pending.len();
         if let Err(error) = service
             .append_request_body(stream_id, Bytes::from(std::mem::take(&mut request.pending)))
             .await
         {
             error!(stream_id, error = %error, "failed to write pure Rust RIST final body");
+        } else {
+            debug!(
+                stream_id,
+                final_bytes, "pure Rust RIST final body slot written"
+            );
         }
     }
 
