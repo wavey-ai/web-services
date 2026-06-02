@@ -2779,7 +2779,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 [[package]]
 name = "playlists"
 version = "0.1.3"
-source = "git+https://github.com/wavey-ai/playlists.git#fea8f07b08d355bffeb7d8f5576381882750bc5e"
+source = "git+https://github.com/wavey-ai/playlists.git#c18b6440ebfacd7f11e47facbae3340849d9dc94"
 dependencies = [
  "access-unit 0.1.3",
  "bytes",

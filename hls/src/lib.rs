@@ -1404,6 +1404,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_segment_uri_serves_after_playlist_window_advances() {
+        let options = Options {
+            segment_min_ms: 1_000,
+            target_duration_ms: 6_000,
+            part_target_ms: 80,
+            ..Options::default()
+        };
+        let chunk_cache = Arc::new(ChunkCache::new(options));
+        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+        let stream_idx = chunk_cache.add_stream_id(1).await;
+        let mut manifest = M3u8Manifest::new(options);
+        let mut expected_segment = BytesMut::new();
+
+        for part in 1..=560 {
+            let key = part == 1 || (part - 1) % 16 == 0;
+            let payload = Bytes::from(format!("part-{part};"));
+            let (playlist, segment_id, seq, idx, _) =
+                manifest.add_part_with_byte_len(80, key, payload.len());
+            assert_eq!(seq, part);
+
+            if segment_id == 32 {
+                expected_segment.extend_from_slice(&payload);
+            }
+
+            chunk_cache.add(stream_idx, part, payload).await.unwrap();
+            m3u8_cache.add(1, segment_id, seq, idx, playlist).unwrap();
+        }
+
+        assert!(!expected_segment.is_empty());
+        let handler = HlsHandler::new(chunk_cache, m3u8_cache);
+        let response = handler
+            .handle(
+                Request::builder().uri("/1/s32.mp4").body(()).unwrap(),
+                vec!["1", "s32.mp4"],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(response.body.as_deref(), Some(&expected_segment[..]));
+    }
+
+    #[tokio::test]
+    async fn retained_segment_uri_serves_from_unregistered_numeric_stream_slot() {
+        let options = Options {
+            segment_min_ms: 1_000,
+            target_duration_ms: 6_000,
+            part_target_ms: 80,
+            ..Options::default()
+        };
+        let chunk_cache = Arc::new(ChunkCache::new(options));
+        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+        let stream_idx = 1;
+        let mut manifest = M3u8Manifest::new(options);
+        let mut expected_segment = BytesMut::new();
+
+        for part in 1..=560 {
+            let key = part == 1 || (part - 1) % 16 == 0;
+            let payload = Bytes::from(format!("part-{part};"));
+            let (playlist, segment_id, seq, idx, _) =
+                manifest.add_part_with_byte_len(80, key, payload.len());
+            assert_eq!(seq, part);
+
+            if segment_id == 32 {
+                expected_segment.extend_from_slice(&payload);
+            }
+
+            chunk_cache.add(stream_idx, part, payload).await.unwrap();
+            m3u8_cache.add(1, segment_id, seq, idx, playlist).unwrap();
+        }
+
+        assert!(!expected_segment.is_empty());
+        let handler = HlsHandler::new(chunk_cache, m3u8_cache);
+        let response = handler
+            .handle(
+                Request::builder().uri("/1/s32.mp4").body(()).unwrap(),
+                vec!["1", "s32.mp4"],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(response.body.as_deref(), Some(&expected_segment[..]));
+    }
+
+    #[tokio::test]
+    async fn open_segment_uri_serves_at_segment_ring_boundary() {
+        let options = Options {
+            segment_min_ms: 1_000,
+            target_duration_ms: 6_000,
+            part_target_ms: 80,
+            ..Options::default()
+        };
+        let chunk_cache = Arc::new(ChunkCache::new(options));
+        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+        let stream_idx = 1;
+        let mut manifest = M3u8Manifest::new(options);
+        let mut expected_segment = BytesMut::new();
+        let mut reached_boundary = false;
+        let mut segment32_start_seq = None;
+        let mut segment32_last_seq = None;
+        let mut segment32_last_idx = None;
+
+        for part in 1..=520 {
+            let key = part == 1 || (part - 1) % 16 == 0;
+            let payload = Bytes::from(format!("part-{part};"));
+            let (playlist, segment_id, seq, idx, _) =
+                manifest.add_part_with_byte_len(80, key, payload.len());
+            assert_eq!(seq, part);
+
+            if segment_id == 32 {
+                reached_boundary = true;
+                segment32_start_seq.get_or_insert(seq);
+                segment32_last_seq = Some(seq);
+                segment32_last_idx = Some(idx);
+                expected_segment.extend_from_slice(&payload);
+            }
+
+            chunk_cache.add(stream_idx, part, payload).await.unwrap();
+            m3u8_cache.add(1, segment_id, seq, idx, playlist).unwrap();
+
+            if reached_boundary && expected_segment.len() > 64 {
+                break;
+            }
+        }
+
+        assert!(reached_boundary);
+        assert!(!expected_segment.is_empty());
+        assert_eq!(
+            m3u8_cache.last_position(1),
+            Some((32, segment32_last_idx.unwrap()))
+        );
+        assert_eq!(
+            m3u8_cache.get_idxs(1, 32).unwrap(),
+            Some((
+                segment32_start_seq.unwrap(),
+                segment32_last_seq.unwrap() + 1
+            ))
+        );
+        let handler = HlsHandler::new(chunk_cache, m3u8_cache);
+        let response = handler
+            .handle(
+                Request::builder().uri("/1/s32.mp4").body(()).unwrap(),
+                vec!["1", "s32.mp4"],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(response.body.as_deref(), Some(&expected_segment[..]));
+    }
+
+    #[tokio::test]
     async fn advertised_segment_uri_waits_for_complete_part_bytes() {
         let options = Options::default();
         let chunk_cache = Arc::new(ChunkCache::new(options));
