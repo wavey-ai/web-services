@@ -557,26 +557,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bindgen"
-version = "0.72.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
-dependencies = [
- "bitflags 2.9.3",
- "cexpr",
- "clang-sys",
- "itertools",
- "log",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash 2.1.1",
- "shlex",
- "syn 2.0.106",
-]
-
-[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3128,7 +3108,9 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 [[package]]
 name = "raptorq-datagram-fec"
 version = "0.1.0"
+source = "git+https://github.com/wavey-ai/raptor-fec.git#b37b14082a2bfc39476fdb70bdab4597ec19f6a2"
 dependencies = [
+ "bytes",
  "raptorq",
  "tokio",
 ]
@@ -3306,7 +3288,7 @@ name = "rist-sys"
 version = "0.1.0"
 source = "git+https://github.com/wavey-ai/rist-rs.git#4b04fee24f961827d5676425a2020fdcc59202d9"
 dependencies = [
- "bindgen 0.70.1",
+ "bindgen",
  "pkg-config",
 ]
 
@@ -3825,7 +3807,7 @@ dependencies = [
 [[package]]
 name = "srt"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/av-rs.git#5ac4c2ce4949a0194621ff46d72066909e2b9b5d"
+source = "git+https://github.com/wavey-ai/av-rs.git#104f0645e70b97f7a14ac0e5dbc2afa0db16596d"
 dependencies = [
  "lazy_static",
  "libc",
@@ -3867,9 +3849,9 @@ dependencies = [
 [[package]]
 name = "srt-sys"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/av-rs.git#5ac4c2ce4949a0194621ff46d72066909e2b9b5d"
+source = "git+https://github.com/wavey-ai/av-rs.git#104f0645e70b97f7a14ac0e5dbc2afa0db16596d"
 dependencies = [
- "bindgen 0.72.1",
+ "bindgen",
  "cmake",
  "libc",
 ]
