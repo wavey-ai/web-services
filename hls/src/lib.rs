@@ -377,6 +377,13 @@ impl HlsHandler {
         msn < last_msn || (msn == last_msn && part.unwrap_or(0) <= last_part)
     }
 
+    fn blocking_request_is_too_far_ahead(&self, sid: u64, msn: usize) -> bool {
+        let Some((last_msn, _)) = self.m3u8_cache.last_position(sid) else {
+            return false;
+        };
+        msn > last_msn.saturating_add(2)
+    }
+
     fn get_m3u8_snapshot(
         &self,
         sid: u64,
@@ -423,6 +430,17 @@ impl HlsHandler {
         part: Option<usize>,
         skip: bool,
     ) -> BlockingPlaylistReload {
+        if self.blocking_request_is_too_far_ahead(sid, msn) {
+            debug!(
+                stream_id = sid,
+                msn,
+                part = part.unwrap_or(0),
+                skip,
+                "rejecting LL-HLS blocking playlist request beyond advance MSN limit"
+            );
+            return BlockingPlaylistReload::Status(StatusCode::BAD_REQUEST);
+        }
+
         if self.blocking_request_is_behind_latest(sid, msn, part) {
             debug!(
                 stream_id = sid,
@@ -925,16 +943,16 @@ mod tests {
 
         let response_fut = handler.handle(
             Request::builder()
-                .uri("/1/stream.m3u8?_HLS_msn=140&_HLS_part=0")
+                .uri("/1/stream.m3u8?_HLS_msn=139&_HLS_part=0")
                 .body(())
                 .unwrap(),
             vec!["1", "stream.m3u8"],
-            Some("_HLS_msn=140&_HLS_part=0"),
+            Some("_HLS_msn=139&_HLS_part=0"),
         );
         let publish_fut = async move {
             sleep(Duration::from_millis(10)).await;
             writer_cache
-                .add(1, 140, 0, 0, Bytes::from_static(b"future-playlist"))
+                .add(1, 139, 0, 0, Bytes::from_static(b"future-playlist"))
                 .unwrap();
         };
 
@@ -943,6 +961,33 @@ mod tests {
 
         assert_eq!(response.status, StatusCode::OK);
         assert_ne!(response.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn future_blocking_playlist_reload_rejects_msn_more_than_two_ahead() {
+        let options = Options::default();
+        let handler = HlsHandler::new(
+            Arc::new(ChunkCache::new(options)),
+            Arc::new(M3u8Cache::new(options)),
+        );
+        handler
+            .m3u8_cache
+            .add(1, 137, 0, 0, Bytes::from_static(b"latest-playlist"))
+            .unwrap();
+
+        let response = handler
+            .handle(
+                Request::builder()
+                    .uri("/1/stream.m3u8?_HLS_msn=140&_HLS_part=0")
+                    .body(())
+                    .unwrap(),
+                vec!["1", "stream.m3u8"],
+                Some("_HLS_msn=140&_HLS_part=0"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1068,6 +1113,42 @@ mod tests {
             .unwrap();
         m3u8_cache
             .add(1, 2, 3, 0, Bytes::from_static(b"playlist-c"))
+            .unwrap();
+
+        let handler = HlsHandler::new(chunk_cache, m3u8_cache);
+        let response = handler
+            .handle(
+                Request::builder().uri("/1/s1.mp4").body(()).unwrap(),
+                vec!["1", "s1.mp4"],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(response.body.as_deref(), Some(&b"part-onepart-two"[..]));
+    }
+
+    #[tokio::test]
+    async fn open_segment_uri_serves_current_concatenated_media_parts() {
+        let options = Options::default();
+        let chunk_cache = Arc::new(ChunkCache::new(options));
+        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+        let stream_idx = chunk_cache.add_stream_id(1).await;
+        chunk_cache
+            .add(stream_idx, 1, Bytes::from_static(b"part-one"))
+            .await
+            .unwrap();
+        chunk_cache
+            .add(stream_idx, 2, Bytes::from_static(b"part-two"))
+            .await
+            .unwrap();
+        m3u8_cache
+            .add(1, 1, 1, 0, Bytes::from_static(b"playlist-a"))
+            .unwrap();
+        m3u8_cache
+            .add(1, 1, 2, 1, Bytes::from_static(b"playlist-b"))
             .unwrap();
 
         let handler = HlsHandler::new(chunk_cache, m3u8_cache);
