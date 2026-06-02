@@ -3,12 +3,31 @@ use bytes::Bytes;
 use http_pack::stream::{StreamHeaders, StreamRequestHeaders};
 use http_pack::{HeaderField, HttpVersion};
 use rist::tokio::AsyncReceiver;
-use rist::Profile;
+use rist::Profile as LibRistProfile;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::time::Duration;
 use tracing::{debug, error, info};
+
+/// RIST profile for the librist-backed ingest path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RistProfile {
+    Simple,
+    #[default]
+    Main,
+    Advanced,
+}
+
+impl From<RistProfile> for LibRistProfile {
+    fn from(profile: RistProfile) -> Self {
+        match profile {
+            RistProfile::Simple => Self::Simple,
+            RistProfile::Main => Self::Main,
+            RistProfile::Advanced => Self::Advanced,
+        }
+    }
+}
 
 /// Auth callback for RIST connections
 pub trait RistAuth: Send + Sync + 'static {
@@ -30,7 +49,7 @@ pub struct RistIngest<A: RistAuth = AllowAllRist> {
     service: Arc<UploadResponseService>,
     #[allow(dead_code)]
     auth: Arc<A>,
-    profile: Profile,
+    profile: RistProfile,
 }
 
 impl RistIngest<AllowAllRist> {
@@ -38,7 +57,7 @@ impl RistIngest<AllowAllRist> {
         Self {
             service,
             auth: Arc::new(AllowAllRist),
-            profile: Profile::Main,
+            profile: RistProfile::Main,
         }
     }
 }
@@ -48,12 +67,12 @@ impl<A: RistAuth> RistIngest<A> {
         Self {
             service,
             auth: Arc::new(auth),
-            profile: Profile::Main,
+            profile: RistProfile::Main,
         }
     }
 
     /// Set the RIST profile (Simple, Main, or Advanced)
-    pub fn with_profile(mut self, profile: Profile) -> Self {
+    pub fn with_profile(mut self, profile: RistProfile) -> Self {
         self.profile = profile;
         self
     }
@@ -71,7 +90,7 @@ impl<A: RistAuth> RistIngest<A> {
         // Create RIST URL for listening
         let url = format!("rist://@:{}", addr.port());
 
-        let receiver = AsyncReceiver::bind(profile, &url)?;
+        let receiver = AsyncReceiver::bind(profile.into(), &url)?;
 
         info!("RIST ingest server listening on {}", addr);
 

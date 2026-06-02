@@ -51,7 +51,7 @@ pub use srt::{AllowAll, AllowAllEncrypted, SrtAuth, SrtIngest};
 #[cfg(feature = "rist")]
 mod rist;
 #[cfg(feature = "rist")]
-pub use rist::{AllowAllRist, RistAuth, RistIngest};
+pub use rist::{AllowAllRist, RistAuth, RistIngest, RistProfile};
 
 #[cfg(feature = "rist-pure")]
 mod pure_rist;
