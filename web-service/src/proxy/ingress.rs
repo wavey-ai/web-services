@@ -6,8 +6,8 @@ use std::sync::Arc;
 pub struct ProxyIngress {
     state: Arc<ProxyState>,
     server: H2H3Server,
-    queue: Arc<ProxyQueue>,
-    worker_pool: WorkerPool,
+    _queue: Arc<ProxyQueue>,
+    _worker_pool: WorkerPool,
     quic_relay: Option<Arc<QuicRelayPool>>,
 }
 
@@ -48,8 +48,8 @@ impl ProxyIngress {
         Ok(Self {
             state,
             server,
-            queue,
-            worker_pool,
+            _queue: queue,
+            _worker_pool: worker_pool,
             quic_relay,
         })
     }

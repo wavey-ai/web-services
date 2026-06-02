@@ -140,6 +140,20 @@ impl HlsHandler {
             .and_then(|c| c.get(2))
             .and_then(|m| m.as_str().parse().ok())
     }
+
+    async fn resolve_chunk_stream_idx(&self, stream_id: u64) -> Option<usize> {
+        if let Some(idx) = self.chunk_cache.get_stream_idx(stream_id).await {
+            return Some(idx);
+        }
+
+        let requested_idx = usize::try_from(stream_id).ok()?;
+        if requested_idx < self.chunk_cache.options.num_playlists {
+            Some(requested_idx)
+        } else {
+            None
+        }
+    }
+
     async fn handle_m3u8(
         &self,
         id: u64,
@@ -288,7 +302,7 @@ impl RequestHandler for HlsHandler {
                     }
                 } else if file.starts_with('p') {
                     if let Some(id) = Self::extract_id(file) {
-                        if let Some(idx) = self.chunk_cache.get_stream_idx(sid).await {
+                        if let Some(idx) = self.resolve_chunk_stream_idx(sid).await {
                             if let Some(d) = self.get_part(idx as u64, id).await {
                                 Ok(HandlerResponse {
                                     status: StatusCode::OK,

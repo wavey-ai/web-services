@@ -32,7 +32,7 @@ impl TailStreamHandler {
 impl StreamingHandler for TailStreamHandler {
     async fn handle_stream(
         &self,
-        _req: Request<()>,
+        req: Request<()>,
         parts: Vec<&str>,
         mut writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()> {
@@ -49,28 +49,71 @@ impl StreamingHandler for TailStreamHandler {
             None if requested_idx < self.chunk_cache.options.num_playlists => requested_idx,
             None => return Err(ServerError::Config("Stream not found".into())),
         };
-        let mut last = self
-            .chunk_cache
-            .last(idx)
-            .ok_or(ServerError::Config("No data available for stream".into()))?;
-        info!("{} [{}] last sequence is {}", stream_id, idx, last);
+        let request = TailRequest::from_request(&req);
+        let current_last = self.chunk_cache.last(idx).unwrap_or(0);
+        let mut next = request
+            .after
+            .map(|after| after.saturating_add(1))
+            .unwrap_or_else(|| current_last.saturating_add(1));
+        info!(
+            "{} [{}] tail from sequence {} (last cached {}, mode {:?})",
+            stream_id, idx, next, current_last, request.mode
+        );
+
+        if request.mode == TailMode::OnePart {
+            if let Some((data, _)) = self
+                .get_part_with_timeout(idx, next, Duration::from_secs(30))
+                .await
+            {
+                let response = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Stream-Id", stream_id.to_string())
+                    .header("x-sequence", next.to_string())
+                    .header("content-type", "video/mp2t")
+                    .header("cache-control", "no-store")
+                    .body(())
+                    .unwrap();
+                writer.send_response(response).await?;
+                if let Err(e) = writer.send_data(data).await {
+                    info!(
+                        "tail client disconnected for stream {} [{}]: {}",
+                        stream_id, idx, e
+                    );
+                }
+            } else {
+                let response = Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .header("Stream-Id", stream_id.to_string())
+                    .header("cache-control", "no-store")
+                    .body(())
+                    .unwrap();
+                writer.send_response(response).await?;
+            }
+            return Ok(());
+        }
 
         let response = Response::builder()
             .status(StatusCode::OK)
             .header("Stream-Id", stream_id.to_string())
-            .header("content-type", "video/mp4")
-            .header("cache-control", "no-cache")
+            .header("content-type", "video/mp2t")
+            .header("cache-control", "no-store")
             .body(())
             .unwrap();
         writer.send_response(response).await?;
 
         loop {
-            if let Some((data, _)) = self.get_part_with_timeout(idx, last).await {
+            if let Some((data, _)) = self
+                .get_part_with_timeout(idx, next, Duration::from_secs(3))
+                .await
+            {
                 if let Err(e) = writer.send_data(data).await {
-                    info!("tail client disconnected for stream {} [{}]: {}", stream_id, idx, e);
+                    info!(
+                        "tail client disconnected for stream {} [{}]: {}",
+                        stream_id, idx, e
+                    );
                     return Ok(());
                 }
-                last += 1;
+                next += 1;
             } else {
                 sleep(Duration::from_millis(5)).await;
             }
@@ -84,8 +127,12 @@ impl StreamingHandler for TailStreamHandler {
 }
 
 impl TailStreamHandler {
-    async fn get_part_with_timeout(&self, idx: usize, id: usize) -> Option<(Bytes, u64)> {
-        let timeout = Duration::from_secs(3);
+    async fn get_part_with_timeout(
+        &self,
+        idx: usize,
+        id: usize,
+        timeout: Duration,
+    ) -> Option<(Bytes, u64)> {
         let start = Instant::now();
         let interval = Duration::from_millis(1);
 
@@ -96,6 +143,45 @@ impl TailStreamHandler {
             sleep(interval).await;
         }
         None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailMode {
+    Stream,
+    OnePart,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TailRequest {
+    mode: TailMode,
+    after: Option<usize>,
+}
+
+impl TailRequest {
+    fn from_request(req: &Request<()>) -> Self {
+        let mut mode = TailMode::Stream;
+        let mut after = None;
+
+        if let Some(query) = req.uri().query() {
+            for pair in query.split('&') {
+                let mut parts = pair.splitn(2, '=');
+                let key = parts.next().unwrap_or_default();
+                let value = parts.next().unwrap_or_default();
+                match key {
+                    "after" => after = value.parse::<usize>().ok(),
+                    "mode" if matches!(value, "part" | "once" | "long-poll") => {
+                        mode = TailMode::OnePart;
+                    }
+                    "once" | "poll" if matches!(value, "1" | "true") => {
+                        mode = TailMode::OnePart;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Self { mode, after }
     }
 }
 

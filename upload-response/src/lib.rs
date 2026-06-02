@@ -70,7 +70,7 @@ pub use tcp::{AllowAllTcp, RequireClientCert, TcpAuth, TcpIngest};
 mod udp_fec;
 #[cfg(feature = "udp-fec")]
 pub use udp_fec::{
-    UdpFecIngest, UdpFecSender, DEFAULT_REPAIR_SYMBOLS, DEFAULT_SOURCE_SYMBOLS,
+    SequenceStats, UdpFecIngest, UdpFecSender, DEFAULT_REPAIR_SYMBOLS, DEFAULT_SOURCE_SYMBOLS,
     DEFAULT_SYMBOL_SIZE, HEADER_LEN,
 };
 

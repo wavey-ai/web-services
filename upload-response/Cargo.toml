@@ -30,7 +30,7 @@ reqwest = { version = "0.12", features = ["rustls-tls", "http2"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 srt = { git = "https://github.com/wavey-ai/av-rs.git", features = ["async"], optional = true }
-raptorq-datagram-fec = { version = "0.1", default-features = false, optional = true }
+raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git", default-features = false, optional = true }
 rist = { git = "https://github.com/wavey-ai/rist-rs.git", features = ["tokio"], optional = true }
 rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", branch = "pure-rust", optional = true }
 rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", branch = "pure-rust", optional = true }

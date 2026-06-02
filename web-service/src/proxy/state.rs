@@ -27,6 +27,7 @@ pub struct ProxyState {
     mode: RwLock<LoadBalancingMode>,
     upstream_protocol: UpstreamProtocol,
     http_client: Option<ProxyHttpClient>,
+    #[allow(dead_code)]
     h3_pool: Option<H3ConnectionPool>,
 }
 
@@ -45,7 +46,7 @@ impl ProxyState {
     pub fn new_with_limits_and_protocol(
         mode: LoadBalancingMode,
         max_queue: Option<usize>,
-        upstream_protocol: UpstreamProtocol,
+        _upstream_protocol: UpstreamProtocol,
         upstream_ca_cert_base64: Option<&str>,
     ) -> anyhow::Result<Self> {
         // Always use HTTP/1.1 for upstream connections (ignoring upstream_protocol setting)
@@ -87,6 +88,7 @@ impl ProxyState {
         self.http_client.as_ref()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn h3_pool(&self) -> Option<&H3ConnectionPool> {
         self.h3_pool.as_ref()
     }
@@ -179,6 +181,7 @@ fn build_proxy_client(
     Ok(client_builder.build(https))
 }
 
+#[allow(dead_code)]
 fn build_h3_endpoint(ca_cert_base64: &str) -> anyhow::Result<quinn::Endpoint> {
     let mut tls_config = build_upstream_tls_config(ca_cert_base64)?;
     tls_config.enable_early_data = true;

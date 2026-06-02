@@ -6,7 +6,8 @@ use http_pack::stream::{StreamHeaders, StreamRequestHeaders};
 use http_pack::{HeaderField, HttpVersion};
 use raptorq_datagram_fec::{DatagramFecDecoder, ENCODING_PACKET_HEADER_LEN};
 pub use raptorq_datagram_fec::{
-    UdpFecSender, DEFAULT_REPAIR_SYMBOLS, DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE, HEADER_LEN,
+    SequenceStats, UdpFecSender, DEFAULT_REPAIR_SYMBOLS, DEFAULT_SOURCE_SYMBOLS,
+    DEFAULT_SYMBOL_SIZE, HEADER_LEN,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -96,7 +97,18 @@ async fn handle_datagram(
     let decoder = peer_decoders.entry(peer).or_default();
 
     if let Some(decoded) = decoder.push_datagram(buf)? {
+        let stats = decoder.sequence_stats();
         debug!(stream_id, bytes = decoded.len(), "UDP+FEC block decoded");
+        if stats.missing > 0 || stats.duplicate_or_reordered > 0 {
+            debug!(
+                stream_id,
+                received = stats.received,
+                missing = stats.missing,
+                duplicate_or_reordered = stats.duplicate_or_reordered,
+                loss_fraction = stats.loss_fraction(),
+                "UDP+FEC sequence recovery stats"
+            );
+        }
         service
             .append_request_body(stream_id, Bytes::from(decoded))
             .await
