@@ -21,6 +21,7 @@ pub mod streaming;
 
 const BLOCKING_RELOAD_TIMEOUT: Duration = Duration::from_secs(18);
 const BLOCKING_RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(3);
+const SEGMENT_AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 const PRIORITY_HEADER: &str = "priority";
 const PLAYLIST_PRIORITY: &str = "u=1, i";
 const MEDIA_PRIORITY: &str = "u=2";
@@ -592,6 +593,14 @@ impl HlsHandler {
         (!bytes.is_empty()).then(|| bytes.freeze())
     }
 
+    fn segment_is_advertised(&self, sid: u64, segment_id: usize) -> bool {
+        self.m3u8_cache
+            .get_idxs(sid, segment_id)
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     async fn get_segment_for_request(
         &self,
         req: &Request<()>,
@@ -607,11 +616,35 @@ impl HlsHandler {
         });
 
         let Some(blocking_start) = blocking_start else {
-            return self
-                .get_segment(sid, segment_id)
-                .await
-                .map(SegmentResponse::Found)
-                .unwrap_or(SegmentResponse::Status(StatusCode::NOT_FOUND));
+            if let Some(bytes) = self.get_segment(sid, segment_id).await {
+                return SegmentResponse::Found(bytes);
+            }
+            if !self.segment_is_advertised(sid, segment_id) {
+                return SegmentResponse::Status(StatusCode::NOT_FOUND);
+            }
+
+            debug!(
+                stream_id = sid,
+                segment_id, "LL-HLS advertised segment request is waiting for complete part bytes"
+            );
+
+            let result = timeout(SEGMENT_AVAILABILITY_TIMEOUT, async {
+                loop {
+                    if let Some(bytes) = self.get_segment(sid, segment_id).await {
+                        return SegmentResponse::Found(bytes);
+                    }
+                    sleep(BLOCKING_RELOAD_POLL_INTERVAL).await;
+                }
+            })
+            .await;
+
+            return result.unwrap_or_else(|_| {
+                debug!(
+                    stream_id = sid,
+                    segment_id, "LL-HLS advertised segment request timed out"
+                );
+                SegmentResponse::Status(StatusCode::SERVICE_UNAVAILABLE)
+            });
         };
 
         debug!(
@@ -1364,6 +1397,52 @@ mod tests {
             )
             .await
             .unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(response.body.as_deref(), Some(&b"part-onepart-two"[..]));
+    }
+
+    #[tokio::test]
+    async fn advertised_segment_uri_waits_for_complete_part_bytes() {
+        let options = Options::default();
+        let chunk_cache = Arc::new(ChunkCache::new(options));
+        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+        let stream_idx = chunk_cache.add_stream_id(1).await;
+        let mut manifest = M3u8Manifest::new(options);
+        let (first_playlist, first_segment, first_seq, first_idx, _) =
+            manifest.add_part_with_byte_len(100, true, 8);
+        let (second_playlist, second_segment, second_seq, second_idx, _) =
+            manifest.add_part_with_byte_len(100, false, 8);
+
+        chunk_cache
+            .add(stream_idx, 1, Bytes::from_static(b"part-one"))
+            .await
+            .unwrap();
+        m3u8_cache
+            .add(1, first_segment, first_seq, first_idx, first_playlist)
+            .unwrap();
+        m3u8_cache
+            .add(1, second_segment, second_seq, second_idx, second_playlist)
+            .unwrap();
+
+        let writer_chunk_cache = Arc::clone(&chunk_cache);
+        let handler = HlsHandler::new(chunk_cache, m3u8_cache);
+        let response_fut = handler.handle(
+            Request::builder().uri("/1/s1.mp4").body(()).unwrap(),
+            vec!["1", "s1.mp4"],
+            None,
+        );
+        let publish_fut = async move {
+            sleep(Duration::from_millis(10)).await;
+            writer_chunk_cache
+                .add(stream_idx, 2, Bytes::from_static(b"part-two"))
+                .await
+                .unwrap();
+        };
+
+        let (response, _) = tokio::join!(response_fut, publish_fut);
+        let response = response.unwrap();
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
