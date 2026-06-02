@@ -675,6 +675,7 @@ fn build_cache(slots: usize) -> ChunkCache {
         max_parted_segments: 1,
         segment_min_ms: 0,
         target_duration_ms: 6000,
+        part_target_ms: 500,
         buffer_size_kb: BUFFER_SIZE_KB,
         init_size_kb: BUFFER_INIT_KB,
     };

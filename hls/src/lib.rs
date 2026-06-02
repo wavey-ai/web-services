@@ -21,6 +21,9 @@ pub mod streaming;
 
 const BLOCKING_RELOAD_TIMEOUT: Duration = Duration::from_secs(18);
 const BLOCKING_RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(3);
+const PRIORITY_HEADER: &str = "priority";
+const PLAYLIST_PRIORITY: &str = "u=1, i";
+const MEDIA_PRIORITY: &str = "u=2";
 
 enum BlockingPlaylistReload {
     Found(Bytes, u64),
@@ -30,6 +33,12 @@ enum BlockingPlaylistReload {
 enum SegmentResponse {
     Found(Bytes),
     Status(StatusCode),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ByteRangeRequest {
+    start: usize,
+    end: Option<usize>,
 }
 
 /// HLS-specific router implementation
@@ -152,6 +161,10 @@ impl HlsHandler {
             None
         }
     }
+
+    fn priority_header(value: &str) -> (String, String) {
+        (PRIORITY_HEADER.to_string(), value.to_string())
+    }
     fn extract_id(s: &str) -> Option<usize> {
         Regex::new(r"(s|p)(\d+)(\.mp4|\.ts)$")
             .unwrap()
@@ -160,7 +173,7 @@ impl HlsHandler {
             .and_then(|m| m.as_str().parse().ok())
     }
 
-    fn request_range_start(req: &Request<()>) -> Option<usize> {
+    fn request_byte_range(req: &Request<()>) -> Option<ByteRangeRequest> {
         let range = req.headers().get(RANGE)?.to_str().ok()?;
         let spec = range.trim().strip_prefix("bytes=")?;
         if spec.contains(',') {
@@ -170,7 +183,14 @@ impl HlsHandler {
         if start.is_empty() {
             return None;
         }
-        start.parse().ok()
+        let (start, end) = spec.split_once('-')?;
+        let start = start.parse().ok()?;
+        let end = if end.is_empty() {
+            None
+        } else {
+            Some(end.parse().ok()?)
+        };
+        Some(ByteRangeRequest { start, end })
     }
 
     async fn resolve_chunk_stream_idx(&self, stream_id: u64) -> Option<usize> {
@@ -289,6 +309,7 @@ impl HlsHandler {
             let mut headers = vec![
                 (ACCEPT_RANGES.as_str().to_string(), "none".to_string()),
                 (VARY.as_str().to_string(), "accept-encoding".to_string()),
+                Self::priority_header(PLAYLIST_PRIORITY),
             ];
             if gzip {
                 headers.push(("content-encoding".into(), "gzip".into()));
@@ -577,35 +598,34 @@ impl HlsHandler {
         sid: u64,
         segment_id: usize,
     ) -> SegmentResponse {
-        let range_start = Self::request_range_start(req);
-        let should_block_for_preload = range_start
-            .and_then(|start| {
-                self.preload_hint_start(sid, segment_id)
-                    .filter(|hint_start| start >= *hint_start)
-                    .map(|hint_start| (start, hint_start))
-            })
-            .is_some();
+        let byte_range = Self::request_byte_range(req);
+        let blocking_start = byte_range.and_then(|range| {
+            let hint_start = self.preload_hint_start(sid, segment_id)?;
+            let overlaps_hint =
+                range.start >= hint_start || range.end.is_none_or(|end| end >= hint_start);
+            overlaps_hint.then_some(range.start.max(hint_start))
+        });
 
-        if !should_block_for_preload {
+        let Some(blocking_start) = blocking_start else {
             return self
                 .get_segment(sid, segment_id)
                 .await
                 .map(SegmentResponse::Found)
                 .unwrap_or(SegmentResponse::Status(StatusCode::NOT_FOUND));
-        }
+        };
 
-        let start = range_start.unwrap_or_default();
         debug!(
             stream_id = sid,
             segment_id,
-            range_start = start,
+            range_start = byte_range.map(|range| range.start).unwrap_or_default(),
+            blocking_start,
             "LL-HLS segment preload range request is waiting for complete part bytes"
         );
 
         let result = timeout(BLOCKING_RELOAD_TIMEOUT, async {
             loop {
                 if let Some(bytes) = self.get_segment(sid, segment_id).await {
-                    if bytes.len() > start {
+                    if bytes.len() > blocking_start {
                         return SegmentResponse::Found(bytes);
                     }
                 }
@@ -618,7 +638,8 @@ impl HlsHandler {
             debug!(
                 stream_id = sid,
                 segment_id,
-                range_start = start,
+                range_start = byte_range.map(|range| range.start).unwrap_or_default(),
+                blocking_start,
                 "LL-HLS segment preload range request timed out"
             );
             SegmentResponse::Status(StatusCode::SERVICE_UNAVAILABLE)
@@ -683,6 +704,7 @@ impl RequestHandler for HlsHandler {
                             status: StatusCode::OK,
                             body: Some(data),
                             content_type: Some("video/mp4".into()),
+                            headers: vec![Self::priority_header(MEDIA_PRIORITY)],
                             ..Default::default()
                         })
                     } else {
@@ -698,6 +720,7 @@ impl RequestHandler for HlsHandler {
                                 status: StatusCode::OK,
                                 body: Some(bytes),
                                 content_type: Self::detect_content_type(file).map(String::from),
+                                headers: vec![Self::priority_header(MEDIA_PRIORITY)],
                                 ..Default::default()
                             }),
                             SegmentResponse::Status(status) => Ok(HandlerResponse {
@@ -719,6 +742,7 @@ impl RequestHandler for HlsHandler {
                                     status: StatusCode::OK,
                                     body: Some(d.0),
                                     content_type: Self::detect_content_type(file).map(String::from),
+                                    headers: vec![Self::priority_header(MEDIA_PRIORITY)],
                                     etag: Some(d.1),
                                     ..Default::default()
                                 })
@@ -848,6 +872,10 @@ mod tests {
             response_header(&response, ACCEPT_RANGES.as_str()),
             Some("none")
         );
+        assert_eq!(
+            response_header(&response, PRIORITY_HEADER),
+            Some(PLAYLIST_PRIORITY)
+        );
         assert!(response_header(&response, CONTENT_ENCODING.as_str()).is_none());
         assert_eq!(decompress_body(&response), expected_playlist);
     }
@@ -873,6 +901,10 @@ mod tests {
         assert_eq!(
             response_header(&response, ACCEPT_RANGES.as_str()),
             Some("none")
+        );
+        assert_eq!(
+            response_header(&response, PRIORITY_HEADER),
+            Some(PLAYLIST_PRIORITY)
         );
         assert_eq!(
             response_header(&response, CONTENT_ENCODING.as_str()),
@@ -919,6 +951,7 @@ mod tests {
             max_segments: 10,
             segment_min_ms: 1000,
             target_duration_ms: 1000,
+            part_target_ms: 1000,
             ..Options::default()
         };
         let chunk_cache = Arc::new(ChunkCache::new(options));
@@ -983,6 +1016,7 @@ mod tests {
             max_segments: 10,
             segment_min_ms: 1000,
             target_duration_ms: 1000,
+            part_target_ms: 1000,
             ..Options::default()
         };
         let chunk_cache = Arc::new(ChunkCache::new(options));
@@ -1293,6 +1327,10 @@ mod tests {
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(
+            response_header(&response, PRIORITY_HEADER),
+            Some(MEDIA_PRIORITY)
+        );
         assert_eq!(response.body.as_deref(), Some(&b"part-onepart-two"[..]));
     }
 
@@ -1359,6 +1397,57 @@ mod tests {
             Request::builder()
                 .uri("/1/s1.mp4")
                 .header(RANGE, "bytes=8-")
+                .body(())
+                .unwrap(),
+            vec!["1", "s1.mp4"],
+            None,
+        );
+        let publish_fut = async move {
+            sleep(Duration::from_millis(10)).await;
+            writer_chunk_cache
+                .add(stream_idx, 2, Bytes::from_static(b"part-two"))
+                .await
+                .unwrap();
+            writer_m3u8_cache
+                .add(1, second_segment, second_seq, second_idx, second_playlist)
+                .unwrap();
+        };
+
+        let (response, _) = tokio::join!(response_fut, publish_fut);
+        let response = response.unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(response.body.as_deref(), Some(&b"part-onepart-two"[..]));
+    }
+
+    #[tokio::test]
+    async fn open_segment_preload_overlapping_range_waits_for_next_complete_part() {
+        let options = Options::default();
+        let chunk_cache = Arc::new(ChunkCache::new(options));
+        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+        let stream_idx = chunk_cache.add_stream_id(1).await;
+        let mut manifest = M3u8Manifest::new(options);
+        let (first_playlist, first_segment, first_seq, first_idx, _) =
+            manifest.add_part_with_byte_len(100, true, 8);
+        let (second_playlist, second_segment, second_seq, second_idx, _) =
+            manifest.add_part_with_byte_len(100, false, 8);
+
+        chunk_cache
+            .add(stream_idx, 1, Bytes::from_static(b"part-one"))
+            .await
+            .unwrap();
+        m3u8_cache
+            .add(1, first_segment, first_seq, first_idx, first_playlist)
+            .unwrap();
+
+        let writer_chunk_cache = Arc::clone(&chunk_cache);
+        let writer_m3u8_cache = Arc::clone(&m3u8_cache);
+        let handler = HlsHandler::new(chunk_cache, m3u8_cache);
+        let response_fut = handler.handle(
+            Request::builder()
+                .uri("/1/s1.mp4")
+                .header(RANGE, "bytes=0-15")
                 .body(())
                 .unwrap(),
             vec!["1", "s1.mp4"],
