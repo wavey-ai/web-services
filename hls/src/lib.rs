@@ -27,6 +27,11 @@ enum BlockingPlaylistReload {
     Status(StatusCode),
 }
 
+enum SegmentResponse {
+    Found(Bytes),
+    Status(StatusCode),
+}
+
 /// HLS-specific router implementation
 pub struct HlsRouter {
     handlers: Vec<Box<dyn RequestHandler>>,
@@ -153,6 +158,19 @@ impl HlsHandler {
             .captures(s)
             .and_then(|c| c.get(2))
             .and_then(|m| m.as_str().parse().ok())
+    }
+
+    fn request_range_start(req: &Request<()>) -> Option<usize> {
+        let range = req.headers().get(RANGE)?.to_str().ok()?;
+        let spec = range.trim().strip_prefix("bytes=")?;
+        if spec.contains(',') {
+            return None;
+        }
+        let (start, _) = spec.split_once('-')?;
+        if start.is_empty() {
+            return None;
+        }
+        start.parse().ok()
     }
 
     async fn resolve_chunk_stream_idx(&self, stream_id: u64) -> Option<usize> {
@@ -336,6 +354,13 @@ impl HlsHandler {
         Ok(Bytes::from(decoded))
     }
 
+    fn decompress_gzip_playlist_to_string(bytes: Bytes) -> std::io::Result<String> {
+        let mut decoder = GzDecoder::new(bytes.as_ref());
+        let mut decoded = String::new();
+        decoder.read_to_string(&mut decoded)?;
+        Ok(decoded)
+    }
+
     fn skip_requested(qp: &HashMap<&str, &str>) -> bool {
         matches!(qp.get("_HLS_skip"), Some(&"YES" | &"v2"))
     }
@@ -377,11 +402,47 @@ impl HlsHandler {
         msn < last_msn || (msn == last_msn && part.unwrap_or(0) <= last_part)
     }
 
-    fn blocking_request_is_too_far_ahead(&self, sid: u64, msn: usize) -> bool {
-        let Some((last_msn, _)) = self.m3u8_cache.last_position(sid) else {
+    fn blocking_request_is_too_far_ahead(&self, sid: u64, msn: usize, part: Option<usize>) -> bool {
+        let Some((last_msn, last_part)) = self.m3u8_cache.last_position(sid) else {
             return false;
         };
-        msn > last_msn.saturating_add(2)
+        if msn > last_msn.saturating_add(2) {
+            return true;
+        }
+        let Some(part) = part else {
+            return false;
+        };
+        let advance_part_limit = self.advance_part_limit(sid).unwrap_or(3);
+        part > last_part.saturating_add(advance_part_limit)
+    }
+
+    fn advance_part_limit(&self, sid: u64) -> Option<usize> {
+        let (playlist, _) = self.m3u8_cache.last(sid).ok()??;
+        let playlist = Self::decompress_gzip_playlist_to_string(playlist).ok()?;
+        let part_target = parse_part_target_seconds(&playlist)?;
+        if part_target < 1.0 {
+            Some((3.0 / part_target).ceil().max(1.0) as usize)
+        } else {
+            Some(3)
+        }
+    }
+
+    fn preload_hint_start(&self, sid: u64, segment_id: usize) -> Option<usize> {
+        let (playlist, _) = self.m3u8_cache.last(sid).ok()??;
+        let playlist = Self::decompress_gzip_playlist_to_string(playlist).ok()?;
+        let expected_uri = format!("s{segment_id}.mp4");
+        playlist.lines().find_map(|line| {
+            let attrs = line.strip_prefix("#EXT-X-PRELOAD-HINT:")?;
+            if parse_attribute_value(attrs, "TYPE")? != "PART" {
+                return None;
+            }
+            if parse_attribute_value(attrs, "URI")? != expected_uri {
+                return None;
+            }
+            parse_attribute_value(attrs, "BYTERANGE-START")?
+                .parse()
+                .ok()
+        })
     }
 
     fn get_m3u8_snapshot(
@@ -430,7 +491,7 @@ impl HlsHandler {
         part: Option<usize>,
         skip: bool,
     ) -> BlockingPlaylistReload {
-        if self.blocking_request_is_too_far_ahead(sid, msn) {
+        if self.blocking_request_is_too_far_ahead(sid, msn, part) {
             debug!(
                 stream_id = sid,
                 msn,
@@ -509,6 +570,61 @@ impl HlsHandler {
         }
         (!bytes.is_empty()).then(|| bytes.freeze())
     }
+
+    async fn get_segment_for_request(
+        &self,
+        req: &Request<()>,
+        sid: u64,
+        segment_id: usize,
+    ) -> SegmentResponse {
+        let range_start = Self::request_range_start(req);
+        let should_block_for_preload = range_start
+            .and_then(|start| {
+                self.preload_hint_start(sid, segment_id)
+                    .filter(|hint_start| start >= *hint_start)
+                    .map(|hint_start| (start, hint_start))
+            })
+            .is_some();
+
+        if !should_block_for_preload {
+            return self
+                .get_segment(sid, segment_id)
+                .await
+                .map(SegmentResponse::Found)
+                .unwrap_or(SegmentResponse::Status(StatusCode::NOT_FOUND));
+        }
+
+        let start = range_start.unwrap_or_default();
+        debug!(
+            stream_id = sid,
+            segment_id,
+            range_start = start,
+            "LL-HLS segment preload range request is waiting for complete part bytes"
+        );
+
+        let result = timeout(BLOCKING_RELOAD_TIMEOUT, async {
+            loop {
+                if let Some(bytes) = self.get_segment(sid, segment_id).await {
+                    if bytes.len() > start {
+                        return SegmentResponse::Found(bytes);
+                    }
+                }
+                sleep(BLOCKING_RELOAD_POLL_INTERVAL).await;
+            }
+        })
+        .await;
+
+        result.unwrap_or_else(|_| {
+            debug!(
+                stream_id = sid,
+                segment_id,
+                range_start = start,
+                "LL-HLS segment preload range request timed out"
+            );
+            SegmentResponse::Status(StatusCode::SERVICE_UNAVAILABLE)
+        })
+    }
+
     async fn get_part(&self, idx: u64, part: usize) -> Option<(Bytes, u64)> {
         self.chunk_cache.get(idx as usize, part).await
     }
@@ -577,18 +693,17 @@ impl RequestHandler for HlsHandler {
                     }
                 } else if file.starts_with('s') {
                     if let Some(id) = Self::extract_id(file) {
-                        if let Some(bytes) = self.get_segment(sid, id).await {
-                            Ok(HandlerResponse {
+                        match self.get_segment_for_request(&req, sid, id).await {
+                            SegmentResponse::Found(bytes) => Ok(HandlerResponse {
                                 status: StatusCode::OK,
                                 body: Some(bytes),
                                 content_type: Self::detect_content_type(file).map(String::from),
                                 ..Default::default()
-                            })
-                        } else {
-                            Ok(HandlerResponse {
-                                status: StatusCode::NOT_FOUND,
+                            }),
+                            SegmentResponse::Status(status) => Ok(HandlerResponse {
+                                status,
                                 ..Default::default()
-                            })
+                            }),
                         }
                     } else {
                         Ok(HandlerResponse {
@@ -641,6 +756,22 @@ impl RequestHandler for HlsHandler {
     fn can_handle(&self, _path: &str) -> bool {
         true
     }
+}
+
+fn parse_part_target_seconds(playlist: &str) -> Option<f64> {
+    playlist.lines().find_map(|line| {
+        let attrs = line.strip_prefix("#EXT-X-PART-INF:")?;
+        parse_attribute_value(attrs, "PART-TARGET")
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+    })
+}
+
+fn parse_attribute_value<'a>(attributes: &'a str, name: &str) -> Option<&'a str> {
+    attributes.split(',').find_map(|attribute| {
+        let (attribute_name, value) = attribute.split_once('=')?;
+        (attribute_name == name).then_some(value.trim_matches('"'))
+    })
 }
 
 #[cfg(test)]
@@ -787,6 +918,7 @@ mod tests {
         let options = Options {
             max_segments: 10,
             segment_min_ms: 1000,
+            target_duration_ms: 1000,
             ..Options::default()
         };
         let chunk_cache = Arc::new(ChunkCache::new(options));
@@ -850,6 +982,7 @@ mod tests {
         let options = Options {
             max_segments: 10,
             segment_min_ms: 1000,
+            target_duration_ms: 1000,
             ..Options::default()
         };
         let chunk_cache = Arc::new(ChunkCache::new(options));
@@ -983,6 +1116,39 @@ mod tests {
                     .unwrap(),
                 vec!["1", "stream.m3u8"],
                 Some("_HLS_msn=140&_HLS_part=0"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn blocking_playlist_reload_rejects_part_beyond_advance_limit() {
+        let options = Options::default();
+        let handler = HlsHandler::new(
+            Arc::new(ChunkCache::new(options)),
+            Arc::new(M3u8Cache::new(options)),
+        );
+        handler
+            .m3u8_cache
+            .add(
+                1,
+                9,
+                1,
+                1,
+                Bytes::from_static(b"#EXTM3U\n#EXT-X-PART-INF:PART-TARGET=0.05000\n"),
+            )
+            .unwrap();
+
+        let response = handler
+            .handle(
+                Request::builder()
+                    .uri("/1/stream.m3u8?_HLS_msn=9&_HLS_part=70")
+                    .body(())
+                    .unwrap(),
+                vec!["1", "stream.m3u8"],
+                Some("_HLS_msn=9&_HLS_part=70"),
             )
             .await
             .unwrap();
@@ -1160,6 +1326,57 @@ mod tests {
             )
             .await
             .unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(response.body.as_deref(), Some(&b"part-onepart-two"[..]));
+    }
+
+    #[tokio::test]
+    async fn open_segment_preload_range_waits_for_next_complete_part() {
+        let options = Options::default();
+        let chunk_cache = Arc::new(ChunkCache::new(options));
+        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+        let stream_idx = chunk_cache.add_stream_id(1).await;
+        let mut manifest = M3u8Manifest::new(options);
+        let (first_playlist, first_segment, first_seq, first_idx, _) =
+            manifest.add_part_with_byte_len(100, true, 8);
+        let (second_playlist, second_segment, second_seq, second_idx, _) =
+            manifest.add_part_with_byte_len(100, false, 8);
+
+        chunk_cache
+            .add(stream_idx, 1, Bytes::from_static(b"part-one"))
+            .await
+            .unwrap();
+        m3u8_cache
+            .add(1, first_segment, first_seq, first_idx, first_playlist)
+            .unwrap();
+
+        let writer_chunk_cache = Arc::clone(&chunk_cache);
+        let writer_m3u8_cache = Arc::clone(&m3u8_cache);
+        let handler = HlsHandler::new(chunk_cache, m3u8_cache);
+        let response_fut = handler.handle(
+            Request::builder()
+                .uri("/1/s1.mp4")
+                .header(RANGE, "bytes=8-")
+                .body(())
+                .unwrap(),
+            vec!["1", "s1.mp4"],
+            None,
+        );
+        let publish_fut = async move {
+            sleep(Duration::from_millis(10)).await;
+            writer_chunk_cache
+                .add(stream_idx, 2, Bytes::from_static(b"part-two"))
+                .await
+                .unwrap();
+            writer_m3u8_cache
+                .add(1, second_segment, second_seq, second_idx, second_playlist)
+                .unwrap();
+        };
+
+        let (response, _) = tokio::join!(response_fut, publish_fut);
+        let response = response.unwrap();
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.content_type.as_deref(), Some("video/mp4"));
