@@ -255,7 +255,11 @@ async fn handle_srt_connection(
                 }
             }
             Ok(Err(e)) => {
-                error!(stream_id, error = %e, "SRT read error");
+                if is_srt_peer_closed_error(&e) {
+                    debug!(stream_id, error = %e, "SRT peer closed stream");
+                } else {
+                    error!(stream_id, error = %e, "SRT read error");
+                }
                 break;
             }
             Err(_) => {
@@ -318,4 +322,27 @@ async fn handle_srt_connection(
 
     upload_stream.close().await;
     result
+}
+
+fn is_srt_peer_closed_error(error: &std::io::Error) -> bool {
+    let text = error.to_string();
+    text.contains("srt_recv error: 2001")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_srt_peer_closed_error;
+    use std::io;
+
+    #[test]
+    fn classifies_srt_peer_close_error() {
+        let error = io::Error::new(io::ErrorKind::Other, "srt_recv error: 2001 (errno = 0)");
+        assert!(is_srt_peer_closed_error(&error));
+    }
+
+    #[test]
+    fn leaves_other_srt_errors_as_errors() {
+        let error = io::Error::new(io::ErrorKind::Other, "srt_recv error: 1001 (errno = 0)");
+        assert!(!is_srt_peer_closed_error(&error));
+    }
 }
