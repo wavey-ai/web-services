@@ -1,7 +1,7 @@
 use crate::traits::HandlerResponse;
 use bytes::Bytes;
 use http::{
-    header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
+    header::{ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
     HeaderMap, StatusCode,
 };
 
@@ -21,6 +21,20 @@ pub(crate) fn apply_byte_range(
     };
 
     if response.status != StatusCode::OK {
+        response.body = Some(body);
+        return response;
+    }
+
+    if response_header_value(&response.headers, ACCEPT_RANGES.as_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("none"))
+    {
+        response.body = Some(body);
+        return response;
+    }
+
+    if response_header_value(&response.headers, CONTENT_ENCODING.as_str())
+        .is_some_and(|value| !value.trim().eq_ignore_ascii_case("identity"))
+    {
         response.body = Some(body);
         return response;
     }
@@ -125,6 +139,14 @@ fn remove_generated_range_headers(headers: &mut Vec<(String, String)>) {
     });
 }
 
+fn response_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers.iter().find_map(|(candidate, value)| {
+        candidate
+            .eq_ignore_ascii_case(name)
+            .then_some(value.as_str())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +218,42 @@ mod tests {
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body.as_deref(), Some(&b"abcdefghi"[..]));
+    }
+
+    #[test]
+    fn accept_ranges_none_ignores_range_request() {
+        let mut response = response(b"abcdefghi");
+        response
+            .headers
+            .push((ACCEPT_RANGES.as_str().to_string(), "none".to_string()));
+
+        let response = apply_byte_range(&headers("bytes=2-5"), response);
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body.as_deref(), Some(&b"abcdefghi"[..]));
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("accept-ranges") && value == "none"
+        }));
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-range")));
+    }
+
+    #[test]
+    fn content_encoded_response_ignores_range_request() {
+        let mut response = response(b"abcdefghi");
+        response
+            .headers
+            .push((CONTENT_ENCODING.as_str().to_string(), "gzip".to_string()));
+
+        let response = apply_byte_range(&headers("bytes=2-5"), response);
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body.as_deref(), Some(&b"abcdefghi"[..]));
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-range")));
     }
 }

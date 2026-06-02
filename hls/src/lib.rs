@@ -1,9 +1,14 @@
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use http::{Method, Request, StatusCode};
+use flate2::read::GzDecoder;
+use http::{
+    Method, Request, StatusCode,
+    header::{ACCEPT_ENCODING, ACCEPT_RANGES, RANGE, VARY},
+};
 use playlists::chunk_cache::ChunkCache;
 use playlists::m3u8_cache::M3u8Cache;
 use regex::Regex;
+use std::io::Read;
 use std::{collections::HashMap, sync::Arc};
 use tokio::time::{Duration, sleep, timeout};
 use tracing::debug;
@@ -165,6 +170,7 @@ impl HlsHandler {
 
     async fn handle_m3u8(
         &self,
+        req: &Request<()>,
         id: u64,
         qp: HashMap<&str, &str>,
     ) -> HandlerResult<HandlerResponse> {
@@ -256,14 +262,24 @@ impl HlsHandler {
                 hash,
                 "LL-HLS playlist response ready"
             );
+            let gzip = Self::request_accepts_gzip(req) && !req.headers().contains_key(RANGE);
+            let body = if gzip {
+                bytes
+            } else {
+                Self::decompress_gzip_playlist(bytes)?
+            };
+            let mut headers = vec![
+                (ACCEPT_RANGES.as_str().to_string(), "none".to_string()),
+                (VARY.as_str().to_string(), "accept-encoding".to_string()),
+            ];
+            if gzip {
+                headers.push(("content-encoding".into(), "gzip".into()));
+            }
             Ok(HandlerResponse {
                 status: StatusCode::OK,
-                body: Some(bytes),
+                body: Some(body),
                 content_type: Some("application/vnd.apple.mpegurl".to_string()),
-                headers: vec![
-                    ("content-encoding".into(), "gzip".into()),
-                    ("vary".into(), "accept-encoding".into()),
-                ],
+                headers,
                 etag: Some(hash),
             })
         } else {
@@ -273,6 +289,51 @@ impl HlsHandler {
                 ..Default::default()
             })
         }
+    }
+
+    fn request_accepts_gzip(req: &Request<()>) -> bool {
+        let Some(value) = req
+            .headers()
+            .get(ACCEPT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return false;
+        };
+
+        let mut wildcard_accepts = false;
+        for encoding in value.split(',') {
+            let mut parts = encoding.split(';').map(str::trim);
+            let Some(coding) = parts.next().filter(|coding| !coding.is_empty()) else {
+                continue;
+            };
+            let q = parts
+                .find_map(|part| {
+                    let (name, value) = part.split_once('=')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("q")
+                        .then(|| value.trim().parse::<f32>().ok())
+                        .flatten()
+                })
+                .unwrap_or(1.0);
+
+            if coding.eq_ignore_ascii_case("gzip") {
+                return q > 0.0;
+            }
+            if coding == "*" {
+                wildcard_accepts = q > 0.0;
+            }
+        }
+
+        wildcard_accepts
+    }
+
+    fn decompress_gzip_playlist(bytes: Bytes) -> HandlerResult<Bytes> {
+        let mut decoder = GzDecoder::new(bytes.as_ref());
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).map_err(|error| {
+            ServerError::Config(format!("failed to decompress playlist: {error}"))
+        })?;
+        Ok(Bytes::from(decoded))
     }
 
     fn skip_requested(qp: &HashMap<&str, &str>) -> bool {
@@ -481,7 +542,7 @@ impl RequestHandler for HlsHandler {
                     .parse::<u64>()
                     .map_err(|_| ServerError::Config("Invalid stream ID".into()))?;
                 if file == &"stream.m3u8" {
-                    self.handle_m3u8(sid, qp).await
+                    self.handle_m3u8(&req, sid, qp).await
                 } else if file == &"init.mp4" {
                     if let Ok(data) = self.m3u8_cache.get_init(sid) {
                         Ok(HandlerResponse {
@@ -568,17 +629,32 @@ impl RequestHandler for HlsHandler {
 mod tests {
     use super::*;
     use flate2::read::GzDecoder;
+    use http::header::CONTENT_ENCODING;
     use playlists::{
         Options, chunk_cache::ChunkCache, m3u8_cache::M3u8Cache, m3u8_manifest::M3u8Manifest,
     };
     use std::io::Read;
 
+    fn response_header<'a>(response: &'a HandlerResponse, name: &str) -> Option<&'a str> {
+        response.headers.iter().find_map(|(candidate, value)| {
+            candidate
+                .eq_ignore_ascii_case(name)
+                .then_some(value.as_str())
+        })
+    }
+
     fn decompress_body(response: &HandlerResponse) -> String {
         let body = response.body.as_ref().expect("response body");
-        let mut decoder = GzDecoder::new(body.as_ref());
-        let mut decoded = String::new();
-        decoder.read_to_string(&mut decoded).unwrap();
-        decoded
+        if response_header(response, CONTENT_ENCODING.as_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("gzip"))
+        {
+            let mut decoder = GzDecoder::new(body.as_ref());
+            let mut decoded = String::new();
+            decoder.read_to_string(&mut decoded).unwrap();
+            decoded
+        } else {
+            String::from_utf8(body.to_vec()).expect("playlist utf8")
+        }
     }
 
     fn generated_ll_playlist(options: Options) -> (Bytes, usize, usize, usize) {
@@ -589,6 +665,71 @@ mod tests {
         }
         let (playlist, segment_id, seq, idx, _) = latest.unwrap();
         (playlist, segment_id, seq, idx)
+    }
+
+    fn handler_with_cached_playlist(options: Options) -> (HlsHandler, String) {
+        let chunk_cache = Arc::new(ChunkCache::new(options));
+        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+        let playlist = M3u8Manifest::new(options).m3u8();
+        let playlist_text = String::from_utf8(playlist.to_vec()).expect("playlist utf8");
+        m3u8_cache.add(1, 1, 0, 0, playlist).unwrap();
+        (HlsHandler::new(chunk_cache, m3u8_cache), playlist_text)
+    }
+
+    #[tokio::test]
+    async fn playlist_range_request_serves_identity_full_playlist() {
+        let (handler, expected_playlist) = handler_with_cached_playlist(Options::default());
+
+        let response = handler
+            .handle(
+                Request::builder()
+                    .uri("/1/stream.m3u8")
+                    .header(RANGE, "bytes=0-1445")
+                    .header(ACCEPT_ENCODING, "identity")
+                    .body(())
+                    .unwrap(),
+                vec!["1", "stream.m3u8"],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response_header(&response, ACCEPT_RANGES.as_str()),
+            Some("none")
+        );
+        assert!(response_header(&response, CONTENT_ENCODING.as_str()).is_none());
+        assert_eq!(decompress_body(&response), expected_playlist);
+    }
+
+    #[tokio::test]
+    async fn playlist_gzip_request_serves_gzip_full_playlist() {
+        let (handler, expected_playlist) = handler_with_cached_playlist(Options::default());
+
+        let response = handler
+            .handle(
+                Request::builder()
+                    .uri("/1/stream.m3u8")
+                    .header(ACCEPT_ENCODING, "gzip, identity;q=0.5")
+                    .body(())
+                    .unwrap(),
+                vec!["1", "stream.m3u8"],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response_header(&response, ACCEPT_RANGES.as_str()),
+            Some("none")
+        );
+        assert_eq!(
+            response_header(&response, CONTENT_ENCODING.as_str()),
+            Some("gzip")
+        );
+        assert_eq!(decompress_body(&response), expected_playlist);
     }
 
     #[tokio::test]
