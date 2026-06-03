@@ -78,7 +78,7 @@ The shared-memory `ChunkCache` and slot-based streaming architecture are inspire
 | RIST Pure | UDP | PSK/SRP support in progress | Socket addr | Pure Rust `rist-core`/`rist-mio` ingest |
 | RTMP | TCP | None | Stream key | Plain TCP, media ingest |
 | RTMPS | TCP | TLS | Stream key | TLS-wrapped RTMP |
-| UDP+FEC | UDP | None | None | RaptorQ FEC, lowest-latency reliable delivery |
+| UDP+FEC | UDP | None | None | RaptorQ FEC, lowest-latency bounded-loss delivery |
 
 Some protocols require optional crate features such as `srt`, `rist`, `rist-pure`, `webrtc`, or `udp-fec`. The default feature set only enables `tcp`.
 
@@ -186,7 +186,7 @@ UDP+FEC, enabled by the `udp-fec` feature, uses the extracted [`raptorq-datagram
 | `src_syms` | `u16` LE | `K`, source symbols per block |
 | `sym_sz` | `u16` LE | `T`, symbol size in bytes, default `1316` |
 
-Defaults: `K=4`, `T=1316`, `R=1` repair symbol. That recovers any single datagram loss per block with about `80 ms` latency overhead at `48 kHz` and `960`-sample frames. The sequenced header also lets receivers report missing/reordered datagrams while RaptorQ repairs complete blocks.
+Defaults: `K=4`, `T=1316`, `R=1` repair symbol. That recovers any single datagram loss per block with about `80 ms` latency overhead at `48 kHz` and `960`-sample frames. The sequenced header also lets receivers report missing/reordered datagrams while RaptorQ repairs complete blocks. Loss beyond the repair budget is not recovered by FEC alone; callers that need eventual delivery must add a repair/backfill path.
 
 ```rust
 use upload_response::{UdpFecIngest, UdpFecSender};
@@ -353,7 +353,7 @@ Latency characteristics for streaming and real-time delivery, such as audio fram
 | HTTP/2 | Multiplexing plus HOL at the TCP layer | Worse than TCP |
 | HTTP/3 | QUIC avoids per-stream HOL, but adds crypto RTT | ~50-100 ms |
 
-SRT and RIST trade latency for reliability via retransmission. A lost packet always costs at least one additional RTT. UDP+FEC pays the latency cost up front and deterministically, so worst-case latency is fixed at block-fill time regardless of packet loss.
+SRT and RIST trade latency for reliability via retransmission. A lost packet always costs at least one additional RTT, but retransmission from history can eventually recover loss that exceeds a small FEC budget. UDP+FEC pays the latency cost up front and deterministically, so worst-case recovery latency is fixed at block-fill time for loss that stays inside the configured repair budget.
 
 Avoid `K=1, R=1` for live media unless you explicitly want 100% repair overhead on each tiny packet. The reusable RaptorQ crates now carry packet sequencing in the compact FEC header and expose media-aware adaptive repair so small delta/data packets can avoid unnecessary repair while keyframes/audio can receive more protection:
 
