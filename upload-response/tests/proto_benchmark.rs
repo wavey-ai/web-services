@@ -5,6 +5,8 @@ use portpicker::pick_unused_port;
 #[cfg(feature = "rist")]
 use rist::Profile as LibRistProfile;
 use std::net::SocketAddr;
+#[cfg(feature = "srt")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::time::{interval, Duration};
@@ -35,7 +37,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 // SRT imports
 #[cfg(feature = "srt")]
-use srt::{AsyncStream, ConnectOptions};
+use srt::{AsyncStream, ConnectOptions, MaxBandwidth};
 use tokio::io::AsyncWriteExt;
 
 // RTMP imports
@@ -634,7 +636,8 @@ async fn run_srt_upload_test(
     port: u16,
     upload_size_mb: usize,
 ) -> (f64, bool) {
-    run_srt_upload_test_inner(_service, port, upload_size_mb, None).await
+    let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+    run_srt_upload_test_inner(_service, addr, upload_size_mb, None).await
 }
 
 #[cfg(feature = "srt")]
@@ -644,13 +647,14 @@ async fn run_srt_upload_test_encrypted(
     upload_size_mb: usize,
     passphrase: &str,
 ) -> (f64, bool) {
-    run_srt_upload_test_inner(_service, port, upload_size_mb, Some(passphrase)).await
+    let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+    run_srt_upload_test_inner(_service, addr, upload_size_mb, Some(passphrase)).await
 }
 
 #[cfg(feature = "srt")]
 async fn run_srt_upload_test_inner(
     service: Arc<UploadResponseService>,
-    port: u16,
+    addr: SocketAddr,
     upload_size_mb: usize,
     passphrase: Option<&str>,
 ) -> (f64, bool) {
@@ -669,17 +673,21 @@ async fn run_srt_upload_test_inner(
     let (data, expected_hash) = generate_test_data(upload_size_bytes);
     println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
 
-    let addr = format!("127.0.0.1:{}", port);
     let connect_options = ConnectOptions {
         stream_id: Some("test-stream".to_string()),
         passphrase: passphrase.map(|p| p.to_string()),
+        timestamp_based_packet_delivery_mode: Some(false),
+        too_late_packet_drop: Some(false),
+        receive_buffer_size: Some(36_400_000),
+        send_buffer_size: Some(36_400_000),
+        max_bandwidth: Some(MaxBandwidth::Infinite),
         ..Default::default()
     };
 
     println!("Uploading {} MB via {}...", upload_size_mb, proto);
     let start = Instant::now();
 
-    let mut stream = AsyncStream::connect(&addr, &connect_options)
+    let mut stream = AsyncStream::connect(addr, &connect_options)
         .await
         .expect("SRT connect");
 
@@ -696,10 +704,10 @@ async fn run_srt_upload_test_inner(
     if let Err(e) = stream.flush().await {
         println!("{} flush error: {}", proto, e);
     }
-    // Give time for data to be received before dropping
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    drop(stream);
 
+    // The SRT wrapper's flush/shutdown methods do not wait for libSRT to deliver
+    // buffered datagrams. Keep the socket alive until the ingest cache proves the
+    // full request body arrived.
     let recovered = match wait_for_recovered_request_body(
         service,
         data.len(),
@@ -713,6 +721,7 @@ async fn run_srt_upload_test_inner(
             return (0.0, false);
         }
     };
+    drop(stream);
 
     let total_elapsed = start.elapsed();
     let expected_hex = format!("{:016x}", expected_hash);
@@ -741,6 +750,152 @@ async fn run_srt_upload_test_inner(
     }
 
     (throughput, passed)
+}
+
+#[cfg(feature = "srt")]
+#[derive(Default)]
+struct SrtLossProxyStats {
+    client_to_server_received: AtomicU64,
+    client_to_server_forwarded: AtomicU64,
+    client_to_server_dropped: AtomicU64,
+    server_to_client_received: AtomicU64,
+    server_to_client_forwarded: AtomicU64,
+}
+
+#[cfg(feature = "srt")]
+#[derive(Debug, Clone, Copy)]
+struct SrtLossProxySnapshot {
+    client_to_server_received: u64,
+    client_to_server_forwarded: u64,
+    client_to_server_dropped: u64,
+    server_to_client_received: u64,
+    server_to_client_forwarded: u64,
+}
+
+#[cfg(feature = "srt")]
+impl SrtLossProxyStats {
+    fn snapshot(&self) -> SrtLossProxySnapshot {
+        SrtLossProxySnapshot {
+            client_to_server_received: self.client_to_server_received.load(Ordering::Relaxed),
+            client_to_server_forwarded: self.client_to_server_forwarded.load(Ordering::Relaxed),
+            client_to_server_dropped: self.client_to_server_dropped.load(Ordering::Relaxed),
+            server_to_client_received: self.server_to_client_received.load(Ordering::Relaxed),
+            server_to_client_forwarded: self.server_to_client_forwarded.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(feature = "srt")]
+async fn start_srt_loss_proxy(
+    target: SocketAddr,
+    warmup_client_packets: u64,
+    drop_every_client_packet: u64,
+) -> (
+    SocketAddr,
+    Arc<SrtLossProxyStats>,
+    tokio::task::JoinHandle<()>,
+) {
+    let socket = Arc::new(
+        tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind SRT loss proxy"),
+    );
+    let proxy_addr = socket.local_addr().expect("SRT loss proxy local addr");
+    let stats = Arc::new(SrtLossProxyStats::default());
+    let task_socket = Arc::clone(&socket);
+    let task_stats = Arc::clone(&stats);
+
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_536];
+        let mut client_addr = None::<SocketAddr>;
+        let mut server_addr = target;
+
+        loop {
+            let Ok((len, peer)) = task_socket.recv_from(&mut buf).await else {
+                break;
+            };
+
+            if client_addr.is_some_and(|client| peer != client) || peer == target {
+                server_addr = peer;
+                task_stats
+                    .server_to_client_received
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(client) = client_addr {
+                    if task_socket.send_to(&buf[..len], client).await.is_ok() {
+                        task_stats
+                            .server_to_client_forwarded
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                continue;
+            }
+
+            if client_addr.is_none() {
+                client_addr = Some(peer);
+            }
+            let received = task_stats
+                .client_to_server_received
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            let should_drop = drop_every_client_packet > 0
+                && received > warmup_client_packets
+                && (received - warmup_client_packets) % drop_every_client_packet == 0;
+            if should_drop {
+                task_stats
+                    .client_to_server_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            if task_socket.send_to(&buf[..len], server_addr).await.is_ok() {
+                task_stats
+                    .client_to_server_forwarded
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+
+    (proxy_addr, stats, handle)
+}
+
+#[cfg(feature = "srt")]
+async fn run_srt_loss_upload_test(
+    service: Arc<UploadResponseService>,
+    server_port: u16,
+    upload_size_mb: usize,
+    warmup_client_packets: u64,
+    drop_every_client_packet: u64,
+    timeout_secs: u64,
+) -> (f64, bool, SrtLossProxySnapshot) {
+    let target: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
+    let (proxy_addr, proxy_stats, proxy_handle) =
+        start_srt_loss_proxy(target, warmup_client_packets, drop_every_client_packet).await;
+
+    let (throughput, passed) = match tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        run_srt_upload_test_inner(service, proxy_addr, upload_size_mb, None),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            println!("SRT loss-proxy upload timed out after {timeout_secs}s");
+            (0.0, false)
+        }
+    };
+    let snapshot = proxy_stats.snapshot();
+    proxy_handle.abort();
+
+    println!(
+        "SRT loss proxy: c2s recv={} fwd={} drop={} s2c recv={} fwd={}",
+        snapshot.client_to_server_received,
+        snapshot.client_to_server_forwarded,
+        snapshot.client_to_server_dropped,
+        snapshot.server_to_client_received,
+        snapshot.server_to_client_forwarded
+    );
+
+    (throughput, passed, snapshot)
 }
 
 #[derive(Debug)]
@@ -1203,6 +1358,31 @@ async fn test_srt_8mb_recovery() {
     println!("============================\n");
 
     assert!(passed, "SRT recovery test failed");
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "srt")]
+async fn test_srt_2mb_loss_recovery_baseline() {
+    let port = pick_unused_port().expect("pick port");
+    let (service, shutdown_tx) = setup_srt_server(port, 2).await;
+
+    println!("\n=== SRT 2MB Loss Recovery Baseline ===");
+    let (throughput, passed, proxy_stats) =
+        run_srt_loss_upload_test(service, port, 2, 128, 25, 10).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("======================================\n");
+
+    assert!(
+        proxy_stats.client_to_server_dropped > 0,
+        "SRT loss proxy should drop client-to-server datagrams: {:?}",
+        proxy_stats
+    );
+    assert!(
+        passed,
+        "SRT failed to recover within the bounded loss budget: {:?}",
+        proxy_stats
+    );
     let _ = shutdown_tx.send(());
 }
 
