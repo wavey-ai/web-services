@@ -215,6 +215,53 @@ fn generate_test_data(size_bytes: usize) -> (Vec<u8>, u64) {
     (data, hasher.digest())
 }
 
+fn hash_hex(data: &[u8]) -> String {
+    let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+    hasher.update(data);
+    format!("{:016x}", hasher.digest())
+}
+
+fn upload_recovery_timeout(upload_size_mb: usize) -> Duration {
+    Duration::from_secs((30 + upload_size_mb as u64 * 4).min(300))
+}
+
+async fn wait_for_recovered_request_body(
+    service: Arc<UploadResponseService>,
+    expected_bytes: usize,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut recovered = Vec::with_capacity(expected_bytes);
+    let mut best_len = 0usize;
+    loop {
+        if Instant::now() > deadline {
+            println!(
+                "recovered {}/{} request bytes before timeout",
+                best_len, expected_bytes
+            );
+            return None;
+        }
+
+        for slot in service.active_stream_slots() {
+            recovered.clear();
+            let last = service.request_last(slot.stream_id).unwrap_or(0);
+            for slot_id in 2..=last {
+                if let Some(TailSlot::Body(bytes)) =
+                    service.tail_request(slot.stream_id, slot_id).await
+                {
+                    recovered.extend_from_slice(&bytes);
+                    best_len = best_len.max(recovered.len());
+                    if recovered.len() >= expected_bytes {
+                        return Some(recovered[..expected_bytes].to_vec());
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[cfg(feature = "udp-fec")]
 fn udp_fec_benchmark_size_mb(env_name: &str, default_mb: usize) -> usize {
     std::env::var(env_name)
@@ -602,7 +649,7 @@ async fn run_srt_upload_test_encrypted(
 
 #[cfg(feature = "srt")]
 async fn run_srt_upload_test_inner(
-    _service: Arc<UploadResponseService>,
+    service: Arc<UploadResponseService>,
     port: u16,
     upload_size_mb: usize,
     passphrase: Option<&str>,
@@ -653,9 +700,25 @@ async fn run_srt_upload_test_inner(
     tokio::time::sleep(Duration::from_millis(100)).await;
     drop(stream);
 
+    let recovered = match wait_for_recovered_request_body(
+        service,
+        data.len(),
+        upload_recovery_timeout(upload_size_mb),
+    )
+    .await
+    {
+        Some(recovered) => recovered,
+        None => {
+            println!("{} timed out waiting for recovered body", proto);
+            return (0.0, false);
+        }
+    };
+
     let total_elapsed = start.elapsed();
     let expected_hex = format!("{:016x}", expected_hash);
+    let got_hex = hash_hex(&recovered);
     let throughput = upload_size_mb as f64 / total_elapsed.as_secs_f64();
+    let passed = recovered == data;
 
     println!(
         "{}: {:.2}s ({:.1} MB/s)",
@@ -664,14 +727,17 @@ async fn run_srt_upload_test_inner(
         throughput
     );
     println!("Expected: {}", expected_hex);
-    println!("Got:      ({} upload only - no response yet)", proto);
+    println!("Got:      {}", got_hex);
 
-    // For now, pass if upload completes without error
-    let passed = true;
     if passed {
         println!("{} PASSED\n", proto);
     } else {
-        println!("{} FAILED\n", proto);
+        println!(
+            "{} FAILED: recovered {} bytes, expected {}\n",
+            proto,
+            recovered.len(),
+            data.len()
+        );
     }
 
     (throughput, passed)
@@ -1123,6 +1189,21 @@ fn drive_pure_rist_feedback(sender: &mut rist_mio_pure::MainMioSender, buf: &mut
             }
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "srt")]
+async fn test_srt_8mb_recovery() {
+    let port = pick_unused_port().expect("pick port");
+    let (service, shutdown_tx) = setup_srt_server(port, 8).await;
+
+    println!("\n=== SRT 8MB Recovery Test ===");
+    let (throughput, passed) = run_srt_upload_test(service, port, 8).await;
+    println!("Throughput: {:.1} MB/s", throughput);
+    println!("============================\n");
+
+    assert!(passed, "SRT recovery test failed");
+    let _ = shutdown_tx.send(());
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -11,7 +11,7 @@ use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info};
 
 const MAX_SRT_PACKET_SIZE: usize = 1316;
-const READ_TIMEOUT_SECS: u64 = 30;
+const READ_TIMEOUT_SECS: u64 = 300;
 
 /// Auth callback for SRT connections
 /// The stream_id typically contains: "bearer:<token>" or just the stream key
