@@ -274,6 +274,31 @@ fn udp_fec_benchmark_size_mb(env_name: &str, default_mb: usize) -> usize {
 }
 
 #[cfg(feature = "udp-fec")]
+fn udp_fec_u16_env(env_name: &str, default: u16) -> u16 {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "udp-fec")]
+fn udp_fec_u32_env(env_name: &str, default: u32) -> u32 {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "udp-fec")]
+fn udp_fec_u64_env(env_name: &str, default: u64) -> u64 {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "udp-fec")]
 fn udp_fec_recovery_timeout(upload_size_mb: usize) -> Duration {
     Duration::from_secs((30 + upload_size_mb as u64 * 8).min(300))
 }
@@ -3126,7 +3151,7 @@ async fn run_udp_fec_upload_test(
     port: u16,
     upload_size_mb: usize,
 ) -> (f64, bool) {
-    use upload_response::{DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE};
+    use upload_response::{DEFAULT_REPAIR_SYMBOLS, DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE};
 
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
     println!("Generating {} MB test data for UDP+FEC...", upload_size_mb);
@@ -3135,12 +3160,21 @@ async fn run_udp_fec_upload_test(
     println!("Generated in {:.2}s", gen_start.elapsed().as_secs_f64());
 
     let target: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let mut sender = UdpFecSender::new(target).await.expect("UdpFecSender::new");
+    let source_symbols = udp_fec_u16_env("UDP_FEC_UPLOAD_SOURCE_SYMBOLS", DEFAULT_SOURCE_SYMBOLS);
+    let repair_symbols = udp_fec_u32_env("UDP_FEC_UPLOAD_REPAIR_SYMBOLS", DEFAULT_REPAIR_SYMBOLS);
+    let mut sender = UdpFecSender::new(target)
+        .await
+        .expect("UdpFecSender::new")
+        .with_source_symbols(source_symbols)
+        .with_repair_symbols(repair_symbols);
 
     // Each FEC block holds K * T bytes of source payload.
-    let block_payload = DEFAULT_SOURCE_SYMBOLS as usize * DEFAULT_SYMBOL_SIZE as usize;
+    let block_payload = source_symbols as usize * DEFAULT_SYMBOL_SIZE as usize;
 
-    println!("Uploading {} MB via UDP+FEC...", upload_size_mb);
+    println!(
+        "Uploading {} MB via UDP+FEC (K={}, R={})...",
+        upload_size_mb, source_symbols, repair_symbols
+    );
     let start = Instant::now();
 
     for chunk in data.chunks(block_payload) {
@@ -3202,12 +3236,15 @@ async fn run_udp_fec_loss_test(service: Arc<UploadResponseService>, port: u16) -
     let upload_size_mb = udp_fec_benchmark_size_mb("UDP_FEC_LOSS_MB", 10);
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
     let (data, _) = generate_test_data(upload_size_bytes);
-    let block_payload = DEFAULT_SOURCE_SYMBOLS as usize * DEFAULT_SYMBOL_SIZE as usize;
+    let source_symbols = udp_fec_u16_env("UDP_FEC_LOSS_SOURCE_SYMBOLS", DEFAULT_SOURCE_SYMBOLS);
+    let repair_symbols = udp_fec_u32_env("UDP_FEC_LOSS_REPAIR_SYMBOLS", 2);
+    let drop_every = udp_fec_u64_env("UDP_FEC_LOSS_DROP_EVERY", 5);
+    let block_payload = source_symbols as usize * DEFAULT_SYMBOL_SIZE as usize;
 
     let target: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // Proxy socket: receive datagrams from the sender and forward to the real
-    // ingest, dropping every 5th datagram.
+    // ingest, dropping every Nth datagram.
     let proxy_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let proxy_sock = Arc::new(UdpSocket::bind(proxy_bind).await.expect("proxy bind"));
     let proxy_addr = proxy_sock.local_addr().unwrap();
@@ -3221,7 +3258,7 @@ async fn run_udp_fec_loss_test(service: Arc<UploadResponseService>, port: u16) -
             match fwd_sock.recv_from(&mut buf).await {
                 Ok((n, _)) => {
                     count += 1;
-                    if count % 5 != 0 {
+                    if drop_every == 0 || count % drop_every != 0 {
                         let _ = fwd_sock.send_to(&buf[..n], fwd_target).await;
                     }
                 }
@@ -3230,15 +3267,15 @@ async fn run_udp_fec_loss_test(service: Arc<UploadResponseService>, port: u16) -
         }
     });
 
-    // 2 repair symbols — survives losing 2 of K+R datagrams per block.
     let mut sender = UdpFecSender::new(proxy_addr)
         .await
-        .expect("UdpFecSender proxy");
-    sender = sender.with_repair_symbols(2);
+        .expect("UdpFecSender proxy")
+        .with_source_symbols(source_symbols)
+        .with_repair_symbols(repair_symbols);
 
     println!(
-        "Running UDP+FEC loss-recovery test ({} MB, drop every 5th pkt)...",
-        upload_size_mb
+        "Running UDP+FEC loss-recovery test ({} MB, K={}, R={}, drop every {} pkt)...",
+        upload_size_mb, source_symbols, repair_symbols, drop_every
     );
     let start = Instant::now();
 
