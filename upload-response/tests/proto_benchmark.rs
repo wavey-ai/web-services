@@ -2,17 +2,24 @@ use bytes::Bytes;
 use http::StatusCode;
 use http_pack::stream::{StreamHeaders, StreamResponseHeaders};
 use portpicker::pick_unused_port;
-use rist::Profile as RistProfile;
+#[cfg(feature = "rist")]
+use rist::Profile as LibRistProfile;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::time::{interval, Duration};
-use upload_response::{
-    AllowAllEncrypted, ResponseWatcher, RistIngest, SrtIngest, TailSlot, TcpIngest,
-    UploadResponseConfig, UploadResponseRouter, UploadResponseService, WebRtcIngest,
-};
+#[cfg(feature = "webrtc")]
+use upload_response::WebRtcIngest;
+#[cfg(feature = "srt")]
+use upload_response::{AllowAllEncrypted, SrtIngest};
 #[cfg(feature = "rist-pure")]
 use upload_response::{PureRistIngest, PureRistProfile};
+use upload_response::{
+    ResponseWatcher, TailSlot, TcpIngest, UploadResponseConfig, UploadResponseRouter,
+    UploadResponseService,
+};
+#[cfg(feature = "rist")]
+use upload_response::{RistIngest, RistProfile};
 #[cfg(feature = "udp-fec")]
 use upload_response::{UdpFecIngest, UdpFecSender};
 use web_service::{H2H3Server, Server, ServerBuilder};
@@ -27,6 +34,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
 // SRT imports
+#[cfg(feature = "srt")]
 use srt::{AsyncStream, ConnectOptions};
 use tokio::io::AsyncWriteExt;
 
@@ -40,10 +48,15 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 // WebRTC imports
+#[cfg(feature = "webrtc")]
 use futures::{select, FutureExt};
+#[cfg(feature = "webrtc")]
 use futures_timer::Delay;
+#[cfg(feature = "webrtc")]
 use matchbox_signaling::topologies::client_server::{ClientServer, ClientServerState};
+#[cfg(feature = "webrtc")]
 use matchbox_signaling::SignalingServerBuilder;
+#[cfg(feature = "webrtc")]
 use matchbox_socket::{ChannelConfig, PeerState, WebRtcSocket, WebRtcSocketBuilder};
 
 use base64::Engine;
@@ -200,6 +213,29 @@ fn generate_test_data(size_bytes: usize) -> (Vec<u8>, u64) {
     }
 
     (data, hasher.digest())
+}
+
+#[cfg(feature = "udp-fec")]
+fn udp_fec_benchmark_size_mb(env_name: &str, default_mb: usize) -> usize {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_mb)
+}
+
+#[cfg(feature = "udp-fec")]
+fn udp_fec_recovery_timeout(upload_size_mb: usize) -> Duration {
+    Duration::from_secs((30 + upload_size_mb as u64 * 8).min(300))
+}
+
+#[cfg(feature = "udp-fec")]
+fn udp_fec_loss_pace() -> Duration {
+    let micros = std::env::var("UDP_FEC_LOSS_PACE_US")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(250);
+    Duration::from_micros(micros)
 }
 
 async fn run_upload_test(port: u16, upload_size_mb: usize, use_http2: bool) -> (f64, bool) {
@@ -545,6 +581,7 @@ async fn run_wss_upload_test(
     (throughput, passed)
 }
 
+#[cfg(feature = "srt")]
 async fn run_srt_upload_test(
     _service: Arc<UploadResponseService>,
     port: u16,
@@ -553,6 +590,7 @@ async fn run_srt_upload_test(
     run_srt_upload_test_inner(_service, port, upload_size_mb, None).await
 }
 
+#[cfg(feature = "srt")]
 async fn run_srt_upload_test_encrypted(
     _service: Arc<UploadResponseService>,
     port: u16,
@@ -562,6 +600,7 @@ async fn run_srt_upload_test_encrypted(
     run_srt_upload_test_inner(_service, port, upload_size_mb, Some(passphrase)).await
 }
 
+#[cfg(feature = "srt")]
 async fn run_srt_upload_test_inner(
     _service: Arc<UploadResponseService>,
     port: u16,
@@ -732,6 +771,7 @@ async fn setup_server(
     shutdown_tx
 }
 
+#[cfg(feature = "srt")]
 async fn setup_srt_server(
     port: u16,
     upload_size_mb: usize,
@@ -765,8 +805,10 @@ async fn setup_srt_server(
     (service, shutdown_tx)
 }
 
+#[cfg(feature = "srt")]
 const SRT_PASSPHRASE: &str = "benchmark-test-passphrase-1234";
 
+#[cfg(feature = "srt")]
 async fn setup_srt_server_encrypted(
     port: u16,
     upload_size_mb: usize,
@@ -803,6 +845,7 @@ async fn setup_srt_server_encrypted(
     (service, shutdown_tx)
 }
 
+#[cfg(feature = "srt")]
 async fn setup_srt_server_high_throughput(
     port: u16,
     upload_size_mb: usize,
@@ -841,6 +884,7 @@ async fn setup_srt_server_high_throughput(
 
 // ============== RIST Tests ==============
 
+#[cfg(feature = "rist")]
 async fn setup_rist_server(
     port: u16,
     upload_size_mb: usize,
@@ -874,6 +918,7 @@ async fn setup_rist_server(
     (service, shutdown_tx)
 }
 
+#[cfg(feature = "rist")]
 async fn run_rist_upload_test(
     _service: Arc<UploadResponseService>,
     port: u16,
@@ -893,7 +938,7 @@ async fn run_rist_upload_test(
     println!("Uploading {} MB via RIST...", upload_size_mb);
     let start = Instant::now();
 
-    let mut sender = match RistSender::new(RistProfile::Main) {
+    let mut sender = match RistSender::new(LibRistProfile::Main) {
         Ok(s) => s,
         Err(e) => {
             println!("RIST sender create failed: {}", e);
@@ -1081,6 +1126,7 @@ fn drive_pure_rist_feedback(sender: &mut rist_mio_pure::MainMioSender, buf: &mut
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "srt")]
 async fn test_srt_100mb() {
     let port = pick_unused_port().expect("pick port");
     let (service, shutdown_tx) = setup_srt_server(port, 100).await;
@@ -1095,6 +1141,7 @@ async fn test_srt_100mb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "srt")]
 async fn test_srt_encrypted_100mb() {
     let port = pick_unused_port().expect("pick port");
     let (service, shutdown_tx) = setup_srt_server_encrypted(port, 100).await;
@@ -1110,6 +1157,7 @@ async fn test_srt_encrypted_100mb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "rist")]
 async fn test_rist_100mb() {
     let port = pick_unused_port().expect("pick port");
     let (service, shutdown_tx) = setup_rist_server(port, 100).await;
@@ -1917,6 +1965,7 @@ async fn test_rtmps_100mb() {
     let _ = shutdown_tx.send(());
 }
 
+#[cfg(feature = "webrtc")]
 async fn setup_webrtc_server(
     signaling_port: u16,
     upload_size_mb: usize,
@@ -1971,8 +2020,10 @@ async fn setup_webrtc_server(
     (service, shutdown_tx, signaling_handle)
 }
 
+#[cfg(feature = "webrtc")]
 const WEBRTC_CHANNEL_ID: usize = 0;
 
+#[cfg(feature = "webrtc")]
 async fn run_webrtc_upload_test(
     _service: Arc<UploadResponseService>,
     signaling_port: u16,
@@ -2127,6 +2178,7 @@ async fn run_webrtc_upload_test(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "webrtc")]
 async fn test_webrtc_100mb() {
     let signaling_port = pick_unused_port().expect("pick port");
     let (service, shutdown_tx, signaling_handle) = setup_webrtc_server(signaling_port, 100).await;
@@ -2141,6 +2193,7 @@ async fn test_webrtc_100mb() {
     signaling_handle.abort();
 }
 
+#[cfg(feature = "webrtc")]
 async fn run_webrtc_upload_test_high_throughput(
     _service: Arc<UploadResponseService>,
     signaling_port: u16,
@@ -2242,6 +2295,7 @@ async fn run_webrtc_upload_test_high_throughput(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "srt")]
 async fn test_srt_high_throughput_100mb() {
     let port = pick_unused_port().expect("pick port");
     let (service, shutdown_tx) = setup_srt_server_high_throughput(port, 100).await;
@@ -2256,6 +2310,7 @@ async fn test_srt_high_throughput_100mb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "webrtc")]
 async fn test_webrtc_high_throughput_100mb() {
     let signaling_port = pick_unused_port().expect("pick port");
     let (service, shutdown_tx, signaling_handle) = setup_webrtc_server(signaling_port, 100).await;
@@ -2273,6 +2328,7 @@ async fn test_webrtc_high_throughput_100mb() {
 
 /// Compare default vs high-throughput modes for SRT and WebRTC
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(all(feature = "srt", feature = "webrtc"))]
 async fn test_throughput_comparison() {
     println!("\n=== Throughput Comparison: Default vs High-Throughput ===\n");
 
@@ -2504,6 +2560,7 @@ async fn test_wss_1gb() {
 
 /// Compare all protocols
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(all(feature = "srt", feature = "rist", feature = "webrtc"))]
 async fn test_protocol_comparison() {
     let (cert_b64, key_b64) = match load_test_env() {
         Some(v) => v,
@@ -2634,6 +2691,7 @@ async fn test_protocol_comparison() {
 
 /// Compare all protocols at 1GB
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(all(feature = "srt", feature = "rist", feature = "webrtc"))]
 async fn test_protocol_comparison_1gb() {
     let (cert_b64, key_b64) = match load_test_env() {
         Some(v) => v,
@@ -2769,8 +2827,11 @@ async fn setup_udp_fec_server(
     port: u16,
     upload_size_mb: usize,
 ) -> (Arc<UploadResponseService>, tokio::sync::watch::Sender<()>) {
+    use upload_response::{DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE};
+
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
-    let num_slots = upload_size_bytes / (SLOT_SIZE_KB * 1024) + 100;
+    let block_payload = DEFAULT_SOURCE_SYMBOLS as usize * DEFAULT_SYMBOL_SIZE as usize;
+    let num_slots = upload_size_bytes.div_ceil(block_payload.max(1)) + 100;
 
     let config = UploadResponseConfig {
         num_streams: 10,
@@ -2800,7 +2861,7 @@ async fn setup_udp_fec_server(
 /// Send `upload_size_mb` MB in block-sized chunks via UDP+FEC, measure throughput.
 #[cfg(feature = "udp-fec")]
 async fn run_udp_fec_upload_test(
-    _service: Arc<UploadResponseService>,
+    service: Arc<UploadResponseService>,
     port: u16,
     upload_size_mb: usize,
 ) -> (f64, bool) {
@@ -2822,35 +2883,62 @@ async fn run_udp_fec_upload_test(
     let start = Instant::now();
 
     for chunk in data.chunks(block_payload) {
-        if let Err(e) = sender.send(chunk).await {
-            println!("UDP+FEC send error: {}", e);
-            return (0.0, false);
+        match tokio::time::timeout(Duration::from_secs(5), sender.send(chunk)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                println!("UDP+FEC send error: {}", e);
+                return (0.0, false);
+            }
+            Err(_) => {
+                println!("UDP+FEC send timed out");
+                return (0.0, false);
+            }
         }
     }
 
-    // Let the last block reach the receiver before we stop timing.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let recovered = match wait_for_udp_fec_recovered_body(
+        service,
+        data.len(),
+        udp_fec_recovery_timeout(upload_size_mb),
+    )
+    .await
+    {
+        Some(recovered) => recovered,
+        None => {
+            println!("UDP+FEC timed out waiting for recovered body");
+            return (0.0, false);
+        }
+    };
 
     let elapsed = start.elapsed();
     let throughput = upload_size_mb as f64 / elapsed.as_secs_f64();
+    let passed = recovered == data;
 
     println!(
         "UDP+FEC: {:.2}s ({:.1} MB/s)",
         elapsed.as_secs_f64(),
         throughput
     );
-    println!("UDP+FEC PASSED\n");
+    if passed {
+        println!("UDP+FEC PASSED\n");
+    } else {
+        println!(
+            "UDP+FEC FAILED: recovered {} bytes, expected {}\n",
+            recovered.len(),
+            data.len()
+        );
+    }
 
-    (throughput, true)
+    (throughput, passed)
 }
 
 /// Send data via a proxy that drops every 5th datagram; verify FEC recovers all blocks.
 #[cfg(feature = "udp-fec")]
-async fn run_udp_fec_loss_test(_service: Arc<UploadResponseService>, port: u16) -> (f64, bool) {
+async fn run_udp_fec_loss_test(service: Arc<UploadResponseService>, port: u16) -> (f64, bool) {
     use tokio::net::UdpSocket;
     use upload_response::{DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE};
 
-    let upload_size_mb = 10usize;
+    let upload_size_mb = udp_fec_benchmark_size_mb("UDP_FEC_LOSS_MB", 10);
     let upload_size_bytes = upload_size_mb * 1024 * 1024;
     let (data, _) = generate_test_data(upload_size_bytes);
     let block_payload = DEFAULT_SOURCE_SYMBOLS as usize * DEFAULT_SYMBOL_SIZE as usize;
@@ -2887,31 +2975,108 @@ async fn run_udp_fec_loss_test(_service: Arc<UploadResponseService>, port: u16) 
         .expect("UdpFecSender proxy");
     sender = sender.with_repair_symbols(2);
 
-    println!("Running UDP+FEC loss-recovery test (10 MB, drop every 5th pkt)...");
+    println!(
+        "Running UDP+FEC loss-recovery test ({} MB, drop every 5th pkt)...",
+        upload_size_mb
+    );
     let start = Instant::now();
 
+    let block_pace = udp_fec_loss_pace();
     for chunk in data.chunks(block_payload) {
-        if let Err(e) = sender.send(chunk).await {
-            println!("UDP+FEC loss-test send error: {}", e);
-            proxy_handle.abort();
-            return (0.0, false);
+        match tokio::time::timeout(Duration::from_secs(5), sender.send(chunk)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                println!("UDP+FEC loss-test send error: {}", e);
+                proxy_handle.abort();
+                return (0.0, false);
+            }
+            Err(_) => {
+                println!("UDP+FEC loss-test send timed out");
+                proxy_handle.abort();
+                return (0.0, false);
+            }
+        }
+        if !block_pace.is_zero() {
+            tokio::time::sleep(block_pace).await;
+        } else {
+            tokio::task::yield_now().await;
         }
     }
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let recovered = match wait_for_udp_fec_recovered_body(
+        service,
+        data.len(),
+        udp_fec_recovery_timeout(upload_size_mb),
+    )
+    .await
+    {
+        Some(recovered) => recovered,
+        None => {
+            println!("UDP+FEC loss-test timed out waiting for recovered body");
+            proxy_handle.abort();
+            return (0.0, false);
+        }
+    };
     proxy_handle.abort();
 
     let elapsed = start.elapsed();
     let throughput = upload_size_mb as f64 / elapsed.as_secs_f64();
+    let passed = recovered == data;
 
     println!(
         "UDP+FEC loss-recovery: {:.2}s ({:.1} MB/s)",
         elapsed.as_secs_f64(),
         throughput
     );
-    println!("UDP+FEC loss-recovery PASSED\n");
+    if passed {
+        println!("UDP+FEC loss-recovery PASSED\n");
+    } else {
+        println!(
+            "UDP+FEC loss-recovery FAILED: recovered {} bytes, expected {}\n",
+            recovered.len(),
+            data.len()
+        );
+    }
 
-    (throughput, true)
+    (throughput, passed)
+}
+
+#[cfg(feature = "udp-fec")]
+async fn wait_for_udp_fec_recovered_body(
+    service: Arc<UploadResponseService>,
+    expected_bytes: usize,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut recovered = Vec::with_capacity(expected_bytes);
+    let mut best_len = 0usize;
+    loop {
+        if Instant::now() > deadline {
+            println!(
+                "UDP+FEC recovered {}/{} bytes before timeout",
+                best_len, expected_bytes
+            );
+            return None;
+        }
+
+        for slot in service.active_stream_slots() {
+            recovered.clear();
+            let last = service.request_last(slot.stream_id).unwrap_or(0);
+            for slot_id in 2..=last {
+                if let Some(TailSlot::Body(bytes)) =
+                    service.tail_request(slot.stream_id, slot_id).await
+                {
+                    recovered.extend_from_slice(&bytes);
+                    best_len = best_len.max(recovered.len());
+                    if recovered.len() >= expected_bytes {
+                        return Some(recovered[..expected_bytes].to_vec());
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[cfg(feature = "udp-fec")]
@@ -2919,15 +3084,17 @@ async fn run_udp_fec_loss_test(_service: Arc<UploadResponseService>, port: u16) 
 async fn test_udp_fec_benchmark() {
     let port = pick_unused_port().expect("pick port");
     let loss_port = pick_unused_port().expect("pick loss port");
+    let upload_size_mb = udp_fec_benchmark_size_mb("UDP_FEC_UPLOAD_MB", 100);
+    let loss_size_mb = udp_fec_benchmark_size_mb("UDP_FEC_LOSS_MB", 10);
 
-    let (service, shutdown_tx) = setup_udp_fec_server(port, 100).await;
-    let (loss_service, loss_shutdown_tx) = setup_udp_fec_server(loss_port, 20).await;
+    let (service, shutdown_tx) = setup_udp_fec_server(port, upload_size_mb).await;
+    let (loss_service, loss_shutdown_tx) = setup_udp_fec_server(loss_port, loss_size_mb + 1).await;
 
     println!("\n========================================");
     println!("    UDP+FEC (RaptorQ) Benchmark");
     println!("========================================\n");
 
-    let (throughput, passed) = run_udp_fec_upload_test(service.clone(), port, 100).await;
+    let (throughput, passed) = run_udp_fec_upload_test(service.clone(), port, upload_size_mb).await;
     let (loss_throughput, loss_passed) =
         run_udp_fec_loss_test(loss_service.clone(), loss_port).await;
 
@@ -2935,7 +3102,8 @@ async fn test_udp_fec_benchmark() {
     println!("    Results");
     println!("========================================");
     println!(
-        "UDP+FEC 100 MB:        {:.1} MB/s {}",
+        "UDP+FEC {} MB:        {:.1} MB/s {}",
+        upload_size_mb,
         throughput,
         if passed { "✓" } else { "✗" }
     );
