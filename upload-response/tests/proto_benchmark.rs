@@ -37,7 +37,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 // SRT imports
 #[cfg(feature = "srt")]
-use srt::{AsyncStream, ConnectOptions, MaxBandwidth};
+use srt::{AsyncListener, AsyncStream, ConnectOptions, ListenerOption, MaxBandwidth};
 use tokio::io::AsyncWriteExt;
 
 // RTMP imports
@@ -820,6 +820,26 @@ async fn start_srt_loss_proxy(
     Arc<SrtLossProxyStats>,
     tokio::task::JoinHandle<()>,
 ) {
+    start_srt_loss_proxy_with_delay(
+        target,
+        warmup_client_packets,
+        drop_every_client_packet,
+        Duration::ZERO,
+    )
+    .await
+}
+
+#[cfg(feature = "srt")]
+async fn start_srt_loss_proxy_with_delay(
+    target: SocketAddr,
+    warmup_client_packets: u64,
+    drop_every_client_packet: u64,
+    one_way_delay: Duration,
+) -> (
+    SocketAddr,
+    Arc<SrtLossProxyStats>,
+    tokio::task::JoinHandle<()>,
+) {
     let socket = Arc::new(
         tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
@@ -846,11 +866,15 @@ async fn start_srt_loss_proxy(
                     .server_to_client_received
                     .fetch_add(1, Ordering::Relaxed);
                 if let Some(client) = client_addr {
-                    if task_socket.send_to(&buf[..len], client).await.is_ok() {
-                        task_stats
-                            .server_to_client_forwarded
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+                    forward_srt_proxy_datagram(
+                        Arc::clone(&task_socket),
+                        Arc::clone(&task_stats),
+                        buf[..len].to_vec(),
+                        client,
+                        one_way_delay,
+                        true,
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -872,15 +896,56 @@ async fn start_srt_loss_proxy(
                 continue;
             }
 
-            if task_socket.send_to(&buf[..len], server_addr).await.is_ok() {
-                task_stats
-                    .client_to_server_forwarded
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            forward_srt_proxy_datagram(
+                Arc::clone(&task_socket),
+                Arc::clone(&task_stats),
+                buf[..len].to_vec(),
+                server_addr,
+                one_way_delay,
+                false,
+            )
+            .await;
         }
     });
 
     (proxy_addr, stats, handle)
+}
+
+#[cfg(feature = "srt")]
+async fn forward_srt_proxy_datagram(
+    socket: Arc<tokio::net::UdpSocket>,
+    stats: Arc<SrtLossProxyStats>,
+    bytes: Vec<u8>,
+    target: SocketAddr,
+    delay: Duration,
+    server_to_client: bool,
+) {
+    if delay.is_zero() {
+        if socket.send_to(&bytes, target).await.is_ok() {
+            srt_proxy_record_forwarded(&stats, server_to_client);
+        }
+        return;
+    }
+
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if socket.send_to(&bytes, target).await.is_ok() {
+            srt_proxy_record_forwarded(&stats, server_to_client);
+        }
+    });
+}
+
+#[cfg(feature = "srt")]
+fn srt_proxy_record_forwarded(stats: &SrtLossProxyStats, server_to_client: bool) {
+    if server_to_client {
+        stats
+            .server_to_client_forwarded
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        stats
+            .client_to_server_forwarded
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(feature = "srt")]
@@ -921,6 +986,98 @@ async fn run_srt_loss_upload_test(
     );
 
     (throughput, passed, snapshot)
+}
+
+#[cfg(feature = "srt")]
+#[derive(Debug, Clone, Copy)]
+struct SrtVideoFrameArrival {
+    sequence: u32,
+    sent_us: u64,
+    arrived_us: u64,
+}
+
+#[cfg(feature = "srt")]
+impl SrtVideoFrameArrival {
+    fn latency_us(self) -> u64 {
+        self.arrived_us.saturating_sub(self.sent_us)
+    }
+}
+
+#[cfg(feature = "srt")]
+fn srt_video_frame(sequence: u32, sent_us: u64, payload_len: usize) -> Vec<u8> {
+    let body_len = 12usize
+        .checked_add(payload_len)
+        .expect("SRT video frame length overflow");
+    let mut frame = Vec::with_capacity(4 + body_len);
+    frame.extend_from_slice(&(body_len as u32).to_be_bytes());
+    frame.extend_from_slice(&sequence.to_be_bytes());
+    frame.extend_from_slice(&sent_us.to_be_bytes());
+    for offset in 0..payload_len {
+        frame.push(((sequence as usize + offset) & 0xff) as u8);
+    }
+    frame
+}
+
+#[cfg(feature = "srt")]
+async fn collect_srt_video_frames(
+    mut stream: AsyncStream,
+    expected_frames: usize,
+    start: Instant,
+) -> Result<Vec<SrtVideoFrameArrival>, String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut read_buf = vec![0u8; 4096];
+    let mut pending = Vec::new();
+    let mut arrivals = Vec::with_capacity(expected_frames);
+
+    while arrivals.len() < expected_frames {
+        let n = stream
+            .read(&mut read_buf)
+            .await
+            .map_err(|error| format!("SRT video read error: {error}"))?;
+        if n == 0 {
+            return Err(format!(
+                "SRT video stream closed after {}/{} frames",
+                arrivals.len(),
+                expected_frames
+            ));
+        }
+        pending.extend_from_slice(&read_buf[..n]);
+
+        loop {
+            if pending.len() < 4 {
+                break;
+            }
+            let body_len =
+                u32::from_be_bytes(pending[..4].try_into().expect("frame length")) as usize;
+            if body_len < 12 {
+                return Err(format!("invalid SRT video frame length: {body_len}"));
+            }
+            let frame_len = 4 + body_len;
+            if pending.len() < frame_len {
+                break;
+            }
+            let frame = pending.drain(..frame_len).collect::<Vec<_>>();
+            let body = &frame[4..];
+            let sequence = u32::from_be_bytes(body[..4].try_into().expect("sequence"));
+            let sent_us = u64::from_be_bytes(body[4..12].try_into().expect("sent timestamp"));
+            for (offset, byte) in body[12..].iter().enumerate() {
+                let expected = ((sequence as usize + offset) & 0xff) as u8;
+                if *byte != expected {
+                    return Err(format!(
+                        "SRT video payload mismatch for frame {sequence} at byte {offset}"
+                    ));
+                }
+            }
+            arrivals.push(SrtVideoFrameArrival {
+                sequence,
+                sent_us,
+                arrived_us: start.elapsed().as_micros() as u64,
+            });
+        }
+    }
+
+    Ok(arrivals)
 }
 
 #[derive(Debug)]
@@ -1372,6 +1529,7 @@ fn drive_pure_rist_feedback(sender: &mut rist_mio_pure::MainMioSender, buf: &mut
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 #[cfg(feature = "srt")]
 async fn test_srt_8mb_recovery() {
     let port = pick_unused_port().expect("pick port");
@@ -1387,6 +1545,7 @@ async fn test_srt_8mb_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 #[cfg(feature = "srt")]
 async fn test_srt_2mb_loss_recovery_baseline() {
     let port = pick_unused_port().expect("pick port");
@@ -1412,6 +1571,128 @@ async fn test_srt_2mb_loss_recovery_baseline() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
+#[cfg(feature = "srt")]
+async fn test_actual_srt_video_loss_misses_low_latency_playout() {
+    const FRAME_COUNT: usize = 30;
+    const FRAME_PAYLOAD_BYTES: usize = 8 * 1024;
+    const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+    const LOW_LATENCY_PLAYOUT_US: u64 = 33_000;
+
+    let port = pick_unused_port().expect("pick port");
+    let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let listener = AsyncListener::bind_with_options(
+        server_addr,
+        [
+            ListenerOption::TimestampBasedPacketDeliveryMode(false),
+            ListenerOption::TooLatePacketDrop(false),
+            ListenerOption::ReceiveBufferSize(36_400_000),
+            ListenerOption::SendBufferSize(36_400_000),
+        ],
+    )
+    .expect("bind SRT video listener");
+    let (proxy_addr, proxy_stats, proxy_handle) =
+        start_srt_loss_proxy_with_delay(server_addr, 48, 17, Duration::from_millis(8)).await;
+
+    let start = Instant::now();
+    let server_task = tokio::spawn(async move {
+        let (stream, _peer) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("SRT video accept error: {error:?}"))?;
+        collect_srt_video_frames(stream, FRAME_COUNT, start).await
+    });
+
+    let connect_options = ConnectOptions {
+        stream_id: Some("video-latency-test".to_string()),
+        timestamp_based_packet_delivery_mode: Some(false),
+        too_late_packet_drop: Some(false),
+        receive_buffer_size: Some(36_400_000),
+        send_buffer_size: Some(36_400_000),
+        max_bandwidth: Some(MaxBandwidth::Infinite),
+        max_send_payload_size: Some(1316),
+        ..Default::default()
+    };
+    let mut stream = AsyncStream::connect(proxy_addr, &connect_options)
+        .await
+        .expect("connect SRT video client");
+
+    for sequence in 0..FRAME_COUNT {
+        let frame = srt_video_frame(
+            sequence as u32,
+            start.elapsed().as_micros() as u64,
+            FRAME_PAYLOAD_BYTES,
+        );
+        stream
+            .write_all(&frame)
+            .await
+            .expect("write SRT video frame");
+        tokio::time::sleep(FRAME_INTERVAL).await;
+    }
+
+    let arrivals = match tokio::time::timeout(Duration::from_secs(8), server_task).await {
+        Ok(Ok(Ok(arrivals))) => arrivals,
+        Ok(Ok(Err(error))) => panic!("{error}"),
+        Ok(Err(error)) => panic!("SRT video server task failed: {error}"),
+        Err(_) => panic!("timed out waiting for SRT video frames"),
+    };
+    drop(stream);
+    let snapshot = proxy_stats.snapshot();
+    proxy_handle.abort();
+
+    let in_deadline = arrivals
+        .iter()
+        .filter(|arrival| arrival.latency_us() <= LOW_LATENCY_PLAYOUT_US)
+        .count();
+    let max_latency_us = arrivals
+        .iter()
+        .map(|arrival| arrival.latency_us())
+        .max()
+        .unwrap_or_default();
+    let late_sequences = arrivals
+        .iter()
+        .filter(|arrival| arrival.latency_us() > LOW_LATENCY_PLAYOUT_US)
+        .map(|arrival| arrival.sequence)
+        .collect::<Vec<_>>();
+
+    println!(
+        "SRT video latency: frames={} in_deadline={} late={} late_seq={:?} max_latency_ms={:.1} c2s_drop={} c2s_fwd={} s2c_fwd={}",
+        arrivals.len(),
+        in_deadline,
+        arrivals.len().saturating_sub(in_deadline),
+        late_sequences,
+        max_latency_us as f64 / 1000.0,
+        snapshot.client_to_server_dropped,
+        snapshot.client_to_server_forwarded,
+        snapshot.server_to_client_forwarded
+    );
+
+    assert!(
+        snapshot.client_to_server_dropped > 0,
+        "SRT video proxy must drop upstream datagrams: {:?}",
+        snapshot
+    );
+    assert_eq!(
+        arrivals.len(),
+        FRAME_COUNT,
+        "SRT should eventually recover every video frame in this bounded-loss test"
+    );
+    assert!(
+        in_deadline > 0,
+        "some actual SRT video frames should arrive inside the 33 ms budget when they avoid retransmission: arrivals={arrivals:?}, proxy={snapshot:?}"
+    );
+    assert!(
+        in_deadline < FRAME_COUNT,
+        "actual SRT should miss a sub-RTT 33 ms video playout budget under retransmission loss: arrivals={arrivals:?}, proxy={snapshot:?}"
+    );
+    assert!(
+        max_latency_us > LOW_LATENCY_PLAYOUT_US,
+        "actual SRT max latency should exceed the low-latency playout budget"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 #[cfg(feature = "srt")]
 async fn test_srt_100mb() {
     let port = pick_unused_port().expect("pick port");
@@ -1427,6 +1708,7 @@ async fn test_srt_100mb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 #[cfg(feature = "srt")]
 async fn test_srt_encrypted_100mb() {
     let port = pick_unused_port().expect("pick port");
@@ -1443,6 +1725,7 @@ async fn test_srt_encrypted_100mb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 #[cfg(feature = "rist")]
 async fn test_rist_100mb() {
     let port = pick_unused_port().expect("pick port");
@@ -1459,6 +1742,7 @@ async fn test_rist_100mb() {
 
 #[cfg(feature = "rist-pure")]
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_pure_rist_100mb() {
     let port = pick_unused_port().expect("pick port");
     let (service, shutdown_tx) = setup_pure_rist_server(port, 100).await;
@@ -1593,6 +1877,7 @@ async fn run_tcp_upload_test(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_tcp_tls_100mb() {
     ensure_rustls_provider();
 
@@ -1918,6 +2203,7 @@ async fn run_rtmp_upload_test(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_rtmp_100mb() {
     let port = pick_unused_port().expect("pick port");
     let (service, shutdown_tx) = setup_rtmp_server(port, 100).await;
@@ -2228,6 +2514,7 @@ async fn run_rtmps_upload_test(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_rtmps_100mb() {
     ensure_rustls_provider();
 
@@ -2464,6 +2751,7 @@ async fn run_webrtc_upload_test(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 #[cfg(feature = "webrtc")]
 async fn test_webrtc_100mb() {
     let signaling_port = pick_unused_port().expect("pick port");
@@ -2581,6 +2869,7 @@ async fn run_webrtc_upload_test_high_throughput(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 #[cfg(feature = "srt")]
 async fn test_srt_high_throughput_100mb() {
     let port = pick_unused_port().expect("pick port");
@@ -2596,6 +2885,7 @@ async fn test_srt_high_throughput_100mb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 #[cfg(feature = "webrtc")]
 async fn test_webrtc_high_throughput_100mb() {
     let signaling_port = pick_unused_port().expect("pick port");
@@ -2614,6 +2904,7 @@ async fn test_webrtc_high_throughput_100mb() {
 
 /// Compare default vs high-throughput modes for SRT and WebRTC
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 #[cfg(all(feature = "srt", feature = "webrtc"))]
 async fn test_throughput_comparison() {
     println!("\n=== Throughput Comparison: Default vs High-Throughput ===\n");
@@ -2669,6 +2960,7 @@ async fn test_throughput_comparison() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_http1_100mb() {
     let (cert_b64, key_b64) = match load_test_env() {
         Some(v) => v,
@@ -2691,6 +2983,7 @@ async fn test_http1_100mb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_http2_100mb() {
     let (cert_b64, key_b64) = match load_test_env() {
         Some(v) => v,
@@ -2713,6 +3006,7 @@ async fn test_http2_100mb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_http1_1gb() {
     let (cert_b64, key_b64) = match load_test_env() {
         Some(v) => v,
@@ -2735,6 +3029,7 @@ async fn test_http1_1gb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_http2_1gb() {
     let (cert_b64, key_b64) = match load_test_env() {
         Some(v) => v,
@@ -2757,6 +3052,7 @@ async fn test_http2_1gb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_http3_100mb() {
     let (cert_b64, key_b64) = match load_test_env() {
         Some(v) => v,
@@ -2779,6 +3075,7 @@ async fn test_http3_100mb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_http3_1gb() {
     let (cert_b64, key_b64) = match load_test_env() {
         Some(v) => v,
@@ -2801,6 +3098,7 @@ async fn test_http3_1gb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_wss_100mb() {
     let (cert_b64, key_b64) = match load_test_env() {
         Some(v) => v,
@@ -2823,6 +3121,7 @@ async fn test_wss_100mb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_wss_1gb() {
     let (cert_b64, key_b64) = match load_test_env() {
         Some(v) => v,
@@ -2846,6 +3145,7 @@ async fn test_wss_1gb() {
 
 /// Compare all protocols
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 #[cfg(all(feature = "srt", feature = "rist", feature = "webrtc"))]
 async fn test_protocol_comparison() {
     let (cert_b64, key_b64) = match load_test_env() {
@@ -2977,6 +3277,7 @@ async fn test_protocol_comparison() {
 
 /// Compare all protocols at 1GB
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 #[cfg(all(feature = "srt", feature = "rist", feature = "webrtc"))]
 async fn test_protocol_comparison_1gb() {
     let (cert_b64, key_b64) = match load_test_env() {
@@ -3379,6 +3680,7 @@ async fn wait_for_udp_fec_recovered_body(
 
 #[cfg(feature = "udp-fec")]
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_udp_fec_benchmark() {
     let port = pick_unused_port().expect("pick port");
     let loss_port = pick_unused_port().expect("pick loss port");

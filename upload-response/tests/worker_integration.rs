@@ -418,6 +418,7 @@ async fn run_upload_benchmark(slot_size_kb: usize, upload_size_mb: usize) -> f64
 }
 
 #[tokio::test]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_slot_size_benchmark() {
     const UPLOAD_SIZE_MB: usize = 512; // Use 512MB for faster iteration
 
@@ -457,6 +458,7 @@ async fn test_slot_size_benchmark() {
 }
 
 #[tokio::test]
+#[ignore = "benchmark/stress test; run explicitly with --ignored"]
 async fn test_gigabyte_upload_benchmark() {
     const SLOT_SIZE_KB: usize = 64; // Default slot size
     const UPLOAD_SIZE_MB: usize = 1024;

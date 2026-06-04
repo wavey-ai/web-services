@@ -7,15 +7,15 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1.88"
-bytes = "1.5"
+bytes = "1.11.1"
 clap = { version = "4.5", features = ["derive"] }
-http = "1"
+http = "1.4.1"
 playlists = { git = "https://github.com/wavey-ai/playlists.git" }
 rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git" }
 rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.45", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 web-service = { path = "../../web-service" }
