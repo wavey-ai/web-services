@@ -36,7 +36,7 @@ h3 = "0.0.8"
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"
 h3-datagram = "0.0.2"
-playlists = { git = "https://github.com/wavey-ai/playlists.git" }
+playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "885ffe5a29ed89a3946179cc4dc2c73399665310" }
 tls-helpers = { git = "https://github.com/wavey-ai/tls-helpers.git" }
 xmpegts = { git = "https://github.com/wavey-ai/xiu" }
 async-trait = "0.1.88"
