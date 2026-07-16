@@ -285,6 +285,7 @@ impl StageLane {
     }
 
     async fn clear_slot_state(&self, stream_idx: usize) {
+        self.cache.reset_stream_idx(stream_idx);
         self.started[stream_idx].store(false, Ordering::SeqCst);
         {
             let mut claims = self.claims.write().await;
@@ -671,6 +672,8 @@ impl UploadResponseService {
     }
 
     async fn clear_slot_state(&self, stream_idx: usize) {
+        self.request_cache.reset_stream_idx(stream_idx);
+        self.response_cache.reset_stream_idx(stream_idx);
         {
             let mut workers = self.stream_workers.write().await;
             workers[stream_idx].clear();
@@ -2672,6 +2675,123 @@ mod tests {
         assert!(UploadResponseService::is_end_marker(&slot4));
 
         upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_reused_stream_slot_starts_with_empty_lanes() {
+        let config = UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 8,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new(config));
+        let first_stream = service.open_stream().await.unwrap();
+        let first_id = first_stream.stream_id();
+
+        service
+            .write_request_headers(
+                first_id,
+                StreamHeaders::Request(StreamRequestHeaders {
+                    stream_id: first_id,
+                    version: http_pack::HttpVersion::Http11,
+                    method: b"POST".to_vec(),
+                    scheme: None,
+                    authority: Some(b"example.com".to_vec()),
+                    path: b"/upload".to_vec(),
+                    headers: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        service
+            .append_request_body(first_id, Bytes::from_static(b"old-request"))
+            .await
+            .unwrap();
+        service.end_request(first_id).await.unwrap();
+
+        service
+            .write_stage_head(first_id, "decode", Bytes::from_static(b"old-head"))
+            .await
+            .unwrap();
+        service
+            .append_stage_body(first_id, "decode", Bytes::from_static(b"old-stage"))
+            .await
+            .unwrap();
+        service.end_stage(first_id, "decode").await.unwrap();
+
+        service
+            .write_response_headers(
+                first_id,
+                StreamHeaders::Response(StreamResponseHeaders {
+                    stream_id: first_id,
+                    version: http_pack::HttpVersion::Http11,
+                    status: 200,
+                    headers: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        service
+            .append_response_body(first_id, Bytes::from_static(b"old-response"))
+            .await
+            .unwrap();
+        service.end_response(first_id).await.unwrap();
+        first_stream.close().await;
+
+        let second_stream = service.open_stream().await.unwrap();
+        let second_id = second_stream.stream_id();
+        assert_ne!(first_id, second_id);
+
+        assert_eq!(service.request_last(second_id), Some(0));
+        assert_eq!(service.response_last(second_id), Some(0));
+        assert_eq!(service.stage_last(second_id, "decode").await, Some(0));
+        assert!(service.request_get(second_id, 1).await.is_none());
+        assert!(service.request_get(second_id, 2).await.is_none());
+        assert!(service.stage_get(second_id, "decode", 1).await.is_none());
+        assert!(service.stage_get(second_id, "decode", 2).await.is_none());
+        assert!(service.response_get(second_id, 1).await.is_none());
+        assert!(service.response_get(second_id, 2).await.is_none());
+
+        service
+            .write_request_headers(
+                second_id,
+                StreamHeaders::Request(StreamRequestHeaders {
+                    stream_id: second_id,
+                    version: http_pack::HttpVersion::Http11,
+                    method: b"POST".to_vec(),
+                    scheme: None,
+                    authority: Some(b"example.com".to_vec()),
+                    path: b"/upload".to_vec(),
+                    headers: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        service
+            .write_stage_head(second_id, "decode", Bytes::from_static(b"new-head"))
+            .await
+            .unwrap();
+        service
+            .write_response_headers(
+                second_id,
+                StreamHeaders::Response(StreamResponseHeaders {
+                    stream_id: second_id,
+                    version: http_pack::HttpVersion::Http11,
+                    status: 200,
+                    headers: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(service.request_last(second_id), Some(1));
+        assert_eq!(service.response_last(second_id), Some(1));
+        assert_eq!(service.stage_last(second_id, "decode").await, Some(1));
+        assert!(service.request_get(second_id, 2).await.is_none());
+        assert!(service.stage_get(second_id, "decode", 2).await.is_none());
+        assert!(service.response_get(second_id, 2).await.is_none());
+
+        second_stream.close().await;
     }
 
     #[tokio::test]

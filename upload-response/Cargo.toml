@@ -15,7 +15,7 @@ udp-fec = ["dep:raptorq-datagram-fec", "raptorq-datagram-fec/udp"]
 [dependencies]
 anyhow = "1.0"
 web-service = { path = "../web-service/" }
-playlists = { git = "https://github.com/wavey-ai/playlists.git" }
+playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "182be33c87331c39082c9a7218cc3ab523fb6891" }
 http-pack = { git = "https://github.com/wavey-ai/http-pack.git", default-features = false }
 tokio = { version = "1.52.3", features = ["full"] }
 bytes = "1.11.1"

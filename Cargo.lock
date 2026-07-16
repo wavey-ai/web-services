@@ -123,7 +123,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -134,7 +134,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -748,7 +748,7 @@ dependencies = [
  "h3-quinn",
  "h3-webtransport",
  "http",
- "playlists",
+ "playlists 0.1.3 (git+https://github.com/wavey-ai/playlists.git)",
  "regex",
  "structopt",
  "tokio",
@@ -1286,7 +1286,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1838,7 +1838,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "playlists",
+ "playlists 0.1.3 (git+https://github.com/wavey-ai/playlists.git)",
  "regex",
  "structopt",
  "tokio",
@@ -1982,7 +1982,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -2564,7 +2564,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2630,7 +2630,7 @@ dependencies = [
  "bytes",
  "clap 4.6.1",
  "http",
- "playlists",
+ "playlists 0.1.3 (git+https://github.com/wavey-ai/playlists.git)",
  "rist-core",
  "rist-mio",
  "serde",
@@ -2814,7 +2814,24 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "playlists"
 version = "0.1.3"
-source = "git+https://github.com/wavey-ai/playlists.git#c18b6440ebfacd7f11e47facbae3340849d9dc94"
+source = "git+https://github.com/wavey-ai/playlists.git?rev=182be33c87331c39082c9a7218cc3ab523fb6891#182be33c87331c39082c9a7218cc3ab523fb6891"
+dependencies = [
+ "access-unit",
+ "bytes",
+ "chrono",
+ "flate2",
+ "raptorq-datagram-fec",
+ "thiserror 1.0.69",
+ "tls-helpers 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "playlists"
+version = "0.1.3"
+source = "git+https://github.com/wavey-ai/playlists.git#182be33c87331c39082c9a7218cc3ab523fb6891"
 dependencies = [
  "access-unit",
  "bytes",
@@ -2990,7 +3007,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.40",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3028,7 +3045,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3159,8 +3176,8 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "raptorq-datagram-fec"
-version = "0.1.2"
-source = "git+https://github.com/wavey-ai/raptor-fec.git#99470906ea0f608057b440b481dcac53ab169691"
+version = "0.1.3"
+source = "git+https://github.com/wavey-ai/raptor-fec.git#27229228b7a910e019f8fbc42091ae45c677bbe3"
 dependencies = [
  "bytes",
  "raptorq",
@@ -3458,7 +3475,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3547,7 +3564,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3907,7 +3924,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4660,7 +4677,7 @@ dependencies = [
  "hyper-util",
  "matchbox_signaling",
  "matchbox_socket",
- "playlists",
+ "playlists 0.1.3 (git+https://github.com/wavey-ai/playlists.git?rev=182be33c87331c39082c9a7218cc3ab523fb6891)",
  "portpicker",
  "quinn",
  "raptorq-datagram-fec",
@@ -4929,7 +4946,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "playlists",
+ "playlists 0.1.3 (git+https://github.com/wavey-ai/playlists.git)",
  "portpicker",
  "quinn",
  "regex",
@@ -5211,7 +5228,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
