@@ -82,7 +82,7 @@ The shared-memory `ChunkCache` and slot-based streaming architecture are inspire
 
 Some protocols require optional crate features such as `srt`, `rist`, `rist-pure`, `webrtc`, or `udp-fec`. The default feature set only enables `tcp`.
 
-The `rist` feature keeps the existing librist/C-wrapper backend. The `rist-pure` feature adds `PureRistIngest`, backed by the pure Rust `rist-core` and `rist-mio` crates from `wavey-ai/rist-rs`.
+The `rist` feature keeps the existing librist/C-wrapper backend. The `rist-pure` feature adds `PureRistIngest`, backed by the pure Rust `rist-core` and `rist-mio` crates from [`wavey-ai/rist-rs`](https://github.com/wavey-ai/rist-rs).
 
 ### Architecture
 
