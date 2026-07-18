@@ -2,11 +2,14 @@ use crate::{
     config::ServerConfig,
     error::{H2Error, ServerError, ServerResult},
     http_range::apply_byte_range,
-    traits::{BodyStream, HandlerResponse, Router, StreamWriter},
+    traits::{
+        response_header_name, response_header_value, BodyStream, HandlerResponse, Router,
+        StreamWriter,
+    },
 };
 use bytes::Bytes;
 use futures_util::stream::unfold;
-use http::header::{HeaderName, HeaderValue};
+use http::header::{HeaderName, HeaderValue, RANGE};
 use http::{Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -273,27 +276,26 @@ async fn handle_h2_request(
     }
 
     let (parts, body) = req.into_parts();
-    let path = parts.uri.path().to_string();
-    let request_headers = parts.headers.clone();
-    if router.has_body_stream_handler(&path) {
+    let range_header = parts.headers.get(RANGE).cloned();
+    if router.has_body_stream_handler(parts.uri.path()) {
         let stream = incoming_body_stream(body);
         let req = http::Request::from_parts(parts, ());
         return handle_h2_body_stream(req, stream, router).await;
     }
 
-    if router.is_streaming(&path) {
+    if router.is_streaming(parts.uri.path()) {
         let req = http::Request::from_parts(parts, ());
         return handle_h2_stream(req, router).await;
     }
 
-    if router.has_body_handler(&path) {
+    if router.has_body_handler(parts.uri.path()) {
         let stream = incoming_body_stream(body);
         let req = http::Request::from_parts(parts, ());
         let handler_response = router
             .route_body(req, stream)
             .await
             .map_err(H2Error::Router)?;
-        return build_buffered_response(apply_byte_range(&request_headers, handler_response));
+        return build_buffered_response(apply_byte_range(range_header.as_ref(), handler_response));
     }
 
     let mut body = body;
@@ -305,7 +307,7 @@ async fn handle_h2_request(
 
     let req = http::Request::from_parts(parts, ());
     let handler_response = router.route(req).await.map_err(H2Error::Router)?;
-    build_buffered_response(apply_byte_range(&request_headers, handler_response))
+    build_buffered_response(apply_byte_range(range_header.as_ref(), handler_response))
 }
 
 fn incoming_body_stream(body: Incoming) -> BodyStream {
@@ -381,7 +383,7 @@ fn build_buffered_response(
     if let Some(ct) = handler_response.content_type {
         response.headers_mut().insert(
             HeaderName::from_static("content-type"),
-            HeaderValue::from_str(&ct)?,
+            response_header_value(ct)?,
         );
     }
     if let Some(etag) = handler_response.etag {
@@ -393,7 +395,7 @@ fn build_buffered_response(
     for (k, v) in handler_response.headers {
         response
             .headers_mut()
-            .insert(k.parse::<HeaderName>()?, v.parse::<HeaderValue>()?);
+            .insert(response_header_name(k)?, response_header_value(v)?);
     }
 
     add_cors_headers(&mut response);

@@ -150,7 +150,7 @@ fn json_response<T: Serialize>(value: &T, status: StatusCode) -> HandlerResponse
     HandlerResponse {
         status,
         body: Some(Bytes::from(body)),
-        content_type: Some("application/json".to_string()),
+        content_type: Some("application/json".into()),
         headers: vec![],
         etag: None,
     }

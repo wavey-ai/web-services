@@ -3,12 +3,18 @@ use crate::{
     error::{H3Error, ServerError, ServerResult},
     h3::{add_cors_preflight_headers, add_cors_response_headers},
     http_range::apply_byte_range,
-    traits::{BodyStream, HandlerResponse, Router, StreamWriter},
+    traits::{
+        response_header_name, response_header_value, BodyStream, HandlerResponse, Router,
+        StreamWriter,
+    },
 };
 use base64::{engine::general_purpose::STANDARD as base64_engine, Engine as _};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use http::{header::HOST, HeaderName, HeaderValue, Method, Request, Response, Uri};
+use http::{
+    header::{HOST, RANGE},
+    HeaderName, HeaderValue, Method, Request, Response, Uri,
+};
 use std::{
     fs,
     net::{Ipv4Addr, SocketAddr},
@@ -224,10 +230,13 @@ async fn handle_request(
         ..
     } = incoming;
     let request = request_from_h3_headers(headers)?;
-    let path = request.uri().path().to_owned();
     let is_preflight = request.method() == Method::OPTIONS;
+    let has_body_stream_handler = router.has_body_stream_handler(request.uri().path());
+    let is_streaming = !has_body_stream_handler && router.is_streaming(request.uri().path());
+    let has_body_handler =
+        !has_body_stream_handler && !is_streaming && router.has_body_handler(request.uri().path());
 
-    if router.has_body_stream_handler(&path) {
+    if has_body_stream_handler {
         let body = body_stream(recv);
         let writer = TokioQuicheStreamWriter::new(send);
         return router
@@ -236,7 +245,7 @@ async fn handle_request(
             .map_err(H3Error::Router);
     }
 
-    if router.is_streaming(&path) {
+    if is_streaming {
         let writer = TokioQuicheStreamWriter::new(send);
         return router
             .route_stream(request, Box::new(writer))
@@ -244,8 +253,8 @@ async fn handle_request(
             .map_err(H3Error::Router);
     }
 
-    let request_headers = request.headers().clone();
-    let response = if router.has_body_handler(&path) {
+    let range_header = request.headers().get(RANGE).cloned();
+    let response = if has_body_handler {
         router
             .route_body(request, body_stream(recv))
             .await
@@ -254,7 +263,7 @@ async fn handle_request(
         router.route(request).await.map_err(H3Error::Router)?
     };
     send_handler_response(
-        apply_byte_range(&request_headers, response),
+        apply_byte_range(range_header.as_ref(), response),
         send,
         is_preflight,
     )
@@ -362,13 +371,19 @@ fn response_parts(
     } = response;
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
-        builder = builder.header("content-type", content_type);
+        builder = builder.header(
+            "content-type",
+            response_header_value(content_type).map_err(|error| H3Error::Header(error.into()))?,
+        );
     }
     if let Some(etag) = etag {
         builder = builder.header("etag", etag.to_string());
     }
     for (name, value) in headers {
-        builder = builder.header(name, value);
+        builder = builder.header(
+            response_header_name(name).map_err(|error| H3Error::Header(error.into()))?,
+            response_header_value(value).map_err(|error| H3Error::Header(error.into()))?,
+        );
     }
     let mut response = builder.body(()).map_err(H3Error::Header)?;
     if is_preflight {

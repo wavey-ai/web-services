@@ -1,9 +1,10 @@
 use crate::traits::HandlerResponse;
 use bytes::Bytes;
 use http::{
-    header::{ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
-    HeaderMap, StatusCode,
+    header::{ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE},
+    HeaderValue, StatusCode,
 };
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParsedRange {
@@ -13,7 +14,7 @@ enum ParsedRange {
 }
 
 pub(crate) fn apply_byte_range(
-    headers: &HeaderMap,
+    range_header: Option<&HeaderValue>,
     mut response: HandlerResponse,
 ) -> HandlerResponse {
     let Some(body) = response.body.take() else {
@@ -40,11 +41,12 @@ pub(crate) fn apply_byte_range(
     }
 
     remove_generated_range_headers(&mut response.headers);
-    response
-        .headers
-        .push((ACCEPT_RANGES.as_str().to_string(), "bytes".to_string()));
+    response.headers.push((
+        Cow::Borrowed(ACCEPT_RANGES.as_str()),
+        Cow::Borrowed("bytes"),
+    ));
 
-    let Some(range) = headers.get(RANGE).and_then(|value| value.to_str().ok()) else {
+    let Some(range) = range_header.and_then(|value| value.to_str().ok()) else {
         response.body = Some(body);
         return response;
     };
@@ -59,24 +61,25 @@ pub(crate) fn apply_byte_range(
             let body = body.slice(start..end + 1);
             response.status = StatusCode::PARTIAL_CONTENT;
             response.headers.push((
-                CONTENT_RANGE.as_str().to_string(),
-                format!("bytes {start}-{end}/{total_len}"),
+                Cow::Borrowed(CONTENT_RANGE.as_str()),
+                Cow::Owned(format!("bytes {start}-{end}/{total_len}")),
             ));
-            response
-                .headers
-                .push((CONTENT_LENGTH.as_str().to_string(), body.len().to_string()));
+            response.headers.push((
+                Cow::Borrowed(CONTENT_LENGTH.as_str()),
+                Cow::Owned(body.len().to_string()),
+            ));
             response.body = Some(body);
             response
         }
         ParsedRange::Unsatisfiable => {
             response.status = StatusCode::RANGE_NOT_SATISFIABLE;
             response.headers.push((
-                CONTENT_RANGE.as_str().to_string(),
-                format!("bytes */{}", body.len()),
+                Cow::Borrowed(CONTENT_RANGE.as_str()),
+                Cow::Owned(format!("bytes */{}", body.len())),
             ));
             response
                 .headers
-                .push((CONTENT_LENGTH.as_str().to_string(), "0".to_string()));
+                .push((Cow::Borrowed(CONTENT_LENGTH.as_str()), Cow::Borrowed("0")));
             response.body = Some(Bytes::new());
             response
         }
@@ -131,7 +134,7 @@ fn parse_range_header(value: &str, len: usize) -> ParsedRange {
     ParsedRange::Satisfiable { start, end }
 }
 
-fn remove_generated_range_headers(headers: &mut Vec<(String, String)>) {
+fn remove_generated_range_headers(headers: &mut Vec<(Cow<'static, str>, Cow<'static, str>)>) {
     headers.retain(|(name, _)| {
         !name.eq_ignore_ascii_case(ACCEPT_RANGES.as_str())
             && !name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str())
@@ -139,18 +142,20 @@ fn remove_generated_range_headers(headers: &mut Vec<(String, String)>) {
     });
 }
 
-fn response_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+fn response_header_value<'a>(
+    headers: &'a [(Cow<'static, str>, Cow<'static, str>)],
+    name: &str,
+) -> Option<&'a str> {
     headers.iter().find_map(|(candidate, value)| {
         candidate
             .eq_ignore_ascii_case(name)
-            .then_some(value.as_str())
+            .then_some(value.as_ref())
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::header::HeaderValue;
 
     fn response(body: &'static [u8]) -> HandlerResponse {
         HandlerResponse {
@@ -162,15 +167,14 @@ mod tests {
         }
     }
 
-    fn headers(range: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(RANGE, HeaderValue::from_str(range).unwrap());
-        headers
+    fn range(value: &str) -> HeaderValue {
+        HeaderValue::from_str(value).unwrap()
     }
 
     #[test]
     fn byte_range_slices_response_body() {
-        let response = apply_byte_range(&headers("bytes=2-5"), response(b"abcdefghi"));
+        let range = range("bytes=2-5");
+        let response = apply_byte_range(Some(&range), response(b"abcdefghi"));
 
         assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.body.as_deref(), Some(&b"cdef"[..]));
@@ -181,7 +185,8 @@ mod tests {
 
     #[test]
     fn open_ended_range_slices_to_end() {
-        let response = apply_byte_range(&headers("bytes=4-"), response(b"abcdefghi"));
+        let range = range("bytes=4-");
+        let response = apply_byte_range(Some(&range), response(b"abcdefghi"));
 
         assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.body.as_deref(), Some(&b"efghi"[..]));
@@ -192,7 +197,8 @@ mod tests {
 
     #[test]
     fn suffix_range_slices_from_end() {
-        let response = apply_byte_range(&headers("bytes=-3"), response(b"abcdefghi"));
+        let range = range("bytes=-3");
+        let response = apply_byte_range(Some(&range), response(b"abcdefghi"));
 
         assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.body.as_deref(), Some(&b"ghi"[..]));
@@ -203,7 +209,8 @@ mod tests {
 
     #[test]
     fn unsatisfiable_range_returns_416() {
-        let response = apply_byte_range(&headers("bytes=99-100"), response(b"abcdefghi"));
+        let range = range("bytes=99-100");
+        let response = apply_byte_range(Some(&range), response(b"abcdefghi"));
 
         assert_eq!(response.status, StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(response.body.as_deref(), Some(&b""[..]));
@@ -214,10 +221,22 @@ mod tests {
 
     #[test]
     fn unsupported_range_unit_serves_full_body() {
-        let response = apply_byte_range(&headers("items=0-3"), response(b"abcdefghi"));
+        let range = range("items=0-3");
+        let response = apply_byte_range(Some(&range), response(b"abcdefghi"));
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body.as_deref(), Some(&b"abcdefghi"[..]));
+    }
+
+    #[test]
+    fn response_without_range_still_advertises_byte_ranges() {
+        let response = apply_byte_range(None, response(b"abcdefghi"));
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body.as_deref(), Some(&b"abcdefghi"[..]));
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("accept-ranges") && value == "bytes"
+        }));
     }
 
     #[test]
@@ -225,9 +244,10 @@ mod tests {
         let mut response = response(b"abcdefghi");
         response
             .headers
-            .push((ACCEPT_RANGES.as_str().to_string(), "none".to_string()));
+            .push((ACCEPT_RANGES.as_str().into(), "none".into()));
 
-        let response = apply_byte_range(&headers("bytes=2-5"), response);
+        let range = range("bytes=2-5");
+        let response = apply_byte_range(Some(&range), response);
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body.as_deref(), Some(&b"abcdefghi"[..]));
@@ -245,9 +265,10 @@ mod tests {
         let mut response = response(b"abcdefghi");
         response
             .headers
-            .push((CONTENT_ENCODING.as_str().to_string(), "gzip".to_string()));
+            .push((CONTENT_ENCODING.as_str().into(), "gzip".into()));
 
-        let response = apply_byte_range(&headers("bytes=2-5"), response);
+        let range = range("bytes=2-5");
+        let response = apply_byte_range(Some(&range), response);
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body.as_deref(), Some(&b"abcdefghi"[..]));

@@ -748,7 +748,7 @@ fn response(
     HandlerResponse {
         status,
         body,
-        content_type: content_type.map(str::to_string),
+        content_type: content_type.map(Into::into),
         headers: vec![
             ("access-control-allow-origin".into(), "*".into()),
             (

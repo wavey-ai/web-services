@@ -401,12 +401,12 @@ fn handler_response_from_parts(
         }
         if name == http::header::CONTENT_TYPE {
             if let Ok(value) = value.to_str() {
-                content_type = Some(value.to_string());
+                content_type = Some(value.to_string().into());
             }
             continue;
         }
         if let Ok(value) = value.to_str() {
-            out_headers.push((name.to_string(), value.to_string()));
+            out_headers.push((name.to_string().into(), value.to_string().into()));
         }
     }
 
@@ -474,7 +474,7 @@ fn text_response(status: StatusCode, message: &str) -> HandlerResponse {
     HandlerResponse {
         status,
         body: Some(Bytes::from(message.to_string())),
-        content_type: Some("text/plain".to_string()),
+        content_type: Some("text/plain".into()),
         headers: vec![],
         etag: None,
     }

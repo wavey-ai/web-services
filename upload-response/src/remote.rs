@@ -666,13 +666,13 @@ impl RemoteIngressClient {
     ) -> Result<()> {
         let mut builder = http::Response::builder().status(response.status);
         if let Some(content_type) = &response.content_type {
-            builder = builder.header(CONTENT_TYPE, content_type);
+            builder = builder.header(CONTENT_TYPE, content_type.as_ref());
         }
         if let Some(etag) = response.etag {
             builder = builder.header(http::header::ETAG, etag.to_string());
         }
         for (name, value) in &response.headers {
-            builder = builder.header(name, value);
+            builder = builder.header(name.as_ref(), value.as_ref());
         }
         let response_head = builder
             .body(())

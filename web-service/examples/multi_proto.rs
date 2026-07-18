@@ -21,7 +21,7 @@ impl RequestHandler for HelloHandler {
         Ok(HandlerResponse {
             status: StatusCode::OK,
             body: Some(Bytes::from_static(b"hello from h1/h2")),
-            content_type: Some("text/plain".to_string()),
+            content_type: Some("text/plain".into()),
             ..Default::default()
         })
     }

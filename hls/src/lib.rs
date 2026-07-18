@@ -8,6 +8,7 @@ use http::{
 use playlists::chunk_cache::ChunkCache;
 use playlists::m3u8_cache::M3u8Cache;
 use regex::Regex;
+use std::borrow::Cow;
 use std::io::Read;
 use std::{collections::HashMap, sync::Arc};
 use tokio::time::{Duration, sleep, timeout};
@@ -163,8 +164,8 @@ impl HlsHandler {
         }
     }
 
-    fn priority_header(value: &str) -> (String, String) {
-        (PRIORITY_HEADER.to_string(), value.to_string())
+    fn priority_header(value: &'static str) -> (Cow<'static, str>, Cow<'static, str>) {
+        (Cow::Borrowed(PRIORITY_HEADER), Cow::Borrowed(value))
     }
     fn extract_id(s: &str) -> Option<usize> {
         Regex::new(r"(s|p)(\d+)(\.mp4|\.ts)$")
@@ -308,8 +309,11 @@ impl HlsHandler {
                 Self::decompress_gzip_playlist(bytes)?
             };
             let mut headers = vec![
-                (ACCEPT_RANGES.as_str().to_string(), "none".to_string()),
-                (VARY.as_str().to_string(), "accept-encoding".to_string()),
+                (Cow::Borrowed(ACCEPT_RANGES.as_str()), Cow::Borrowed("none")),
+                (
+                    Cow::Borrowed(VARY.as_str()),
+                    Cow::Borrowed("accept-encoding"),
+                ),
                 Self::priority_header(PLAYLIST_PRIORITY),
             ];
             if gzip {
@@ -318,7 +322,7 @@ impl HlsHandler {
             Ok(HandlerResponse {
                 status: StatusCode::OK,
                 body: Some(body),
-                content_type: Some("application/vnd.apple.mpegurl".to_string()),
+                content_type: Some("application/vnd.apple.mpegurl".into()),
                 headers,
                 etag: Some(hash),
             })
@@ -752,7 +756,7 @@ impl RequestHandler for HlsHandler {
                             SegmentResponse::Found(bytes) => Ok(HandlerResponse {
                                 status: StatusCode::OK,
                                 body: Some(bytes),
-                                content_type: Self::detect_content_type(file).map(String::from),
+                                content_type: Self::detect_content_type(file).map(Into::into),
                                 headers: vec![Self::priority_header(MEDIA_PRIORITY)],
                                 ..Default::default()
                             }),
@@ -774,7 +778,7 @@ impl RequestHandler for HlsHandler {
                                 Ok(HandlerResponse {
                                     status: StatusCode::OK,
                                     body: Some(d.0),
-                                    content_type: Self::detect_content_type(file).map(String::from),
+                                    content_type: Self::detect_content_type(file).map(Into::into),
                                     headers: vec![Self::priority_header(MEDIA_PRIORITY)],
                                     etag: Some(d.1),
                                     ..Default::default()
@@ -845,7 +849,7 @@ mod tests {
         response.headers.iter().find_map(|(candidate, value)| {
             candidate
                 .eq_ignore_ascii_case(name)
-                .then_some(value.as_str())
+                .then_some(value.as_ref())
         })
     }
 

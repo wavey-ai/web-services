@@ -143,7 +143,7 @@ impl RequestHandler for ChunkHandler {
                                 Ok(HandlerResponse {
                                     status: StatusCode::OK,
                                     body: Some(d.0),
-                                    content_type: Self::detect_content_type(file).map(String::from),
+                                    content_type: Self::detect_content_type(file).map(Into::into),
                                     etag: Some(d.1),
                                     ..Default::default()
                                 })

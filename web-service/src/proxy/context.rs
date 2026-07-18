@@ -36,7 +36,7 @@ pub fn attach_request_id(response: &mut HandlerResponse, request_id: &str) {
     if !exists {
         response
             .headers
-            .push((REQUEST_ID_HEADER.to_string(), request_id.to_string()));
+            .push((REQUEST_ID_HEADER.into(), request_id.to_string().into()));
     }
 }
 
@@ -85,7 +85,7 @@ mod tests {
             status: http::StatusCode::OK,
             body: None,
             content_type: None,
-            headers: vec![(REQUEST_ID_HEADER.to_string(), "req-1".to_string())],
+            headers: vec![(REQUEST_ID_HEADER.into(), "req-1".into())],
             etag: None,
         };
 

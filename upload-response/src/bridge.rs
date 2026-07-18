@@ -273,9 +273,9 @@ pub fn handler_response_from_cached(cached: CachedResponse) -> HandlerResponse {
     let mut headers = Vec::new();
     for (name, value) in cached.headers {
         if name.eq_ignore_ascii_case("content-type") {
-            content_type = Some(value);
+            content_type = Some(value.into());
         } else {
-            headers.push((name, value));
+            headers.push((name.into(), value.into()));
         }
     }
 

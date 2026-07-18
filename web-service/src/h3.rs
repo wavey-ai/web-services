@@ -2,7 +2,7 @@ use crate::{
     config::ServerConfig,
     error::{H3Error, ServerError, ServerResult},
     http_range::apply_byte_range,
-    traits::{BodyStream, Router, StreamWriter},
+    traits::{response_header_name, response_header_value, BodyStream, Router, StreamWriter},
 };
 use bytes::{Buf, Bytes};
 use futures_util::stream::unfold;
@@ -10,7 +10,7 @@ use h3::ext::Protocol;
 use h3::server::{Connection, RequestStream};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
 use h3_webtransport::server::WebTransportSession;
-use http::{HeaderName, HeaderValue, Method, Response, StatusCode};
+use http::{header::RANGE, HeaderName, HeaderValue, Method, Response, StatusCode};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
@@ -255,15 +255,20 @@ async fn handle_h3_connection(
                     return Ok(());
                 }
                 let router = Arc::clone(&router);
-                let path = req.uri().path().to_string();
+                let has_body_stream_handler = router.has_body_stream_handler(req.uri().path());
+                let is_streaming =
+                    !has_body_stream_handler && router.is_streaming(req.uri().path());
+                let has_body_handler = !has_body_stream_handler
+                    && !is_streaming
+                    && router.has_body_handler(req.uri().path());
                 tokio::spawn(async move {
-                    if router.has_body_stream_handler(&path) {
+                    if has_body_stream_handler {
                         let _ = handle_h3_body_stream_request(req, stream, router).await;
-                    } else if router.is_streaming(&path) {
+                    } else if is_streaming {
                         let writer = H3StreamWriter { stream };
                         let _ = router.route_stream(req, Box::new(writer)).await;
                     } else {
-                        let _ = handle_h3_request(req, stream, router).await;
+                        let _ = handle_h3_request(req, stream, router, has_body_handler).await;
                     }
                 });
             }
@@ -314,11 +319,11 @@ async fn handle_h3_request(
     req: http::Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     router: Arc<dyn Router>,
+    has_body_handler: bool,
 ) -> Result<(), H3Error> {
-    let path = req.uri().path().to_string();
     let is_preflight = req.method() == Method::OPTIONS;
-    let request_headers = req.headers().clone();
-    if router.has_body_handler(&path) {
+    let range_header = req.headers().get(RANGE).cloned();
+    if has_body_handler {
         let shared_stream = Arc::new(Mutex::new(stream));
         let body_stream: BodyStream =
             Box::pin(unfold(Arc::clone(&shared_stream), |shared| async move {
@@ -341,7 +346,7 @@ async fn handle_h3_request(
             .map_err(H3Error::Router)?;
         let mut guard = shared_stream.lock().await;
         return send_h3_response(
-            apply_byte_range(&request_headers, handler_response),
+            apply_byte_range(range_header.as_ref(), handler_response),
             &mut *guard,
             is_preflight,
         )
@@ -350,7 +355,7 @@ async fn handle_h3_request(
 
     let handler_response = router.route(req).await.map_err(H3Error::Router)?;
     send_h3_response(
-        apply_byte_range(&request_headers, handler_response),
+        apply_byte_range(range_header.as_ref(), handler_response),
         &mut stream,
         is_preflight,
     )
@@ -364,13 +369,19 @@ async fn send_h3_response(
 ) -> Result<(), H3Error> {
     let mut builder = http::Response::builder().status(handler_response.status);
     if let Some(ct) = handler_response.content_type {
-        builder = builder.header("content-type", ct);
+        builder = builder.header(
+            "content-type",
+            response_header_value(ct).map_err(|error| H3Error::Header(error.into()))?,
+        );
     }
     if let Some(etag) = handler_response.etag {
         builder = builder.header("etag", etag.to_string());
     }
     for (key, value) in handler_response.headers {
-        builder = builder.header(&key, &value);
+        builder = builder.header(
+            response_header_name(key).map_err(|error| H3Error::Header(error.into()))?,
+            response_header_value(value).map_err(|error| H3Error::Header(error.into()))?,
+        );
     }
     let mut resp = builder.body(()).map_err(H3Error::Header)?;
     if is_preflight {

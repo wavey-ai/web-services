@@ -1433,13 +1433,13 @@ impl UploadResponseService {
     ) -> Result<(), String> {
         let mut builder = http::Response::builder().status(response.status);
         if let Some(content_type) = &response.content_type {
-            builder = builder.header(http::header::CONTENT_TYPE, content_type);
+            builder = builder.header(http::header::CONTENT_TYPE, content_type.as_ref());
         }
         if let Some(etag) = response.etag {
             builder = builder.header(http::header::ETAG, etag.to_string());
         }
         for (name, value) in &response.headers {
-            builder = builder.header(name, value);
+            builder = builder.header(name.as_ref(), value.as_ref());
         }
 
         let response_head = builder
@@ -1635,7 +1635,7 @@ impl UploadResponseRouter {
         HandlerResponse {
             status,
             body: Some(Bytes::from(body.into())),
-            content_type: Some("text/plain; charset=utf-8".to_string()),
+            content_type: Some("text/plain; charset=utf-8".into()),
             ..Default::default()
         }
     }
@@ -1646,7 +1646,7 @@ impl UploadResponseRouter {
             body: Some(Bytes::from(
                 serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()),
             )),
-            content_type: Some("application/json".to_string()),
+            content_type: Some("application/json".into()),
             ..Default::default()
         }
     }
@@ -1659,14 +1659,14 @@ impl UploadResponseRouter {
         let mut headers = Vec::new();
         if let Some(slot_type) = slot_type {
             headers.push((
-                "x-upload-response-slot-type".to_string(),
-                slot_type.to_string(),
+                "x-upload-response-slot-type".into(),
+                slot_type.to_string().into(),
             ));
         }
         HandlerResponse {
             status,
             body: Some(body),
-            content_type: Some("application/octet-stream".to_string()),
+            content_type: Some("application/octet-stream".into()),
             headers,
             ..Default::default()
         }
@@ -2219,9 +2219,9 @@ impl UploadResponseRouter {
                 let mut headers = Vec::new();
                 for (name, value) in cached.headers {
                     if name.eq_ignore_ascii_case("content-type") {
-                        content_type = Some(value);
+                        content_type = Some(value.into());
                     } else {
-                        headers.push((name, value));
+                        headers.push((name.into(), value.into()));
                     }
                 }
                 Ok(HandlerResponse {

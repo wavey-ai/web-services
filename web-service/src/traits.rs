@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use h3_webtransport::server::WebTransportSession;
-use http::{Request, Response, StatusCode};
+use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use std::borrow::Cow;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 
@@ -16,8 +17,8 @@ pub type HandlerResult<T> = Result<T, ServerError>;
 pub struct HandlerResponse {
     pub status: StatusCode,
     pub body: Option<Bytes>,
-    pub content_type: Option<String>,
-    pub headers: Vec<(String, String)>,
+    pub content_type: Option<Cow<'static, str>>,
+    pub headers: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     pub etag: Option<u64>,
 }
 
@@ -34,6 +35,22 @@ impl Default for HandlerResponse {
             etag: None,
         }
     }
+}
+
+pub(crate) fn response_header_name(
+    value: Cow<'static, str>,
+) -> Result<HeaderName, http::header::InvalidHeaderName> {
+    HeaderName::from_bytes(value.as_bytes())
+}
+
+pub(crate) fn response_header_value(
+    value: Cow<'static, str>,
+) -> Result<HeaderValue, http::header::InvalidHeaderValue> {
+    let bytes = match value {
+        Cow::Borrowed(value) => Bytes::from_static(value.as_bytes()),
+        Cow::Owned(value) => Bytes::from(value.into_bytes()),
+    };
+    HeaderValue::from_maybe_shared(bytes)
 }
 
 /// Main trait for HTTP request handlers
@@ -143,13 +160,20 @@ pub trait Router: Send + Sync + 'static {
         let handler_response = self.route_body(req, body).await?;
         let mut response = Response::builder().status(handler_response.status);
         if let Some(content_type) = handler_response.content_type {
-            response = response.header("content-type", content_type);
+            response = response.header(
+                "content-type",
+                response_header_value(content_type)
+                    .map_err(|error| ServerError::Http(error.into()))?,
+            );
         }
         if let Some(etag) = handler_response.etag {
             response = response.header("etag", etag.to_string());
         }
         for (key, value) in handler_response.headers {
-            response = response.header(&key, &value);
+            response = response.header(
+                response_header_name(key).map_err(|error| ServerError::Http(error.into()))?,
+                response_header_value(value).map_err(|error| ServerError::Http(error.into()))?,
+            );
         }
         stream_writer.send_response(response.body(())?).await?;
         if let Some(body) = handler_response.body {
