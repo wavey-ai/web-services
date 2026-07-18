@@ -32,6 +32,16 @@ two implementations without maintaining a copied server. Selecting
 tokio-quiche together with WebTransport is rejected until feature parity is
 implemented.
 
+The isolation work has produced its first proven capacity fix. Ordinary media
+GET responses were carrying two CORS fields that belong on preflight responses.
+On the same two-vCPU GCP server, removing that repeated header/QPACK work raised
+the saturated 64-byte H3 response rate from a two-run mean of `71,946` to
+`79,702` responses/s (`+10.78%`), reduced p99 from about `18.4 ms` to `16.1 ms`,
+and reduced total wire traffic despite serving more requests. An immediate
+restart of the old build reproduced the old ceiling. This is a small-response
+transport result; the nearly 1 Gbit/s PCM result above remains the current
+full-media boundary.
+
 See [HTTP/3 capacity investigation](./docs/http3-capacity-investigation.md) for
 the workload, results, profile, current interpretation, and bug-audit plan.
 

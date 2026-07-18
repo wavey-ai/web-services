@@ -1,6 +1,6 @@
 # HTTP/3 capacity investigation
 
-Status: active investigation, 18 July 2026.
+Status: active investigation with one proven capacity fix, 18 July 2026.
 
 ## Discussion summary
 
@@ -16,6 +16,13 @@ then failed to hold cadence at 56 customers. The TCP control rates are much
 higher, but those controls were collected locally with a different harness, so
 the size of the apparent gap is a reason for a controlled A/B investigation,
 not yet a protocol conclusion.
+
+The investigation has now produced its first measured application fix.
+Ordinary media GET responses were carrying two CORS fields intended for
+preflight responses. Removing that repeated header work raised the saturated
+64-byte H3 response rate from `71,946` to `79,702` responses/s on the same
+two-vCPU GCP server, an immediate-reversal gain of `10.78%`. The change did not
+alter the media body, transport, client, topology, or server size.
 
 The profile's strongest lead is below the application router: the GCP virtio
 NIC reported `tx-udp-segmentation: off [fixed]`. Quinn can batch UDP output with
@@ -78,6 +85,41 @@ responses/s and `42,100` persistent H2 responses/s for the same body size. Those
 numbers are deliberately not in the table: client and server shared a host and
 the H3 test used two hosts, so comparing them as if only the protocol changed
 would be misleading.
+
+## Tiny-response control and first proven fix
+
+A separate 64-byte-body test removes link bandwidth and media packetization as
+the primary limit. The same London Quinn client drove the Amsterdam Quinn
+server over persistent H3 connections with 16 connections, a pipeline of 64,
+and a ten-second unpaced step. Both hosts were unchanged GCP `n2-standard-2`
+instances. The server was saturated at about `195%` CPU in every run.
+
+| Server build | Responses/s | Client-observed wire Mbit/s | p99 ms | Server CPU ticks |
+| --- | ---: | ---: | ---: | ---: |
+| Before, repeat 1 | 71,878 | 146.63 | 18.44 | 1,958 |
+| Before, repeat 2 | 72,014 | 147.09 | 18.28 | 1,960 |
+| Fixed, repeat 1 | 79,751 | 142.40 | 16.10 | 1,951 |
+| Fixed, repeat 2 | 79,653 | 142.35 | 16.06 | 1,947 |
+
+The old build was restarted immediately after the fixed runs and returned to
+the old rate, ruling out a transient increase in available cloud capacity. The
+fixed mean is `10.78%` higher, requests per server CPU tick improve by `11.35%`,
+and wire traffic per response falls by `12.49%`. Every run reported zero request
+errors.
+
+The pre-fix profile attributed `7.13%` flat CPU to stateless QPACK string
+encoding, with additional allocation and buffer-copy costs. The server added
+`Access-Control-Allow-Methods` and `Access-Control-Allow-Headers` to every
+response even though the [Fetch Standard](https://fetch.spec.whatwg.org/)
+defines those as CORS-preflight response fields. The fix keeps those fields on
+`OPTIONS` responses, omits them from ordinary media responses, and applies the
+same behavior to the Quinn and tokio-quiche backends. Unit and cross-
+implementation integration tests cover both cases.
+
+This is a real capacity fix, but it is not evidence that the remaining H3 cost
+has been eliminated. The next profile must verify how much QPACK and allocation
+work remains, and the full 5,760-byte media test must quantify its effect at the
+packet-rate boundary.
 
 ## What the profile showed
 
@@ -164,18 +206,34 @@ This feature deliberately adds a Cargo dependency instead of copying
 the build so the runner can switch the server backend while using the same
 Quinn client.
 
+The controlled backend comparison did not identify Quinn as the current
+capacity bug. At 40 simulated customers, both implementations completed exactly
+`16,000` scheduled responses/s. Quinn averaged about `150.6%` server CPU while
+tokio-quiche averaged about `159.5%`, and tokio-quiche emitted about `4.8%` more
+server packets. At 48 customers both completed exactly, with Quinn using about
+`179.8%` CPU and tokio-quiche about `189.9%`. Raising tokio-quiche's configured
+maximum UDP payload from 1,350 to 1,400 bytes produced no measurable change.
+
+The 64-byte unpaced control was more decisive: Quinn reached roughly `72,000`
+responses/s before the CORS fix, while tokio-quiche reached roughly `48,000` at
+16 connections and declined at 32. Quinn therefore remains the default. The
+selectable backend is retained as a correctness and implementation control, not
+as a capacity improvement.
+
 ## Application-path audit
 
 Inspection of [`web-service/src/h3.rs`](../web-service/src/h3.rs) found the
-following candidates. None is being declared the root cause until an isolated
-A/B test measures it:
+following candidates. Only the CORS response-header item has completed an
+isolated A/B test:
 
 - the ordinary request path allocates its URI path in the connection loop and
   allocates it again in the handler;
 - it clones the complete request header map when only `Range` is needed;
 - every accepted request creates a Tokio task and currently discards the task's
   handler error;
-- every response constructs the same four CORS headers;
+- fixed: every ordinary response constructed two unnecessary preflight CORS
+  fields; method-aware response fields improved tiny-response throughput by
+  `10.78%`;
 - the current `h3` response encoder uses stateless QPACK, so repeated response
   fields are encoded on every response; and
 - transport and H3 defaults need explicit tests for stream limits, flow-control
@@ -187,28 +245,34 @@ playlists at roughly `243,000` to `431,000` requests/s, and the underlying cache
 at `4.7` to `9.2` million reads/s. Each is comfortably above the isolated H3
 rate.
 
+The configured `256` bidirectional streams are a per-connection concurrency
+limit, not a global connection or customer cap. Idle persistent connections,
+blocked reloads, tiny active responses, and high-bandwidth PCM viewers are
+separate capacity dimensions and must be reported separately.
+
 ## Investigation plan
 
 All performance changes must keep H3 and use the same fixed workload so a
 regression cannot be hidden by changing the protocol or media shape.
 
-1. Make the runner's qualification strict per generator: exact request count,
-   zero errors, and zero scheduling backpressure. A nominal percentage alone is
-   not a valid pass.
-2. Run the same 40-customer GCP workload against Quinn and tokio-quiche, with a
-   Quinn client in both cases. Compare exactness, CPU, wire bytes, and latency.
-3. Add production-boundary H3 tests for response bytes, range requests,
+1. Completed: make the runner's qualification strict per generator: exact
+   request count, zero errors, and zero scheduling backpressure.
+2. Completed: run the same GCP workload against Quinn and tokio-quiche with an
+   unchanged Quinn client; keep Quinn as the default based on the result.
+3. Profile the fixed tiny-response path and remove the next measured per-
+   response allocation or encoding bottleneck.
+4. Add production-boundary H3 tests for response bytes, range requests,
    concurrent streams, disconnects, stream-limit pressure, and surfaced handler
    errors.
-4. Remove the duplicate path allocation and full header-map clone, then A/B
+5. Remove the duplicate path allocation and full header-map clone, then A/B
    CPU, request rate, latency, allocation rate, and wire bytes.
-5. Measure the canonical server against a minimal Quinn/`h3` static server on
+6. Measure the canonical server against a minimal Quinn/`h3` static server on
    the same machines. This isolates `web-service` overhead without moving away
    from H3.
-6. Compare UDP packet and raw QUIC controls with identical payload and pacing to
+7. Compare UDP packet and raw QUIC controls with identical payload and pacing to
    separate kernel packetization, QUIC crypto/recovery, H3 framing, and router
    costs.
-7. Repeat on a host with hardware UDP segmentation if one is available. Record
+8. Repeat on a host with hardware UDP segmentation if one is available. Record
    NIC offload features with every capacity result.
 
 An implementation change qualifies only when it preserves the exact H3
