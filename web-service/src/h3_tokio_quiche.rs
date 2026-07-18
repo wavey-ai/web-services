@@ -10,7 +10,7 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD as base64_engine, Engine as _};
 use bytes::Bytes;
-use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use http::{
     header::{HOST, RANGE},
     HeaderName, HeaderValue, Method, Request, Response, Uri,
@@ -22,7 +22,11 @@ use std::{
     sync::Arc,
 };
 use tempfile::TempDir;
-use tokio::{net::UdpSocket, sync::watch};
+use tokio::{
+    net::UdpSocket,
+    sync::watch,
+    task::{JoinError, JoinSet},
+};
 use tokio_quiche::{
     http3::{
         driver::{
@@ -192,12 +196,12 @@ async fn serve_connection(
     events: &mut ServerEventStream,
     router: Arc<dyn Router>,
 ) -> Result<(), H3Error> {
-    let mut in_flight = FuturesUnordered::new();
+    let mut request_tasks = JoinSet::new();
     loop {
         tokio::select! {
-            event = events.recv() => match event {
+            event = events.recv(), if request_tasks.len() < MAX_CONCURRENT_STREAMS as usize => match event {
                 Some(ServerH3Event::Headers { incoming_headers, .. }) => {
-                    in_flight.push(handle_request(incoming_headers, Arc::clone(&router)));
+                    request_tasks.spawn(handle_request(incoming_headers, Arc::clone(&router)));
                 }
                 Some(ServerH3Event::Core(H3Event::ConnectionError(error))) => {
                     return Err(H3Error::Transport(error.to_string()));
@@ -211,21 +215,27 @@ async fn serve_connection(
                 Some(ServerH3Event::Core(_)) => {}
                 None => break,
             },
-            Some(result) = in_flight.next(), if !in_flight.is_empty() => {
-                log_request_result(result);
+            Some(result) = request_tasks.join_next(), if !request_tasks.is_empty() => {
+                log_request_task_result(result);
             }
         }
     }
 
-    while let Some(result) = in_flight.next().await {
-        log_request_result(result);
+    while let Some(result) = request_tasks.join_next().await {
+        log_request_task_result(result);
     }
     Ok(())
 }
 
-fn log_request_result(result: Result<(), H3Error>) {
-    if let Err(error) = result {
-        tracing::warn!(backend = "tokio-quiche", %error, "H3 request failed");
+fn log_request_task_result(result: Result<Result<(), H3Error>, JoinError>) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(backend = "tokio-quiche", %error, "H3 request failed");
+        }
+        Err(error) => {
+            tracing::warn!(backend = "tokio-quiche", %error, "H3 request task failed");
+        }
     }
 }
 

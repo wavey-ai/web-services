@@ -5,10 +5,7 @@ use crate::{
     traits::{response_header_name, response_header_value, BodyStream, Router, StreamWriter},
 };
 use bytes::{Buf, Bytes};
-use futures_util::{
-    stream::{unfold, FuturesUnordered},
-    StreamExt,
-};
+use futures_util::stream::unfold;
 use h3::ext::Protocol;
 use h3::server::{Connection, RequestStream};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
@@ -17,10 +14,17 @@ use http::{header::RANGE, HeaderName, HeaderValue, Method, Response, StatusCode}
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
-use tokio::sync::{watch, Mutex};
+use tokio::{
+    sync::{watch, Mutex},
+    task::{JoinError, JoinSet},
+};
 
 // Stay below the 16,384-byte QUIC varint boundary to avoid 4-byte length encodings.
 const H3_MAX_DATA_CHUNK: usize = 16 * 1024 - 1;
+
+// Keep request work independently schedulable while bounding the tasks retained by a connection.
+// This matches the QUIC concurrent bidirectional-stream limit configured below.
+const H3_MAX_IN_FLIGHT_REQUESTS: usize = 256;
 
 pub struct Http3Server {
     config: ServerConfig,
@@ -232,18 +236,18 @@ async fn handle_h3_connection(
     mut conn: Connection<h3_quinn::Connection, Bytes>,
     router: Arc<dyn Router>,
 ) -> Result<(), H3Error> {
-    let mut in_flight = FuturesUnordered::new();
+    let mut request_tasks = JoinSet::new();
     loop {
         tokio::select! {
-            accepted = conn.accept() => match accepted {
+            accepted = conn.accept(), if request_tasks.len() < H3_MAX_IN_FLIGHT_REQUESTS => match accepted {
                 Ok(Some(resolver)) => {
                     let resolving = resolver.resolve_request();
                     tokio::pin!(resolving);
                     let resolved = loop {
                         tokio::select! {
                             resolved = &mut resolving => break resolved,
-                            Some(result) = in_flight.next(), if !in_flight.is_empty() => {
-                                log_h3_request_result(result, "HTTP/3 request failed");
+                            Some(result) = request_tasks.join_next(), if !request_tasks.is_empty() => {
+                                log_h3_request_task_result(result, "HTTP/3 request failed");
                             }
                         }
                     };
@@ -274,7 +278,7 @@ async fn handle_h3_connection(
                     let has_body_handler = !has_body_stream_handler
                         && !is_streaming
                         && router.has_body_handler(req.uri().path());
-                    in_flight.push(dispatch_h3_request(
+                    request_tasks.spawn(dispatch_h3_request(
                         req,
                         stream,
                         router,
@@ -286,21 +290,26 @@ async fn handle_h3_connection(
                 Ok(None) => break,
                 Err(_) => break,
             },
-            Some(result) = in_flight.next(), if !in_flight.is_empty() => {
-                log_h3_request_result(result, "HTTP/3 request failed");
+            Some(result) = request_tasks.join_next(), if !request_tasks.is_empty() => {
+                log_h3_request_task_result(result, "HTTP/3 request failed");
             }
         }
     }
 
-    while let Some(result) = in_flight.next().await {
-        log_h3_request_result(result, "HTTP/3 request failed while draining connection");
+    while let Some(result) = request_tasks.join_next().await {
+        log_h3_request_task_result(result, "HTTP/3 request failed while draining connection");
     }
     Ok(())
 }
 
-fn log_h3_request_result(result: Result<(), H3Error>, message: &'static str) {
-    if let Err(error) = result {
-        tracing::debug!(%error, message);
+fn log_h3_request_task_result(
+    result: Result<Result<(), H3Error>, JoinError>,
+    message: &'static str,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::debug!(%error, message),
+        Err(error) => tracing::warn!(%error, message = "HTTP/3 request task failed"),
     }
 }
 
