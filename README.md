@@ -39,7 +39,9 @@ the saturated 64-byte H3 response rate from a two-run mean of `71,946` to
 `79,702` responses/s (`+10.78%`), reduced p99 from about `18.4 ms` to `16.1 ms`,
 and reduced total wire traffic despite serving more requests. An immediate
 restart of the old build reproduced the old ceiling. This is a small-response
-transport result; the nearly 1 Gbit/s PCM result above remains the current
+transport result. On the full 5,760-byte control, the same change reduced
+server CPU by about `2.4%` at 40 customers while completing every scheduled
+request. The nearly 1 Gbit/s PCM result above remains the current qualified
 full-media boundary.
 
 See [HTTP/3 capacity investigation](./docs/http3-capacity-investigation.md) for

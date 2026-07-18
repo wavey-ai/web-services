@@ -117,9 +117,24 @@ same behavior to the Quinn and tokio-quiche backends. Unit and cross-
 implementation integration tests cover both cases.
 
 This is a real capacity fix, but it is not evidence that the remaining H3 cost
-has been eliminated. The next profile must verify how much QPACK and allocation
-work remains, and the full 5,760-byte media test must quantify its effect at the
-packet-rate boundary.
+has been eliminated. A post-fix profile reduced flat QPACK string-encoding
+samples from `7.13%` to `4.55%`; `malloc`, `free`, QPACK decoding, and buffer
+copies remain visible. The profile collected more than 9,000 samples at 499 Hz
+with none lost. Profiling reduced the achieved response rate, so its throughput
+is diagnostic and is not included in the capacity mean.
+
+The full 5,760-byte control also improved. Two 40-customer runs completed all
+`160,000` scheduled requests with no error or backpressure. Mean server CPU
+fell from about `150.8%` to `147.2%`, while client-observed wire traffic fell
+from about `790.8` to `786.6 Mbit/s`; the server packet count was unchanged.
+The fix therefore adds real CPU headroom to the PCM-shaped path without
+altering packet geometry.
+
+At the old 56-customer failure point, the fixed build completed 223,896 of
+224,000 requests (`99.9536%`) but still reported ten generator backpressure
+events. Server CPU was about `183%`. This is a large improvement over the old
+`95.22%` completion result, but it is deliberately still recorded as a strict
+failure and does not establish 56-customer server capacity.
 
 ## What the profile showed
 
@@ -249,6 +264,16 @@ The configured `256` bidirectional streams are a per-connection concurrency
 limit, not a global connection or customer cap. Idle persistent connections,
 blocked reloads, tiny active responses, and high-bandwidth PCM viewers are
 separate capacity dimensions and must be reported separately.
+
+As an initial connection-count control, the server completed exact three-second
+steps at 100, 500, and 1,000 simultaneous persistent H3 connections, each
+making one 5,760-byte request per second, with zero error or scheduling
+backpressure. The load generator's soft file-descriptor limit was raised for
+that run because this diagnostic client currently creates one UDP endpoint per
+generated connection. This result disproves a 256-connection global ceiling;
+it is not an extrapolation to millions of connections. Larger idle and blocked-
+reload tests require a shared-endpoint generator and explicit memory/task
+measurements.
 
 ## Investigation plan
 
