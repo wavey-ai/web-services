@@ -10,7 +10,7 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD as base64_engine, Engine as _};
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
 use http::{
     header::{HOST, RANGE},
     HeaderName, HeaderValue, Method, Request, Response, Uri,
@@ -192,31 +192,41 @@ async fn serve_connection(
     events: &mut ServerEventStream,
     router: Arc<dyn Router>,
 ) -> Result<(), H3Error> {
-    while let Some(event) = events.recv().await {
-        match event {
-            ServerH3Event::Headers {
-                incoming_headers, ..
-            } => {
-                let router = Arc::clone(&router);
-                tokio::spawn(async move {
-                    if let Err(error) = handle_request(incoming_headers, router).await {
-                        tracing::warn!(backend = "tokio-quiche", %error, "H3 request failed");
-                    }
-                });
+    let mut in_flight = FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(ServerH3Event::Headers { incoming_headers, .. }) => {
+                    in_flight.push(handle_request(incoming_headers, Arc::clone(&router)));
+                }
+                Some(ServerH3Event::Core(H3Event::ConnectionError(error))) => {
+                    return Err(H3Error::Transport(error.to_string()));
+                }
+                Some(ServerH3Event::Core(H3Event::ConnectionShutdown(error))) => {
+                    return match error {
+                        Some(error) => Err(H3Error::Transport(error.to_string())),
+                        None => Ok(()),
+                    };
+                }
+                Some(ServerH3Event::Core(_)) => {}
+                None => break,
+            },
+            Some(result) = in_flight.next(), if !in_flight.is_empty() => {
+                log_request_result(result);
             }
-            ServerH3Event::Core(H3Event::ConnectionError(error)) => {
-                return Err(H3Error::Transport(error.to_string()));
-            }
-            ServerH3Event::Core(H3Event::ConnectionShutdown(error)) => {
-                return match error {
-                    Some(error) => Err(H3Error::Transport(error.to_string())),
-                    None => Ok(()),
-                };
-            }
-            ServerH3Event::Core(_) => {}
         }
     }
+
+    while let Some(result) = in_flight.next().await {
+        log_request_result(result);
+    }
     Ok(())
+}
+
+fn log_request_result(result: Result<(), H3Error>) {
+    if let Err(error) = result {
+        tracing::warn!(backend = "tokio-quiche", %error, "H3 request failed");
+    }
 }
 
 async fn handle_request(
