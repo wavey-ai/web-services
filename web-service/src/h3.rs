@@ -449,7 +449,7 @@ async fn send_h3_empty_response(
         .map_err(|e| H3Error::Transport(e.to_string()))
 }
 
-fn add_cors_headers<B>(res: &mut Response<B>) {
+pub(crate) fn add_cors_headers<B>(res: &mut Response<B>) {
     res.headers_mut().insert(
         HeaderName::from_static("access-control-allow-origin"),
         HeaderValue::from_static("*"),

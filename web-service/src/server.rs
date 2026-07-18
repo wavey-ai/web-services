@@ -1,7 +1,7 @@
 // h2h3-server/src/server.rs
 
 use crate::{
-    config::ServerConfig,
+    config::{H3Backend, ServerConfig},
     error::ServerError,
     h2::Http2Server,
     h3::Http3Server,
@@ -66,14 +66,30 @@ impl Server for H2H3Server {
 
         // Start HTTP/3 server if enabled
         if self.config.enable_h3 {
-            let h3_server = Http3Server::new(self.config.clone(), Arc::clone(&self.router));
             let shutdown_rx = shutdown_rx.clone();
 
-            let handle = tokio::spawn(async move {
-                if let Err(e) = h3_server.start(shutdown_rx).await {
-                    tracing::error!("HTTP/3 server error: {}", e);
+            let handle = match self.config.h3_backend {
+                H3Backend::Quinn => {
+                    let h3_server = Http3Server::new(self.config.clone(), Arc::clone(&self.router));
+                    tokio::spawn(async move {
+                        if let Err(e) = h3_server.start(shutdown_rx).await {
+                            tracing::error!(backend = "quinn", "HTTP/3 server error: {}", e);
+                        }
+                    })
                 }
-            });
+                #[cfg(feature = "h3-tokio-quiche")]
+                H3Backend::TokioQuiche => {
+                    let h3_server = crate::h3_tokio_quiche::TokioQuicheHttp3Server::new(
+                        self.config.clone(),
+                        Arc::clone(&self.router),
+                    );
+                    tokio::spawn(async move {
+                        if let Err(e) = h3_server.start(shutdown_rx).await {
+                            tracing::error!(backend = "tokio-quiche", "HTTP/3 server error: {}", e);
+                        }
+                    })
+                }
+            };
 
             tasks.push(handle);
         }
@@ -186,6 +202,15 @@ impl ServerBuilder for H2H3ServerBuilder {
                 "At least one protocol (HTTP/2 or HTTP/3) must be enabled".into(),
             ));
         }
+        #[cfg(feature = "h3-tokio-quiche")]
+        if self.config.enable_h3
+            && self.config.h3_backend == H3Backend::TokioQuiche
+            && self.config.enable_webtransport
+        {
+            return Err(ServerError::Config(
+                "tokio-quiche H3 backend cannot be selected while WebTransport is enabled".into(),
+            ));
+        }
         if self.config.enable_raw_tcp && self.raw_tcp_handler.is_none() {
             return Err(ServerError::Config(
                 "Raw TCP enabled but no handler provided".into(),
@@ -197,5 +222,12 @@ impl ServerBuilder for H2H3ServerBuilder {
             router: Arc::from(router),
             raw_tcp_handler: self.raw_tcp_handler.map(Arc::from),
         })
+    }
+}
+
+impl H2H3ServerBuilder {
+    pub fn with_h3_backend(mut self, backend: H3Backend) -> Self {
+        self.config.h3_backend = backend;
+        self
     }
 }

@@ -6,6 +6,35 @@ The `web-service` crate owns protocol plumbing only. Raw TCP helpers expose
 generic `[u32_be length][payload]` frame reads/writes; callers decide whether a
 frame is mesh JSON, media access-unit bytes, or another application payload.
 
+## HTTP/3 capacity investigation
+
+Persistent HTTP/3 is still the production target for low-latency delivery. In
+the current isolated two-host test, `web-service` delivered a 5 ms, 16-channel
+PCM-shaped workload exactly through 48 simulated customers: `19,200` responses
+per second, `884.7 Mbit/s` of response payload, and about `947.7 Mbit/s` on the
+wire. The request-latency p99 was `14.1 ms` on a path with roughly `12.9 ms`
+ICMP RTT. At 56 customers the test stopped holding the requested cadence.
+
+The capacity gap relative to the TCP controls is large enough that we are
+treating it as an implementation investigation, not a reason to replace H3.
+The profile and packet capture found substantial UDP send/kernel work: each
+5,760-byte response already used the minimum practical number of QUIC packets,
+but the virtio NIC had UDP transmit segmentation fixed off, so batched output
+was segmented in software. A dedicated Linode control had the same offload
+constraint and was not faster than GCP at the same exact workload. The existing
+H1/H2 figures were collected with a different topology and are controls only;
+they are not a valid final protocol comparison.
+
+Quinn remains the default and continues to own WebTransport. Enabling the
+`h3-tokio-quiche` Cargo feature adds Cloudflare's `tokio-quiche` as a selectable
+plain-H3 server backend, so the same router and a Quinn client can measure the
+two implementations without maintaining a copied server. Selecting
+tokio-quiche together with WebTransport is rejected until feature parity is
+implemented.
+
+See [HTTP/3 capacity investigation](./docs/http3-capacity-investigation.md) for
+the workload, results, profile, current interpretation, and bug-audit plan.
+
 ## Workspace Overview
 
 | Crate | Purpose |
