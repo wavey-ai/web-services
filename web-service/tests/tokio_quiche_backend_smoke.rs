@@ -130,8 +130,7 @@ async fn get(
     Ok(Bytes::from(body))
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn quinn_client_reads_concurrent_tokio_quiche_responses() {
+async fn assert_quinn_client_reads_concurrent_responses(backend: H3Backend) {
     let tls = test_tls();
     let port = unused_udp_port();
     let server = H2H3Server::builder()
@@ -141,11 +140,11 @@ async fn quinn_client_reads_concurrent_tokio_quiche_responses() {
         .enable_h3(true)
         .enable_websocket(false)
         .enable_webtransport(false)
-        .with_h3_backend(H3Backend::TokioQuiche)
+        .with_h3_backend(backend)
         .with_router(Box::new(StaticRouter))
         .build()
-        .expect("build tokio-quiche server");
-    let handle = server.start().await.expect("start tokio-quiche server");
+        .expect("build H3 server");
+    let handle = server.start().await.expect("start H3 server");
     handle.ready_rx.await.expect("server ready");
 
     let quinn_config = h3_quinn::quinn::ClientConfig::new(Arc::new(
@@ -185,6 +184,16 @@ async fn quinn_client_reads_concurrent_tokio_quiche_responses() {
     driver_task.abort();
     let _ = handle.shutdown_tx.send(());
     let _ = handle.finished_rx.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quinn_client_reads_concurrent_tokio_quiche_responses() {
+    assert_quinn_client_reads_concurrent_responses(H3Backend::TokioQuiche).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quinn_client_reads_concurrent_quinn_responses() {
+    assert_quinn_client_reads_concurrent_responses(H3Backend::Quinn).await;
 }
 
 #[test]

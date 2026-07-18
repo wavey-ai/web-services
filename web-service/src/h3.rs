@@ -5,7 +5,10 @@ use crate::{
     traits::{response_header_name, response_header_value, BodyStream, Router, StreamWriter},
 };
 use bytes::{Buf, Bytes};
-use futures_util::stream::unfold;
+use futures_util::{
+    stream::{unfold, FuturesUnordered},
+    StreamExt,
+};
 use h3::ext::Protocol;
 use h3::server::{Connection, RequestStream};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
@@ -229,54 +232,97 @@ async fn handle_h3_connection(
     mut conn: Connection<h3_quinn::Connection, Bytes>,
     router: Arc<dyn Router>,
 ) -> Result<(), H3Error> {
+    let mut in_flight = FuturesUnordered::new();
     loop {
-        match conn.accept().await {
-            Ok(Some(resolver)) => {
-                let (req, stream) = resolver
-                    .resolve_request()
-                    .await
-                    .map_err(|e| H3Error::Transport(e.to_string()))?;
-                let ext = req.extensions();
-                if req.method() == &Method::CONNECT
-                    && ext.get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT)
-                {
-                    if let Some(handler) = router.webtransport_handler() {
-                        let session = WebTransportSession::accept(req, stream, conn)
-                            .await
-                            .map_err(|e| H3Error::Transport(e.to_string()))?;
-                        handler
-                            .handle_session(session)
-                            .await
-                            .map_err(H3Error::Router)?;
-                    } else {
-                        send_h3_empty_response(StatusCode::NOT_FOUND, stream).await?;
-                        continue;
+        tokio::select! {
+            accepted = conn.accept() => match accepted {
+                Ok(Some(resolver)) => {
+                    let resolving = resolver.resolve_request();
+                    tokio::pin!(resolving);
+                    let resolved = loop {
+                        tokio::select! {
+                            resolved = &mut resolving => break resolved,
+                            Some(result) = in_flight.next(), if !in_flight.is_empty() => {
+                                log_h3_request_result(result, "HTTP/3 request failed");
+                            }
+                        }
+                    };
+                    let (req, stream) = resolved
+                        .map_err(|e| H3Error::Transport(e.to_string()))?;
+                    let ext = req.extensions();
+                    if req.method() == &Method::CONNECT
+                        && ext.get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT)
+                    {
+                        if let Some(handler) = router.webtransport_handler() {
+                            let session = WebTransportSession::accept(req, stream, conn)
+                                .await
+                                .map_err(|e| H3Error::Transport(e.to_string()))?;
+                            handler
+                                .handle_session(session)
+                                .await
+                                .map_err(H3Error::Router)?;
+                        } else {
+                            send_h3_empty_response(StatusCode::NOT_FOUND, stream).await?;
+                            continue;
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
+                    let router = Arc::clone(&router);
+                    let has_body_stream_handler = router.has_body_stream_handler(req.uri().path());
+                    let is_streaming =
+                        !has_body_stream_handler && router.is_streaming(req.uri().path());
+                    let has_body_handler = !has_body_stream_handler
+                        && !is_streaming
+                        && router.has_body_handler(req.uri().path());
+                    in_flight.push(dispatch_h3_request(
+                        req,
+                        stream,
+                        router,
+                        has_body_stream_handler,
+                        is_streaming,
+                        has_body_handler,
+                    ));
                 }
-                let router = Arc::clone(&router);
-                let has_body_stream_handler = router.has_body_stream_handler(req.uri().path());
-                let is_streaming =
-                    !has_body_stream_handler && router.is_streaming(req.uri().path());
-                let has_body_handler = !has_body_stream_handler
-                    && !is_streaming
-                    && router.has_body_handler(req.uri().path());
-                tokio::spawn(async move {
-                    if has_body_stream_handler {
-                        let _ = handle_h3_body_stream_request(req, stream, router).await;
-                    } else if is_streaming {
-                        let writer = H3StreamWriter { stream };
-                        let _ = router.route_stream(req, Box::new(writer)).await;
-                    } else {
-                        let _ = handle_h3_request(req, stream, router, has_body_handler).await;
-                    }
-                });
+                Ok(None) => break,
+                Err(_) => break,
+            },
+            Some(result) = in_flight.next(), if !in_flight.is_empty() => {
+                log_h3_request_result(result, "HTTP/3 request failed");
             }
-            Ok(None) => break,
-            Err(_) => break,
         }
     }
+
+    while let Some(result) = in_flight.next().await {
+        log_h3_request_result(result, "HTTP/3 request failed while draining connection");
+    }
     Ok(())
+}
+
+fn log_h3_request_result(result: Result<(), H3Error>, message: &'static str) {
+    if let Err(error) = result {
+        tracing::debug!(%error, message);
+    }
+}
+
+async fn dispatch_h3_request(
+    req: http::Request<()>,
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    router: Arc<dyn Router>,
+    has_body_stream_handler: bool,
+    is_streaming: bool,
+    has_body_handler: bool,
+) -> Result<(), H3Error> {
+    if has_body_stream_handler {
+        handle_h3_body_stream_request(req, stream, router).await
+    } else if is_streaming {
+        let writer = H3StreamWriter { stream };
+        router
+            .route_stream(req, Box::new(writer))
+            .await
+            .map_err(H3Error::Router)
+    } else {
+        handle_h3_request(req, stream, router, has_body_handler).await
+    }
 }
 
 async fn handle_h3_body_stream_request(
