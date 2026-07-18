@@ -33,6 +33,7 @@ use tokio_quiche::{
 
 const STREAM_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CONCURRENT_STREAMS: u64 = 256;
+const MAX_UDP_PAYLOAD_BYTES: usize = 1_400;
 const QPACK_TABLE_BYTES: u64 = 4 * 1024;
 const QPACK_BLOCKED_STREAMS: u64 = 16;
 
@@ -58,18 +59,7 @@ impl TokioQuicheHttp3Server {
         let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.config.port);
         let socket = UdpSocket::bind(addr).await?;
 
-        let mut quic = QuicSettings::default();
-        quic.disable_client_ip_validation = true;
-        quic.enable_dgram = false;
-        quic.initial_max_data = STREAM_WINDOW_BYTES;
-        quic.initial_max_stream_data_bidi_local = STREAM_WINDOW_BYTES;
-        quic.initial_max_stream_data_bidi_remote = STREAM_WINDOW_BYTES;
-        quic.initial_max_stream_data_uni = STREAM_WINDOW_BYTES;
-        quic.initial_max_streams_bidi = MAX_CONCURRENT_STREAMS;
-        quic.initial_max_streams_uni = MAX_CONCURRENT_STREAMS;
-        quic.max_connection_window = STREAM_WINDOW_BYTES;
-        quic.max_stream_window = STREAM_WINDOW_BYTES;
-        quic.discover_path_mtu = true;
+        let quic = quic_settings();
 
         let cert_path = tls_files.path_string(&tls_files.cert_path)?;
         let key_path = tls_files.path_string(&tls_files.key_path)?;
@@ -123,6 +113,24 @@ impl TokioQuicheHttp3Server {
         drop(tls_files);
         Ok(())
     }
+}
+
+fn quic_settings() -> QuicSettings {
+    let mut quic = QuicSettings::default();
+    quic.disable_client_ip_validation = true;
+    quic.enable_dgram = false;
+    quic.initial_max_data = STREAM_WINDOW_BYTES;
+    quic.initial_max_stream_data_bidi_local = STREAM_WINDOW_BYTES;
+    quic.initial_max_stream_data_bidi_remote = STREAM_WINDOW_BYTES;
+    quic.initial_max_stream_data_uni = STREAM_WINDOW_BYTES;
+    quic.initial_max_streams_bidi = MAX_CONCURRENT_STREAMS;
+    quic.initial_max_streams_uni = MAX_CONCURRENT_STREAMS;
+    quic.max_connection_window = STREAM_WINDOW_BYTES;
+    quic.max_stream_window = STREAM_WINDOW_BYTES;
+    quic.max_recv_udp_payload_size = MAX_UDP_PAYLOAD_BYTES;
+    quic.max_send_udp_payload_size = MAX_UDP_PAYLOAD_BYTES;
+    quic.discover_path_mtu = true;
+    quic
 }
 
 struct MaterializedTls {
@@ -463,5 +471,13 @@ mod tests {
         assert!(headers.iter().any(|header| {
             header.name() == b"access-control-allow-origin" && header.value() == b"*"
         }));
+    }
+
+    #[test]
+    fn transport_settings_allow_pmtu_above_the_conservative_default() {
+        let settings = quic_settings();
+        assert_eq!(settings.max_recv_udp_payload_size, 1_400);
+        assert_eq!(settings.max_send_udp_payload_size, 1_400);
+        assert!(settings.discover_path_mtu);
     }
 }
