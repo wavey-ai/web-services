@@ -31,7 +31,7 @@ pub struct H3StreamWriter {
 #[async_trait::async_trait]
 impl StreamWriter for H3StreamWriter {
     async fn send_response(&mut self, mut response: Response<()>) -> Result<(), ServerError> {
-        add_cors_headers(&mut response);
+        add_cors_response_headers(&mut response);
         self.stream
             .send_response(response)
             .await
@@ -80,7 +80,7 @@ pub struct H3SharedStreamWriter {
 #[async_trait::async_trait]
 impl StreamWriter for H3SharedStreamWriter {
     async fn send_response(&mut self, mut response: Response<()>) -> Result<(), ServerError> {
-        add_cors_headers(&mut response);
+        add_cors_response_headers(&mut response);
         let mut guard = self.stream.lock().await;
         guard
             .send_response(response)
@@ -128,7 +128,7 @@ pub struct H3SplitStreamWriter {
 #[async_trait::async_trait]
 impl StreamWriter for H3SplitStreamWriter {
     async fn send_response(&mut self, mut response: Response<()>) -> Result<(), ServerError> {
-        add_cors_headers(&mut response);
+        add_cors_response_headers(&mut response);
         let mut guard = self.stream.lock().await;
         guard
             .send_response(response)
@@ -316,6 +316,7 @@ async fn handle_h3_request(
     router: Arc<dyn Router>,
 ) -> Result<(), H3Error> {
     let path = req.uri().path().to_string();
+    let is_preflight = req.method() == Method::OPTIONS;
     let request_headers = req.headers().clone();
     if router.has_body_handler(&path) {
         let shared_stream = Arc::new(Mutex::new(stream));
@@ -342,6 +343,7 @@ async fn handle_h3_request(
         return send_h3_response(
             apply_byte_range(&request_headers, handler_response),
             &mut *guard,
+            is_preflight,
         )
         .await;
     }
@@ -350,6 +352,7 @@ async fn handle_h3_request(
     send_h3_response(
         apply_byte_range(&request_headers, handler_response),
         &mut stream,
+        is_preflight,
     )
     .await
 }
@@ -357,6 +360,7 @@ async fn handle_h3_request(
 async fn send_h3_response(
     handler_response: crate::traits::HandlerResponse,
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    is_preflight: bool,
 ) -> Result<(), H3Error> {
     let mut builder = http::Response::builder().status(handler_response.status);
     if let Some(ct) = handler_response.content_type {
@@ -369,7 +373,11 @@ async fn send_h3_response(
         builder = builder.header(&key, &value);
     }
     let mut resp = builder.body(()).map_err(H3Error::Header)?;
-    add_cors_headers(&mut resp);
+    if is_preflight {
+        add_cors_preflight_headers(&mut resp);
+    } else {
+        add_cors_response_headers(&mut resp);
+    }
 
     stream
         .send_response(resp)
@@ -438,7 +446,7 @@ async fn send_h3_empty_response(
         .status(status)
         .body(())
         .map_err(H3Error::Header)?;
-    add_cors_headers(&mut response);
+    add_cors_response_headers(&mut response);
     stream
         .send_response(response)
         .await
@@ -449,11 +457,25 @@ async fn send_h3_empty_response(
         .map_err(|e| H3Error::Transport(e.to_string()))
 }
 
-pub(crate) fn add_cors_headers<B>(res: &mut Response<B>) {
+pub(crate) fn add_cors_response_headers<B>(res: &mut Response<B>) {
     res.headers_mut().insert(
         HeaderName::from_static("access-control-allow-origin"),
         HeaderValue::from_static("*"),
     );
+    res.headers_mut()
+        .remove(HeaderName::from_static("access-control-allow-methods"));
+    res.headers_mut()
+        .remove(HeaderName::from_static("access-control-allow-headers"));
+    res.headers_mut().insert(
+        HeaderName::from_static("access-control-expose-headers"),
+        HeaderValue::from_static(
+            "x-sequence, stream-id, etag, content-length, accept-ranges, content-range",
+        ),
+    );
+}
+
+pub(crate) fn add_cors_preflight_headers<B>(res: &mut Response<B>) {
+    add_cors_response_headers(res);
     res.headers_mut().insert(
         HeaderName::from_static("access-control-allow-methods"),
         HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
@@ -461,12 +483,6 @@ pub(crate) fn add_cors_headers<B>(res: &mut Response<B>) {
     res.headers_mut().insert(
         HeaderName::from_static("access-control-allow-headers"),
         HeaderValue::from_static("*"),
-    );
-    res.headers_mut().insert(
-        HeaderName::from_static("access-control-expose-headers"),
-        HeaderValue::from_static(
-            "x-sequence, stream-id, etag, content-length, accept-ranges, content-range",
-        ),
     );
 }
 
@@ -481,4 +497,41 @@ fn build_quic_transport_config() -> quinn::TransportConfig {
         .max_concurrent_bidi_streams(MAX_CONCURRENT_STREAMS.into())
         .max_concurrent_uni_streams(MAX_CONCURRENT_STREAMS.into());
     transport
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_cors_response_omits_preflight_only_fields() {
+        let mut response = Response::builder()
+            .header("access-control-allow-methods", "GET")
+            .header("access-control-allow-headers", "range")
+            .body(())
+            .unwrap();
+        add_cors_response_headers(&mut response);
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+        assert!(!response
+            .headers()
+            .contains_key("access-control-allow-methods"));
+        assert!(!response
+            .headers()
+            .contains_key("access-control-allow-headers"));
+        assert!(response
+            .headers()
+            .contains_key("access-control-expose-headers"));
+    }
+
+    #[test]
+    fn preflight_cors_response_keeps_method_and_header_permissions() {
+        let mut response = Response::new(());
+        add_cors_preflight_headers(&mut response);
+        assert!(response
+            .headers()
+            .contains_key("access-control-allow-methods"));
+        assert!(response
+            .headers()
+            .contains_key("access-control-allow-headers"));
+    }
 }

@@ -1,7 +1,7 @@
 use crate::{
     config::ServerConfig,
     error::{H3Error, ServerError, ServerResult},
-    h3::add_cors_headers,
+    h3::{add_cors_preflight_headers, add_cors_response_headers},
     http_range::apply_byte_range,
     traits::{BodyStream, HandlerResponse, Router, StreamWriter},
 };
@@ -225,6 +225,7 @@ async fn handle_request(
     } = incoming;
     let request = request_from_h3_headers(headers)?;
     let path = request.uri().path().to_owned();
+    let is_preflight = request.method() == Method::OPTIONS;
 
     if router.has_body_stream_handler(&path) {
         let body = body_stream(recv);
@@ -252,7 +253,12 @@ async fn handle_request(
     } else {
         router.route(request).await.map_err(H3Error::Router)?
     };
-    send_handler_response(apply_byte_range(&request_headers, response), send).await
+    send_handler_response(
+        apply_byte_range(&request_headers, response),
+        send,
+        is_preflight,
+    )
+    .await
 }
 
 fn body_stream(recv: tokio_quiche::http3::driver::InboundFrameStream) -> BodyStream {
@@ -330,8 +336,9 @@ fn request_from_h3_headers(headers: Vec<Header>) -> Result<Request<()>, H3Error>
 async fn send_handler_response(
     response: HandlerResponse,
     mut sender: OutboundFrameSender,
+    is_preflight: bool,
 ) -> Result<(), H3Error> {
-    let (headers, body) = response_parts(response)?;
+    let (headers, body) = response_parts(response, is_preflight)?;
     sender
         .send(OutboundFrame::Headers(headers, None))
         .await
@@ -342,7 +349,10 @@ async fn send_handler_response(
         .map_err(channel_error)
 }
 
-fn response_parts(response: HandlerResponse) -> Result<(Vec<Header>, Option<Bytes>), H3Error> {
+fn response_parts(
+    response: HandlerResponse,
+    is_preflight: bool,
+) -> Result<(Vec<Header>, Option<Bytes>), H3Error> {
     let HandlerResponse {
         status,
         body,
@@ -361,7 +371,11 @@ fn response_parts(response: HandlerResponse) -> Result<(Vec<Header>, Option<Byte
         builder = builder.header(name, value);
     }
     let mut response = builder.body(()).map_err(H3Error::Header)?;
-    add_cors_headers(&mut response);
+    if is_preflight {
+        add_cors_preflight_headers(&mut response);
+    } else {
+        add_cors_response_headers(&mut response);
+    }
     Ok((response_headers(&response), body))
 }
 
@@ -401,7 +415,7 @@ impl TokioQuicheStreamWriter {
 #[async_trait::async_trait]
 impl StreamWriter for TokioQuicheStreamWriter {
     async fn send_response(&mut self, mut response: Response<()>) -> Result<(), ServerError> {
-        add_cors_headers(&mut response);
+        add_cors_response_headers(&mut response);
         self.sender
             .lock()
             .await
@@ -457,12 +471,15 @@ mod tests {
     #[test]
     fn response_conversion_preserves_payload_and_cors() {
         let payload = Bytes::from_static(b"pcm");
-        let (headers, body) = response_parts(HandlerResponse {
-            status: StatusCode::OK,
-            body: Some(payload.clone()),
-            content_type: Some("audio/L24".into()),
-            ..HandlerResponse::default()
-        })
+        let (headers, body) = response_parts(
+            HandlerResponse {
+                status: StatusCode::OK,
+                body: Some(payload.clone()),
+                content_type: Some("audio/L24".into()),
+                ..HandlerResponse::default()
+            },
+            false,
+        )
         .expect("valid response");
         assert_eq!(body, Some(payload));
         assert!(headers
@@ -471,6 +488,27 @@ mod tests {
         assert!(headers.iter().any(|header| {
             header.name() == b"access-control-allow-origin" && header.value() == b"*"
         }));
+        assert!(!headers
+            .iter()
+            .any(|header| header.name() == b"access-control-allow-methods"));
+        assert!(!headers
+            .iter()
+            .any(|header| header.name() == b"access-control-allow-headers"));
+    }
+
+    #[test]
+    fn preflight_response_includes_cors_permissions() {
+        let (headers, _) =
+            response_parts(HandlerResponse::default(), true).expect("valid response");
+        assert!(headers.iter().any(|header| {
+            header.name() == b"access-control-allow-origin" && header.value() == b"*"
+        }));
+        assert!(headers
+            .iter()
+            .any(|header| header.name() == b"access-control-allow-methods"));
+        assert!(headers
+            .iter()
+            .any(|header| header.name() == b"access-control-allow-headers"));
     }
 
     #[test]

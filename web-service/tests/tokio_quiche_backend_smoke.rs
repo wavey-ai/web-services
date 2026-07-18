@@ -116,6 +116,12 @@ async fn get(
     assert_eq!(response.version(), Version::HTTP_3);
     assert_eq!(response.headers()["content-type"], "video/mp4");
     assert_eq!(response.headers()["access-control-allow-origin"], "*");
+    assert!(!response
+        .headers()
+        .contains_key("access-control-allow-methods"));
+    assert!(!response
+        .headers()
+        .contains_key("access-control-allow-headers"));
     let mut body = Vec::new();
     while let Some(mut chunk) = stream.recv_data().await? {
         let remaining = chunk.remaining();
