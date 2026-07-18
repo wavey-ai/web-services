@@ -221,6 +221,10 @@ async fn serve_connection(
         }
     }
 
+    // No further events can arrive once this connection stream closes. Abort
+    // live-tail router work immediately instead of retaining it until its
+    // application deadline.
+    request_tasks.abort_all();
     while let Some(result) = request_tasks.join_next().await {
         log_request_task_result(result);
     }
@@ -233,6 +237,7 @@ fn log_request_task_result(result: Result<Result<(), H3Error>, JoinError>) {
         Ok(Err(error)) => {
             tracing::warn!(backend = "tokio-quiche", %error, "H3 request failed");
         }
+        Err(error) if error.is_cancelled() => {}
         Err(error) => {
             tracing::warn!(backend = "tokio-quiche", %error, "H3 request task failed");
         }

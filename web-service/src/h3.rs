@@ -296,8 +296,12 @@ async fn handle_h3_connection(
         }
     }
 
+    // A request can be blocked waiting for future live media. Once the owning
+    // QUIC connection is gone, keeping those tasks alive until their router
+    // deadline wastes capacity and lets one load tier bleed into the next.
+    request_tasks.abort_all();
     while let Some(result) = request_tasks.join_next().await {
-        log_h3_request_task_result(result, "HTTP/3 request failed while draining connection");
+        log_h3_request_task_result(result, "HTTP/3 request failed while closing connection");
     }
     Ok(())
 }
@@ -309,6 +313,7 @@ fn log_h3_request_task_result(
     match result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::debug!(%error, message),
+        Err(error) if error.is_cancelled() => {}
         Err(error) => tracing::warn!(%error, message = "HTTP/3 request task failed"),
     }
 }
