@@ -7,15 +7,74 @@ use http::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use playlists::chunk_cache::ChunkCache;
 use std::sync::Arc;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::sync::broadcast;
+use tokio::time::{Duration, Instant, sleep, timeout};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use web_service::{
     HandlerResult, ServerError, StreamWriter, StreamingHandler, WebSocketHandler,
     WebTransportHandler,
 };
 use xmpegts::define::epsi_stream_type;
 use xmpegts::ts::TsMuxer;
+
+pub const AUDIO_EPOCH_SUBSCRIPTION: &[u8] = b"WAVEY-AUDIO-EPOCH/1";
+
+/// Fans out already encoded multichannel audio epochs. Lagging sessions skip
+/// stale packets instead of increasing playout latency.
+pub struct AudioEpochWebTransportHandler {
+    audio_epochs: broadcast::Sender<Bytes>,
+}
+
+impl AudioEpochWebTransportHandler {
+    pub fn new(audio_epochs: broadcast::Sender<Bytes>) -> Self {
+        Self { audio_epochs }
+    }
+}
+
+#[async_trait]
+impl WebTransportHandler for AudioEpochWebTransportHandler {
+    async fn handle_session(
+        &self,
+        session: WebTransportSession<QuinnConnection, Bytes>,
+    ) -> HandlerResult<()> {
+        let mut reader = session.datagram_reader();
+        let subscription = timeout(Duration::from_secs(5), reader.read_datagram())
+            .await
+            .map_err(|_| ServerError::Config("audio epoch subscription timed out".into()))?
+            .map_err(|error| {
+                ServerError::Handler(Box::new(std::io::Error::other(error.to_string())))
+            })?
+            .into_payload();
+        if subscription.as_ref() != AUDIO_EPOCH_SUBSCRIPTION {
+            return Err(ServerError::Config(
+                "invalid audio epoch WebTransport subscription".into(),
+            ));
+        }
+
+        let mut audio_epochs = self.audio_epochs.subscribe();
+        let mut sender = session.datagram_sender();
+        info!("WebTransport multichannel audio epoch session started");
+        loop {
+            match audio_epochs.recv().await {
+                Ok(datagram) => {
+                    if let Err(error) = sender.send_datagram(datagram) {
+                        debug!("WebTransport audio epoch session closed: {}", error);
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    debug!(
+                        skipped,
+                        "WebTransport audio epoch receiver skipped stale datagrams"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Tail streaming handler
 pub struct TailStreamHandler {
