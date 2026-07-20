@@ -3,45 +3,53 @@
 `web-services` is the Rust workspace for Wavey's transport, proxy, and low-latency delivery services. It combines a reusable multi-protocol server foundation with cache-backed streaming crates and the `upload-response` request/response pipeline.
 
 The `web-service` crate owns protocol plumbing only. Raw TCP helpers expose
-generic `[u32_be length][payload]` frame reads/writes; callers decide whether a
+generic `[u32_be length][payload]` frame reads/writes. Callers decide whether a
 frame is mesh JSON, media access-unit bytes, or another application payload.
 
 ## HTTP/3 capacity investigation
 
 Persistent HTTP/3 is still the production target for low-latency delivery. In
 the current isolated two-host test, `web-service` delivered a 5 ms, 16-channel
-PCM-shaped workload exactly through 48 simulated customers: `19,200` responses
-per second, `884.7 Mbit/s` of response payload, and about `947.7 Mbit/s` on the
-wire. The request-latency p99 was `14.1 ms` on a path with roughly `12.9 ms`
+PCM-shaped workload exactly through 48 simulated customers. It delivered
+`19,200` responses per second and `884.7 Mbit/s` of response payload. The wire
+rate was approximately `947.7 Mbit/s`. Request-latency p99 was `14.1 ms` on a
+path with approximately `12.9 ms`
 ICMP RTT. At 56 customers the test stopped holding the requested cadence.
 
-The capacity gap relative to the TCP controls is large enough that we are
-treating it as an implementation investigation, not a reason to replace H3.
-The profile and packet capture found substantial UDP send/kernel work: each
-5,760-byte response already used the minimum practical number of QUIC packets,
-but the virtio NIC had UDP transmit segmentation fixed off, so batched output
-was segmented in software. A dedicated Linode control had the same offload
+The capacity gap relative to the TCP controls requires an implementation
+investigation. It is not a reason to replace H3. The profile and packet capture
+found much UDP send and kernel work. Each 5,760-byte response used the minimum
+practical number of QUIC packets. However, UDP transmit segmentation was off on
+the virtio NIC. Thus, software segmented the batched output.
+
+A dedicated Linode control had the same offload
 constraint and was not faster than GCP at the same exact workload. The existing
-H1/H2 figures were collected with a different topology and are controls only;
-they are not a valid final protocol comparison.
+H1/H2 figures were collected with a different topology and are controls only.
+They are not a valid final protocol comparison.
 
 Quinn remains the default and continues to own WebTransport. Enabling the
 `h3-tokio-quiche` Cargo feature adds Cloudflare's `tokio-quiche` as a selectable
-plain-H3 server backend, so the same router and a Quinn client can measure the
-two implementations without maintaining a copied server. Selecting
+plain-H3 server backend. The same router and a Quinn client can then measure the
+two implementations without a copied server. Selecting
 tokio-quiche together with WebTransport is rejected until feature parity is
 implemented.
 
 The isolation work has produced its first proven capacity fix. Ordinary media
-GET responses were carrying two CORS fields that belong on preflight responses.
-On the same two-vCPU GCP server, removing that repeated header/QPACK work raised
-the saturated 64-byte H3 response rate from a two-run mean of `71,946` to
-`79,702` responses/s (`+10.78%`), reduced p99 from about `18.4 ms` to `16.1 ms`,
-and reduced total wire traffic despite serving more requests. An immediate
+GET responses carried two CORS fields that belong on preflight responses. Tests
+removed this repeated header and QPACK work on the same two-vCPU GCP server. The
+mean saturated 64-byte H3 response rate increased from `71,946` to `79,702`
+responses/s (`+10.78%`). The change reduced p99 from approximately `18.4 ms` to
+`16.1 ms`.
+
+It also reduced wire traffic while it served more requests. An immediate
 restart of the old build reproduced the old ceiling. This is a small-response
-transport result. On the full 5,760-byte control, the same change reduced
+transport result.
+
+On the full 5,760-byte control, the same change reduced
 server CPU by about `2.4%` at 40 customers while completing every scheduled
-request. The nearly 1 Gbit/s PCM result above remains the current qualified
+request.
+
+The nearly 1 Gbit/s PCM result above remains the current qualified
 full-media boundary.
 
 See [HTTP/3 capacity investigation](./docs/http3-capacity-investigation.md) for
@@ -100,7 +108,9 @@ For local TLS-based tests, the repo also includes certificates under [`tls/local
 
 The detailed `upload-response` crate documentation now lives here instead of in [`upload-response/README.md`](./upload-response/README.md).
 
-`upload-response` is a high-performance request/response proxy service that streams requests into a shared-memory cache for external workers to process, then returns responses back to clients.
+`upload-response` is a high-performance request and response proxy. It streams
+requests into a shared-memory cache for external workers. It then returns their
+responses to clients.
 
 The shared-memory `ChunkCache` and slot-based streaming architecture are inspired by Low-Latency HLS partial segment delivery patterns.
 
@@ -191,7 +201,10 @@ For split CPU ingress and GPU worker deployments, `UploadResponseRouter` now exp
 | `PUT` | `/_upload_response/streams/{stream_id}/response/body` | Append raw response body bytes |
 | `PUT` | `/_upload_response/streams/{stream_id}/response/end` | Finish the response stream |
 
-This is the intended `v1` control plane for k8s pod splits: CPU ingress/transcode pods own the client connection and cache, while GPU workers read request slots and write response slots back over internal H2. If we need a hotter data plane later, the same semantics can move to raw TCP/TLS with `HPKS` framing.
+This is the intended `v1` control plane for Kubernetes pod splits. CPU ingress
+and transcode pods own the client connection and cache. GPU workers read request
+slots and write response slots through internal H2. A future high-throughput
+data plane can use raw TCP/TLS with the same semantics and `HPKS` framing.
 
 ### Stream Format
 
@@ -227,7 +240,7 @@ UDP+FEC, enabled by the `udp-fec` feature, uses the extracted [`raptorq-datagram
 | `src_syms` | `u16` LE | `K`, source symbols per block |
 | `sym_sz` | `u16` LE | `T`, symbol size in bytes, default `1316` |
 
-Defaults: `K=4`, `T=1316`, `R=1` repair symbol. That recovers any single datagram loss per block with about `80 ms` latency overhead at `48 kHz` and `960`-sample frames. The sequenced header also lets receivers report missing/reordered datagrams while RaptorQ repairs complete blocks. Loss beyond the repair budget is not recovered by FEC alone; callers that need eventual delivery must add a repair/backfill path.
+Defaults: `K=4`, `T=1316`, `R=1` repair symbol. That recovers any single datagram loss per block with about `80 ms` latency overhead at `48 kHz` and `960`-sample frames. The sequenced header also lets receivers report missing/reordered datagrams while RaptorQ repairs complete blocks. Loss beyond the repair budget is not recovered by FEC alone. Callers that need eventual delivery must add a repair/backfill path.
 
 ```rust
 use upload_response::{UdpFecIngest, UdpFecSender};
@@ -394,9 +407,16 @@ Latency characteristics for streaming and real-time delivery, such as audio fram
 | HTTP/2 | Multiplexing plus HOL at the TCP layer | Worse than TCP |
 | HTTP/3 | QUIC avoids per-stream HOL, but adds crypto RTT | ~50-100 ms |
 
-SRT and RIST trade latency for reliability via retransmission. A lost packet always costs at least one additional RTT, but retransmission from history can eventually recover loss that exceeds a small FEC budget. UDP+FEC pays the latency cost up front and deterministically, so worst-case recovery latency is fixed at block-fill time for loss that stays inside the configured repair budget.
+SRT and RIST trade latency for reliability through retransmission. A lost packet
+always costs at least one more RTT. Historical retransmission can recover loss
+that exceeds a small FEC budget. UDP+FEC pays a deterministic latency cost in
+advance. For loss within the repair budget, the maximum recovery latency is the
+block-fill time.
 
-Avoid `K=1, R=1` for live media unless you explicitly want 100% repair overhead on each tiny packet. The reusable RaptorQ crates now carry packet sequencing in the compact FEC header and expose media-aware adaptive repair so small delta/data packets can avoid unnecessary repair while keyframes/audio can receive more protection:
+Avoid `K=1, R=1` for live media unless you require 100% repair overhead on each
+small packet. The reusable RaptorQ crates carry packet sequencing in the compact
+FEC header. Media-aware adaptive repair gives more protection to keyframes and
+audio. It does not add unnecessary repair to small delta or data packets:
 
 ```rust
 let sender = UdpFecSender::new(target).await?;

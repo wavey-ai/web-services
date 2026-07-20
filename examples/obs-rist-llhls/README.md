@@ -10,7 +10,7 @@ OBS MPEG-TS over RIST -> pure Rust rist-mio receiver -> playlists ChunkCache -> 
 ```
 
 The server expects OBS to send MPEG-TS containing browser-playable codecs
-such as H.264 video and AAC audio. It does not transcode or remux yet; it
+such as H.264 video and AAC audio. It does not transcode or remux yet. It
 chunks received transport stream payloads into short cached parts and serves
 a low-latency live HLS playlist.
 
