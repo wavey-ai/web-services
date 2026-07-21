@@ -11,7 +11,7 @@ async-trait = "0.1.88"
 bytes = "1.11.1"
 clap = { version = "4.5", features = ["derive"] }
 http = "1.4.1"
-playlists = "0.1.6"
+playlists = { git = "https://github.com/wavey-ai/playlists.git" }
 rist-core-pure = { package = "rist-core", version = "0.1.0" }
 rist-mio-pure = { package = "rist-mio", version = "0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
@@ -19,4 +19,4 @@ serde_json = "1.0"
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-web-service = { package = "av-web-service", version = "0.1.0" }
+web-service = { package = "av-web-service", git = "https://github.com/wavey-ai/web-services.git" }

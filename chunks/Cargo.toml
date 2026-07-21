@@ -10,7 +10,7 @@ description = "Chunked media delivery services for Wavey"
 name = "chunks"
 
 [dependencies]
-web-service = { package = "av-web-service", version = "0.1.0" }
+web-service = { package = "av-web-service", git = "https://github.com/wavey-ai/web-services.git" }
 env_logger = "0.11.0"
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.40"
@@ -24,4 +24,4 @@ h3 = "0.0.8"
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"
 h3-datagram = "0.0.2"
-playlists = "0.1.6"
+playlists = { git = "https://github.com/wavey-ai/playlists.git" }

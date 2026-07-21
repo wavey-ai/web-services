@@ -20,9 +20,9 @@ udp-fec = ["dep:raptorq-datagram-fec", "raptorq-datagram-fec/udp"]
 
 [dependencies]
 anyhow = "1.0"
-web-service = { package = "av-web-service", version = "0.1.0" }
-playlists = "0.1.6"
-http-pack = { version = "0.1.0", default-features = false }
+web-service = { package = "av-web-service", git = "https://github.com/wavey-ai/web-services.git" }
+playlists = { git = "https://github.com/wavey-ai/playlists.git" }
+http-pack = { git = "https://github.com/wavey-ai/http-pack.git", default-features = false }
 tokio = { version = "1.52.3", features = ["full"] }
 bytes = "1.11.1"
 async-trait = "0.1.88"
@@ -36,7 +36,7 @@ reqwest = { version = "0.13.4", features = ["rustls", "http2"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 srt = { package = "wavey-srt", version = "0.1.0", features = ["async"], optional = true }
-raptorq-datagram-fec = { version = "0.1.6", default-features = false, optional = true }
+raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git", package = "raptorq-datagram-fec", default-features = false, optional = true }
 rist = { package = "wavey-rist", version = "0.1.0", features = ["tokio"], optional = true }
 rist-core-pure = { package = "rist-core", version = "0.1.0", optional = true }
 rist-mio-pure = { package = "rist-mio", version = "0.1.0", optional = true }
