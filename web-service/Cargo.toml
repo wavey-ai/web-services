@@ -1,8 +1,14 @@
 [package]
-name = "web-service"
+name = "av-web-service"
 authors = ["Jamie Brough <jamie@wavey.ai>"]
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
+repository.workspace = true
+description = "HTTP/2, HTTP/3, WebTransport, and WebSocket services for Wavey media"
+
+[lib]
+name = "web_service"
 
 [features]
 default = ["h3-quinn"]
@@ -41,19 +47,19 @@ h3 = "0.0.8"
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"
 h3-datagram = "0.0.2"
-playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "885ffe5a29ed89a3946179cc4dc2c73399665310" }
-tls-helpers = { git = "https://github.com/wavey-ai/tls-helpers.git" }
-xmpegts = { git = "https://github.com/wavey-ai/xiu" }
+playlists = "0.1.6"
+tls-helpers = "0.2.0"
+xmpegts = "0.2.4"
 async-trait = "0.1.88"
 thiserror = "2.0.12"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
-gen-id = { git = "https://github.com/wavey-ai/gen-id.git" }
+gen-id = "0.3.0"
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "webpki-tokio", "ring"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 url = { version = "2", features = ["serde"] }
-http-pack = { git = "https://github.com/wavey-ai/http-pack.git" }
+http-pack = "0.1.0"
 rustls-pemfile = "2"
 tempfile = { version = "3", optional = true }
 tokio-quiche = { version = "0.19.1", default-features = false, optional = true }

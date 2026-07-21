@@ -1,7 +1,13 @@
 [package]
-name = "upload-response"
+name = "av-upload-response"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
+repository.workspace = true
+description = "RIST, SRT, and datagram contribution services for Wavey media"
+
+[lib]
+name = "upload_response"
 
 [features]
 default = ["tcp"]
@@ -14,9 +20,9 @@ udp-fec = ["dep:raptorq-datagram-fec", "raptorq-datagram-fec/udp"]
 
 [dependencies]
 anyhow = "1.0"
-web-service = { path = "../web-service/" }
-playlists = { git = "https://github.com/wavey-ai/playlists.git", rev = "885ffe5a29ed89a3946179cc4dc2c73399665310" }
-http-pack = { git = "https://github.com/wavey-ai/http-pack.git", default-features = false }
+web-service = { package = "av-web-service", version = "0.1.0", path = "../web-service" }
+playlists = "0.1.6"
+http-pack = { version = "0.1.0", default-features = false }
 tokio = { version = "1.52.3", features = ["full"] }
 bytes = "1.11.1"
 async-trait = "0.1.88"
@@ -29,14 +35,14 @@ hyper = { version = "1.10.1", features = ["full"] }
 reqwest = { version = "0.13.4", features = ["rustls", "http2"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-srt = { git = "https://github.com/wavey-ai/av-rs.git", features = ["async"], optional = true }
-raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git", default-features = false, optional = true }
-rist = { git = "https://github.com/wavey-ai/rist-rs.git", features = ["tokio"], optional = true }
-rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", optional = true }
-rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", optional = true }
+srt = { package = "wavey-srt", version = "0.1.0", features = ["async"], optional = true }
+raptorq-datagram-fec = { version = "0.1.6", default-features = false, optional = true }
+rist = { package = "wavey-rist", version = "0.1.0", features = ["tokio"], optional = true }
+rist-core-pure = { package = "rist-core", version = "0.1.0", optional = true }
+rist-mio-pure = { package = "rist-mio", version = "0.1.0", optional = true }
 
 # WebRTC Data Channels (optional)
-matchbox_socket = { git = "https://github.com/wavey-ai/matchbox", branch = "feat/graceful-shutdown", optional = true }
+matchbox_socket = { version = "0.13.0", optional = true }
 futures-timer = { version = "3", optional = true }
 futures = { version = "0.3", optional = true }
 
@@ -53,7 +59,7 @@ portpicker = "0.1"
 http-body-util = "0.1.3"
 # SRT is already in dependencies, tests can use it
 dotenvy = "0.15"
-tls-helpers = { git = "https://github.com/wavey-ai/tls-helpers.git" }
+tls-helpers = "0.2.0"
 tokio-rustls = "0.26.4"
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 h3 = "0.0.8"
@@ -64,8 +70,8 @@ rustls-pemfile = "2"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 # RTMP testing
-rtmp-ingress = { git = "https://github.com/wavey-ai/rtmp-ingress.git", features = ["upload-response", "tls"] }
-rml_rtmp = { git = "https://github.com/wavey-ai/rust-media-libs.git" }
+rtmp-ingress = "0.1.0"
+rml_rtmp = "0.8.0"
 # WebRTC testing
-matchbox_signaling = { git = "https://github.com/wavey-ai/matchbox", branch = "feat/graceful-shutdown" }
+matchbox_signaling = "0.13.0"
 futures-timer = "3"

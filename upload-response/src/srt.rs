@@ -12,6 +12,7 @@ use tracing::{debug, error, info};
 
 const MAX_SRT_PACKET_SIZE: usize = 1316;
 const READ_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_LIVE_LATENCY_MS: i32 = 120;
 
 /// Auth callback for SRT connections
 /// The stream_id typically contains: "bearer:<token>" or just the stream key
@@ -111,11 +112,14 @@ impl<A: SrtAuth> SrtIngest<A> {
                 ListenerOption::PeerLatency(0),
             ]
         } else {
-            // Default mode: optimized for live media with some reliability
+            // Live mode preserves SRT's timestamp-based receive ordering and
+            // recovery window. Disabling TSBPD exposes arrival order and can
+            // corrupt an MPEG-TS byte stream when packets are retransmitted.
             vec![
-                ListenerOption::TimestampBasedPacketDeliveryMode(false),
-                ListenerOption::TooLatePacketDrop(false),
+                ListenerOption::TimestampBasedPacketDeliveryMode(true),
+                ListenerOption::TooLatePacketDrop(true),
                 ListenerOption::ReceiveBufferSize(36400000),
+                ListenerOption::PeerLatency(DEFAULT_LIVE_LATENCY_MS),
             ]
         };
 

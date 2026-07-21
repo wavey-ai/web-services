@@ -133,7 +133,7 @@ The shared-memory `ChunkCache` and slot-based streaming architecture are inspire
 
 Some protocols require optional crate features such as `srt`, `rist`, `rist-pure`, `webrtc`, or `udp-fec`. The default feature set only enables `tcp`.
 
-The `rist` feature keeps the existing librist/C-wrapper backend. The `rist-pure` feature adds `PureRistIngest`, backed by the pure Rust `rist-core` and `rist-mio` crates from [`wavey-ai/rist-rs`](https://github.com/wavey-ai/rist-rs).
+The `rist` feature keeps the existing librist/C-wrapper backend. The `rist-pure` feature adds `PureRistIngest`, backed by the pure Rust `rist-core` and `rist-mio` crates from [`wavey-ai/rist-rs`](https://github.com/wavey-ai/rist-rs). Pure RIST byte-stream delivery suppresses duplicate arrivals and holds packets behind a sequence gap until retransmission restores wire order. The reorder queue is bounded and fails closed instead of concatenating bytes across an unresolved gap.
 
 ### Architecture
 
@@ -286,7 +286,7 @@ let (au, bytes_consumed) = deserialize_access_unit(&data)?;
 
 ### SRT Payload Format
 
-SRT streams write raw bytes directly to the cache with no additional framing. Workers receive the exact bytes sent by the SRT client.
+SRT streams write raw bytes directly to the cache with no additional framing. Workers receive the exact bytes sent by the SRT client. Default live ingest enables timestamp-based packet delivery, too-late packet dropping, and a 120 ms peer recovery window so retransmissions are delivered in stream order. `start_high_throughput` remains the explicit bulk-transfer mode and does not provide those live pacing semantics.
 
 ### Configuration
 
@@ -412,6 +412,12 @@ always costs at least one more RTT. Historical retransmission can recover loss
 that exceeds a small FEC budget. UDP+FEC pays a deterministic latency cost in
 advance. For loss within the repair budget, the maximum recovery latency is the
 block-fill time.
+
+Reliable transport must restore wire order before exposing a byte stream. RIST
+retransmissions and bonded duplicates are therefore reordered and deduplicated
+before cache slot batching. SRT live ingest delegates the equivalent ordering
+to TSBPD. Cache slot size changes batching and backpressure only; it must never
+be used to hide continuity or decoder errors.
 
 Avoid `K=1, R=1` for live media unless you require 100% repair overhead on each
 small packet. The reusable RaptorQ crates carry packet sequencing in the compact
@@ -543,3 +549,7 @@ cargo check -p upload-response --features rist-pure
 - [`playlists`](https://github.com/wavey-ai/playlists) provides the shared-memory `ChunkCache`.
 - [`http-pack`](https://github.com/wavey-ai/http-pack) provides the HPKS framing used for headers.
 - `raptorq-datagram-fec` is optional and only needed for `udp-fec`.
+
+## License
+
+web-services is available under the [MIT License](LICENSE).

@@ -4,7 +4,7 @@ use http_pack::stream::{StreamHeaders, StreamRequestHeaders};
 use http_pack::{HeaderField, HttpVersion};
 use rist_core_pure::packet::rtcp::NackMode;
 use rist_core_pure::time::ntp_now;
-use rist_core_pure::ReceivedPayload;
+use rist_core_pure::{OrderedPayloadBuffer, ReceivedPayload};
 use rist_mio_pure::{MainMioReceiver, SimpleMioReceiver};
 use std::io;
 use std::net::SocketAddr;
@@ -17,6 +17,8 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_FLOW_ID: u32 = 0x1122_3344;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const DEFAULT_RTCP_INTERVAL: Duration = Duration::from_millis(20);
+const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_REORDERED_PACKETS: usize = 16_384;
 
 /// Pure Rust RIST profile used by [`PureRistIngest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +55,9 @@ struct PureRistRequest {
     stream: UploadStream,
     response_rx: oneshot::Receiver<ResponseResult>,
     pending: Vec<u8>,
+    body_flush_bytes: usize,
+    ordered_payloads: OrderedPayloadBuffer,
+    last_payload_at: Instant,
 }
 
 enum Receiver {
@@ -105,6 +110,8 @@ pub struct PureRistIngest<A: PureRistAuth = AllowAllPureRist> {
     auth: Arc<A>,
     profile: PureRistProfile,
     flow_id: u32,
+    session_idle_timeout: Duration,
+    body_flush_bytes: Option<usize>,
 }
 
 impl PureRistIngest<AllowAllPureRist> {
@@ -114,6 +121,8 @@ impl PureRistIngest<AllowAllPureRist> {
             auth: Arc::new(AllowAllPureRist),
             profile: PureRistProfile::Main,
             flow_id: DEFAULT_FLOW_ID,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
+            body_flush_bytes: None,
         }
     }
 }
@@ -125,6 +134,8 @@ impl<A: PureRistAuth> PureRistIngest<A> {
             auth: Arc::new(auth),
             profile: PureRistProfile::Main,
             flow_id: DEFAULT_FLOW_ID,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
+            body_flush_bytes: None,
         }
     }
 
@@ -135,6 +146,18 @@ impl<A: PureRistAuth> PureRistIngest<A> {
 
     pub fn with_flow_id(mut self, flow_id: u32) -> Self {
         self.flow_id = flow_id;
+        self
+    }
+
+    /// End an upload request after this interval without a media payload.
+    pub fn with_session_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.session_idle_timeout = timeout;
+        self
+    }
+
+    /// Flush ordered payload bytes at this threshold instead of the cache slot size.
+    pub fn with_body_flush_bytes(mut self, bytes: usize) -> Self {
+        self.body_flush_bytes = Some(bytes.max(1));
         self
     }
 
@@ -150,6 +173,10 @@ impl<A: PureRistAuth> PureRistIngest<A> {
         let auth = self.auth;
         let profile = self.profile;
         let flow_id = self.flow_id;
+        let session_idle_timeout = self.session_idle_timeout;
+        let body_flush_bytes = self
+            .body_flush_bytes
+            .unwrap_or_else(|| service.config().slot_bytes().max(1));
         let mut receiver = Receiver::bind(profile, addr, flow_id)?;
 
         info!(
@@ -181,6 +208,8 @@ impl<A: PureRistAuth> PureRistIngest<A> {
                             addr,
                             profile,
                             flow_id,
+                            session_idle_timeout,
+                            body_flush_bytes,
                             &mut buf,
                         ).await;
 
@@ -214,6 +243,8 @@ async fn drain_receiver<A: PureRistAuth>(
     local_addr: SocketAddr,
     profile: PureRistProfile,
     flow_id: u32,
+    session_idle_timeout: Duration,
+    body_flush_bytes: usize,
     buf: &mut [u8],
 ) {
     for _ in 0..128 {
@@ -234,14 +265,65 @@ async fn drain_receiver<A: PureRistAuth>(
         }
 
         if request.is_none() {
-            match open_request(service, local_addr, peer, profile, flow_id).await {
+            match open_request(
+                service,
+                local_addr,
+                peer,
+                profile,
+                flow_id,
+                body_flush_bytes,
+            )
+            .await
+            {
                 Some(opened) => *request = Some(opened),
                 None => continue,
             }
         }
 
         if let Some(opened) = request.as_mut() {
-            append_payload(service.as_ref(), opened, &payload.payload).await;
+            opened.last_payload_at = Instant::now();
+        }
+
+        let ordered = if let Some(opened) = request.as_mut() {
+            match opened.ordered_payloads.push(payload) {
+                Ok(ordered) => ordered,
+                Err(error) => {
+                    error!(
+                        stream_id = opened.stream.stream_id(),
+                        error = %error,
+                        "pure Rust RIST sequence gap exceeded reorder bound; closing stream"
+                    );
+                    if let Some(failed) = request.take() {
+                        finish_request(service.as_ref(), failed).await;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            continue;
+        };
+
+        if let Some(opened) = request.as_mut() {
+            for payload in ordered {
+                append_payload(service.as_ref(), opened, &payload.payload).await;
+            }
+        }
+    }
+
+    let idle = request.as_ref().is_some_and(|opened| {
+        Instant::now().duration_since(opened.last_payload_at) >= session_idle_timeout
+    });
+    if idle {
+        if let Some(finished) = request.take() {
+            let pending_packets = finished.ordered_payloads.pending_len();
+            if pending_packets > 0 {
+                warn!(
+                    stream_id = finished.stream.stream_id(),
+                    pending_packets,
+                    "closing idle pure Rust RIST stream with an unresolved sequence gap"
+                );
+            }
+            finish_request(service.as_ref(), finished).await;
         }
     }
 }
@@ -252,6 +334,7 @@ async fn open_request(
     peer: SocketAddr,
     profile: PureRistProfile,
     flow_id: u32,
+    body_flush_bytes: usize,
 ) -> Option<PureRistRequest> {
     let stream = match service.open_stream().await {
         Ok(stream) => stream,
@@ -306,6 +389,9 @@ async fn open_request(
         stream,
         response_rx,
         pending: Vec::new(),
+        body_flush_bytes,
+        ordered_payloads: OrderedPayloadBuffer::new(MAX_REORDERED_PACKETS),
+        last_payload_at: Instant::now(),
     })
 }
 
@@ -319,7 +405,7 @@ async fn append_payload(
     }
 
     let stream_id = request.stream.stream_id();
-    let slot_bytes = service.config().slot_bytes().max(1);
+    let slot_bytes = request.body_flush_bytes;
     request.pending.extend_from_slice(payload);
     debug!(
         stream_id,
@@ -399,4 +485,162 @@ async fn finish_request(service: &UploadResponseService, mut request: PureRistRe
     }
 
     request.stream.close().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{TailSlot, UploadResponseConfig};
+    use rist_core_pure::time::ntp_now;
+    use rist_mio_pure::MainMioSender;
+    use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pure_rist_reconstructs_an_exact_multi_slot_byte_stream() {
+        const RIST_PACKET_BYTES: usize = 1_316;
+        const SLOT_KB: usize = 47;
+        const SLOT_BYTES: usize = SLOT_KB * 1_024;
+        // 231 body slots is exactly 8,448 full RIST packets. This deliberately
+        // crosses the 8,192-packet boundary that a sustained MPEG-TS stream
+        // reaches after roughly twenty seconds at the current test bitrate.
+        const BODY_SLOTS: usize = 231;
+        const PAYLOAD_BYTES: usize = SLOT_BYTES * BODY_SLOTS;
+
+        assert_eq!(PAYLOAD_BYTES % RIST_PACKET_BYTES, 0);
+        let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 1,
+            slot_size_kb: SLOT_KB,
+            slots_per_stream: 256,
+            response_timeout_ms: 1_000,
+        }));
+        let probe = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ingest_addr = probe.local_addr().unwrap();
+        drop(probe);
+        let shutdown = PureRistIngest::new(service.clone())
+            .with_profile(PureRistProfile::Main)
+            .start(ingest_addr)
+            .await
+            .unwrap();
+
+        let mut sender = MainMioSender::connect(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            ingest_addr,
+            DEFAULT_FLOW_ID,
+            16_384,
+        )
+        .unwrap();
+        let expected: Vec<u8> = (0..PAYLOAD_BYTES)
+            .map(|index| ((index * 31 + index / 188) % 251) as u8)
+            .collect();
+        let mut feedback = vec![0u8; 65_536];
+
+        for (index, chunk) in expected.chunks(RIST_PACKET_BYTES).enumerate() {
+            sender
+                .send_payload(chunk, ntp_now(), Instant::now())
+                .unwrap();
+            if index % 8 == 7 {
+                while let Ok(Some(_)) = sender.try_recv_feedback_and_retransmit(&mut feedback) {}
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+
+        let stream = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(stream) = service
+                    .active_streams()
+                    .await
+                    .into_iter()
+                    .find(|stream| stream.request_last >= BODY_SLOTS + 1)
+                {
+                    break stream;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("pure RIST body slots did not arrive");
+
+        let mut actual = Vec::with_capacity(PAYLOAD_BYTES);
+        for slot in 2..=(BODY_SLOTS + 1) {
+            match service.tail_request(stream.stream_id, slot).await {
+                Some(TailSlot::Body(bytes)) => actual.extend_from_slice(&bytes),
+                other => panic!("expected body at slot {slot}, got {other:?}"),
+            }
+        }
+        assert_eq!(actual.len(), expected.len());
+        let first_mismatch = actual
+            .iter()
+            .zip(&expected)
+            .position(|(actual, expected)| actual != expected);
+        assert_eq!(
+            first_mismatch,
+            None,
+            "first mismatch at byte {:?}, RIST packet {:?}",
+            first_mismatch,
+            first_mismatch.map(|offset| offset / RIST_PACKET_BYTES)
+        );
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pure_rist_flushes_before_the_cache_slot_is_full_when_configured() {
+        const RIST_PACKET_BYTES: usize = 1_316;
+        const FLUSH_BYTES: usize = RIST_PACKET_BYTES * 2;
+        let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 1,
+            slot_size_kb: 47,
+            slots_per_stream: 16,
+            response_timeout_ms: 1_000,
+        }));
+        let probe = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ingest_addr = probe.local_addr().unwrap();
+        drop(probe);
+        let shutdown = PureRistIngest::new(service.clone())
+            .with_profile(PureRistProfile::Main)
+            .with_body_flush_bytes(FLUSH_BYTES)
+            .start(ingest_addr)
+            .await
+            .unwrap();
+
+        let mut sender = MainMioSender::connect(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            ingest_addr,
+            DEFAULT_FLOW_ID,
+            64,
+        )
+        .unwrap();
+        let first = vec![0x31; RIST_PACKET_BYTES];
+        let second = vec![0x52; RIST_PACKET_BYTES];
+        sender
+            .send_payload(&first, ntp_now(), Instant::now())
+            .unwrap();
+        sender
+            .send_payload(&second, ntp_now(), Instant::now())
+            .unwrap();
+
+        let stream = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(stream) = service
+                    .active_streams()
+                    .await
+                    .into_iter()
+                    .find(|stream| stream.request_last >= 2)
+                {
+                    break stream;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("low-latency RIST body slot did not arrive");
+
+        let body = match service.tail_request(stream.stream_id, 2).await {
+            Some(TailSlot::Body(body)) => body,
+            other => panic!("expected low-latency body slot, got {other:?}"),
+        };
+        assert_eq!(body.len(), FLUSH_BYTES);
+        assert_eq!(&body[..RIST_PACKET_BYTES], first);
+        assert_eq!(&body[RIST_PACKET_BYTES..], second);
+        let _ = shutdown.send(());
+    }
 }
