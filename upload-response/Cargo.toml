@@ -20,7 +20,7 @@ udp-fec = ["dep:raptorq-datagram-fec", "raptorq-datagram-fec/udp"]
 
 [dependencies]
 anyhow = "1.0"
-web-service = { package = "av-web-service", version = "0.1.0", path = "../web-service" }
+web-service = { package = "av-web-service", version = "0.1.0" }
 playlists = "0.1.6"
 http-pack = { version = "0.1.0", default-features = false }
 tokio = { version = "1.52.3", features = ["full"] }

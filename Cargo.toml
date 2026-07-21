@@ -8,15 +8,6 @@ members = [
 ]
 resolver = "3"
 
-[patch.crates-io]
-rtmp-ingress = { path = "../rtmp-ingress" }
-wavey-boxer = { path = "../boxer" }
-wavey-rist = { path = "../rist-rs/rist" }
-wavey-srt = { path = "../av-rs/srt" }
-rist-core = { path = "../rist-rs/rist-core" }
-rist-mio = { path = "../rist-rs/rist-mio" }
-rist-sys = { path = "../rist-rs/rist-sys" }
-
 [workspace.package]
 license = "MIT"
 repository = "https://github.com/wavey-ai/web-services"
