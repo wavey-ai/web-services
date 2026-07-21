@@ -40,12 +40,16 @@ use tokio_tungstenite::tungstenite::Message;
 use srt::{AsyncListener, AsyncStream, ConnectOptions, ListenerOption, MaxBandwidth};
 use tokio::io::AsyncWriteExt;
 
-// RTMP imports
+// RTMP integration is tested in rtmp-ingress to avoid a cyclic dev dependency.
+#[cfg(any())]
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
+#[cfg(any())]
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
 };
+#[cfg(any())]
 use rtmp_ingress::upload::RtmpUploadIngest;
+#[cfg(any())]
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
@@ -1901,6 +1905,7 @@ async fn test_tcp_tls_100mb() {
     let _ = shutdown_tx.send(());
 }
 
+#[cfg(any())]
 async fn setup_rtmp_server(
     port: u16,
     upload_size_mb: usize,
@@ -1935,6 +1940,7 @@ async fn setup_rtmp_server(
 }
 
 /// Generate fake AAC audio frame (ADTS header + random data)
+#[cfg(any())]
 fn generate_fake_aac_frame(frame_size: usize) -> Vec<u8> {
     let mut frame = Vec::with_capacity(7 + frame_size);
     let total_len = 7 + frame_size;
@@ -1956,6 +1962,7 @@ fn generate_fake_aac_frame(frame_size: usize) -> Vec<u8> {
     frame
 }
 
+#[cfg(any())]
 async fn run_rtmp_upload_test(
     _service: Arc<UploadResponseService>,
     port: u16,
@@ -2204,6 +2211,7 @@ async fn run_rtmp_upload_test(
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark/stress test; run explicitly with --ignored"]
+#[cfg(any())]
 async fn test_rtmp_100mb() {
     let port = pick_unused_port().expect("pick port");
     let (service, shutdown_tx) = setup_rtmp_server(port, 100).await;
@@ -2217,6 +2225,7 @@ async fn test_rtmp_100mb() {
     let _ = shutdown_tx.send(());
 }
 
+#[cfg(any())]
 async fn setup_rtmps_server(
     port: u16,
     upload_size_mb: usize,
@@ -2258,6 +2267,7 @@ async fn setup_rtmps_server(
     (service, shutdown_tx)
 }
 
+#[cfg(any())]
 async fn run_rtmps_upload_test(
     _service: Arc<UploadResponseService>,
     port: u16,
@@ -2515,6 +2525,7 @@ async fn run_rtmps_upload_test(
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark/stress test; run explicitly with --ignored"]
+#[cfg(any())]
 async fn test_rtmps_100mb() {
     ensure_rustls_provider();
 
@@ -2791,10 +2802,9 @@ async fn run_webrtc_upload_test_high_throughput(
         upload_size_mb
     );
 
-    // Connect to signaling server with high-throughput mode
+    // Use larger application messages for the high-throughput profile.
     let (mut socket, loop_fut) = WebRtcSocketBuilder::new(&signaling_url)
         .add_channel(ChannelConfig::reliable())
-        .high_throughput()
         .build();
     let loop_fut = loop_fut.fuse();
     futures::pin_mut!(loop_fut);
@@ -2840,7 +2850,7 @@ async fn run_webrtc_upload_test_high_throughput(
     for chunk in data.chunks(CHUNK_SIZE) {
         socket
             .channel_mut(0)
-            .send(bytes::Bytes::copy_from_slice(chunk), peer);
+            .send(chunk.to_vec().into_boxed_slice(), peer);
     }
 
     // Close socket to signal end of transmission
@@ -3161,7 +3171,6 @@ async fn test_protocol_comparison() {
     let rist_port = pick_unused_port().expect("pick rist port");
     #[cfg(feature = "rist-pure")]
     let pure_rist_port = pick_unused_port().expect("pick pure rist port");
-    let rtmp_port = pick_unused_port().expect("pick rtmp port");
     let webrtc_port = pick_unused_port().expect("pick webrtc port");
     let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 512).await;
     let (srt_service, srt_shutdown_tx) = setup_srt_server(srt_port, 512).await;
@@ -3169,7 +3178,6 @@ async fn test_protocol_comparison() {
     #[cfg(feature = "rist-pure")]
     let (pure_rist_service, pure_rist_shutdown_tx) =
         setup_pure_rist_server(pure_rist_port, 512).await;
-    let (rtmp_service, rtmp_shutdown_tx) = setup_rtmp_server(rtmp_port, 512).await;
     let (webrtc_service, webrtc_shutdown_tx, webrtc_handle) =
         setup_webrtc_server(webrtc_port, 512).await;
 
@@ -3187,7 +3195,6 @@ async fn test_protocol_comparison() {
     #[cfg(feature = "rist-pure")]
     let (pure_rist_throughput, pure_rist_passed) =
         run_pure_rist_upload_test(pure_rist_service, pure_rist_port, 512).await;
-    let (rtmp_throughput, rtmp_passed) = run_rtmp_upload_test(rtmp_service, rtmp_port, 512).await;
     let (webrtc_throughput, webrtc_passed) =
         run_webrtc_upload_test(webrtc_service, webrtc_port, 512).await;
 
@@ -3236,11 +3243,6 @@ async fn test_protocol_comparison() {
         if pure_rist_passed { "✓" } else { "✗" }
     );
     println!(
-        "RTMP:               {:.1} MB/s {}",
-        rtmp_throughput,
-        if rtmp_passed { "✓" } else { "✗" }
-    );
-    println!(
         "WebRTC:             {:.1} MB/s {}",
         webrtc_throughput,
         if webrtc_passed { "✓" } else { "✗" }
@@ -3261,7 +3263,6 @@ async fn test_protocol_comparison() {
             && srt_passed
             && rist_passed
             && pure_rist_ok
-            && rtmp_passed
             && webrtc_passed,
         "Protocol tests failed"
     );
@@ -3270,7 +3271,6 @@ async fn test_protocol_comparison() {
     let _ = rist_shutdown_tx.send(());
     #[cfg(feature = "rist-pure")]
     let _ = pure_rist_shutdown_tx.send(());
-    let _ = rtmp_shutdown_tx.send(());
     let _ = webrtc_shutdown_tx.send(());
     webrtc_handle.abort();
 }
@@ -3293,7 +3293,6 @@ async fn test_protocol_comparison_1gb() {
     let rist_port = pick_unused_port().expect("pick rist port");
     #[cfg(feature = "rist-pure")]
     let pure_rist_port = pick_unused_port().expect("pick pure rist port");
-    let rtmp_port = pick_unused_port().expect("pick rtmp port");
     let webrtc_port = pick_unused_port().expect("pick webrtc port");
     let shutdown_tx = setup_server(cert_b64.clone(), key_b64.clone(), port, 1024).await;
     let (srt_service, srt_shutdown_tx) = setup_srt_server(srt_port, 1024).await;
@@ -3301,7 +3300,6 @@ async fn test_protocol_comparison_1gb() {
     #[cfg(feature = "rist-pure")]
     let (pure_rist_service, pure_rist_shutdown_tx) =
         setup_pure_rist_server(pure_rist_port, 1024).await;
-    let (rtmp_service, rtmp_shutdown_tx) = setup_rtmp_server(rtmp_port, 1024).await;
     let (webrtc_service, webrtc_shutdown_tx, webrtc_handle) =
         setup_webrtc_server(webrtc_port, 1024).await;
 
@@ -3319,7 +3317,6 @@ async fn test_protocol_comparison_1gb() {
     #[cfg(feature = "rist-pure")]
     let (pure_rist_throughput, pure_rist_passed) =
         run_pure_rist_upload_test(pure_rist_service, pure_rist_port, 1024).await;
-    let (rtmp_throughput, rtmp_passed) = run_rtmp_upload_test(rtmp_service, rtmp_port, 1024).await;
     let (webrtc_throughput, webrtc_passed) =
         run_webrtc_upload_test(webrtc_service, webrtc_port, 1024).await;
 
@@ -3368,11 +3365,6 @@ async fn test_protocol_comparison_1gb() {
         if pure_rist_passed { "✓" } else { "✗" }
     );
     println!(
-        "RTMP:               {:.1} MB/s {}",
-        rtmp_throughput,
-        if rtmp_passed { "✓" } else { "✗" }
-    );
-    println!(
         "WebRTC:             {:.1} MB/s {}",
         webrtc_throughput,
         if webrtc_passed { "✓" } else { "✗" }
@@ -3393,7 +3385,6 @@ async fn test_protocol_comparison_1gb() {
             && srt_passed
             && rist_passed
             && pure_rist_ok
-            && rtmp_passed
             && webrtc_passed,
         "Protocol tests failed"
     );
@@ -3402,7 +3393,6 @@ async fn test_protocol_comparison_1gb() {
     let _ = rist_shutdown_tx.send(());
     #[cfg(feature = "rist-pure")]
     let _ = pure_rist_shutdown_tx.send(());
-    let _ = rtmp_shutdown_tx.send(());
     let _ = webrtc_shutdown_tx.send(());
     webrtc_handle.abort();
 }

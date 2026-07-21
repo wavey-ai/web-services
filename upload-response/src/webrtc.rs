@@ -164,7 +164,10 @@ impl<A: WebRtcAuth> WebRtcIngest<A> {
                                         match tokio::time::timeout(timeout_duration, ctx.response_rx).await {
                                             Ok(Ok(Ok(cached))) => {
                                                 debug!(stream_id, status = ?cached.status, len = cached.body.len(), "Sending WebRTC response");
-                                                socket.channel_mut(CHANNEL_ID).send(cached.body, peer);
+                                                socket.channel_mut(CHANNEL_ID).send(
+                                                    cached.body.to_vec().into_boxed_slice(),
+                                                    peer,
+                                                );
                                             }
                                             Ok(Ok(Err(e))) => {
                                                 error!(stream_id, error = %e, "Response error");
