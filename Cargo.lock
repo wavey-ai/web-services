@@ -12,6 +12,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "access-unit"
+version = "0.1.3"
+source = "git+https://github.com/wavey-ai/access-unit.git#ae7aa5f0baa6c2827e17ce19319d57181bdb401a"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -404,7 +412,7 @@ name = "av-chunks"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "av-web-service 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git)",
  "bytes",
  "env_logger",
  "h3",
@@ -412,7 +420,7 @@ dependencies = [
  "h3-quinn",
  "h3-webtransport",
  "http",
- "playlists",
+ "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git)",
  "regex",
  "structopt",
  "tokio",
@@ -425,7 +433,7 @@ name = "av-hls"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "av-web-service 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git)",
  "bytes",
  "env_logger",
  "flate2",
@@ -437,7 +445,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "playlists",
+ "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git)",
  "regex",
  "structopt",
  "tokio",
@@ -453,7 +461,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "av-web-service 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git)",
  "base64 0.22.1",
  "bytes",
  "dotenvy",
@@ -464,12 +472,12 @@ dependencies = [
  "h3-quinn",
  "http",
  "http-body-util",
- "http-pack",
+ "http-pack 0.1.0 (git+https://github.com/wavey-ai/http-pack.git)",
  "hyper",
  "hyper-util",
  "matchbox_signaling",
  "matchbox_socket",
- "playlists",
+ "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git)",
  "portpicker",
  "quinn",
  "raptorq-datagram-fec",
@@ -510,11 +518,11 @@ dependencies = [
  "h3-webtransport",
  "http",
  "http-body-util",
- "http-pack",
+ "http-pack 0.1.0 (git+https://github.com/wavey-ai/http-pack.git)",
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "playlists",
+ "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git)",
  "portpicker",
  "quinn",
  "rcgen",
@@ -545,8 +553,7 @@ dependencies = [
 [[package]]
 name = "av-web-service"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61f6a7a41c8984dc5c1c3e34515c94177bcf40d8dd03d68b6b4dcfc0f9dae7ce"
+source = "git+https://github.com/wavey-ai/web-services.git#90ed5e8dfdb0eecc1ba8e5c6baa8fed61a76c7ad"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -563,11 +570,11 @@ dependencies = [
  "h3-webtransport",
  "http",
  "http-body-util",
- "http-pack",
+ "http-pack 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "playlists",
+ "playlists 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "quinn",
  "regex",
  "rustls 0.23.40",
@@ -2446,6 +2453,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-pack"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/http-pack.git#a6766dfc4b996e3c066b4c5086bfb10c727475f3"
+dependencies = [
+ "bytes",
+ "h3",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httparse",
+ "message-packetizer",
+ "serde",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3311,11 +3333,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "av-web-service 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "av-web-service 0.1.0 (git+https://github.com/wavey-ai/web-services.git)",
  "bytes",
  "clap 4.6.1",
  "http",
- "playlists",
+ "playlists 0.1.6 (git+https://github.com/wavey-ai/playlists.git)",
  "rist-core",
  "rist-mio",
  "serde",
@@ -3584,7 +3606,23 @@ version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a079df8689d40f9bcecbdfea78f0b5af588637777078715ec24a7b2a48c565f"
 dependencies = [
- "access-unit",
+ "access-unit 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes",
+ "chrono",
+ "flate2",
+ "thiserror 1.0.69",
+ "tls-helpers 0.2.0",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "playlists"
+version = "0.1.6"
+source = "git+https://github.com/wavey-ai/playlists.git#92e41ec1d54ec0494f820a7741664618753a020f"
+dependencies = [
+ "access-unit 0.1.3 (git+https://github.com/wavey-ai/access-unit.git)",
  "bytes",
  "chrono",
  "flate2",
@@ -4129,8 +4167,7 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 [[package]]
 name = "raptorq-datagram-fec"
 version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8aef794a9c41cf367daa21ced02d91bd828e33411b01c9ea14c81d1a90e8979"
+source = "git+https://github.com/wavey-ai/raptor-fec.git#fe431818a8efae75b77144c1387572daf110e886"
 dependencies = [
  "bytes",
  "crc32fast",
