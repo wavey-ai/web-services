@@ -431,12 +431,13 @@ fn add_cors_headers<B>(res: &mut Response<B>) {
         HeaderName::from_static("access-control-allow-headers"),
         HeaderValue::from_static("*"),
     );
-    res.headers_mut().insert(
-        HeaderName::from_static("access-control-expose-headers"),
-        HeaderValue::from_static(
-            "x-sequence, stream-id, etag, content-length, accept-ranges, content-range",
-        ),
-    );
+    res.headers_mut()
+        .entry(HeaderName::from_static("access-control-expose-headers"))
+        .or_insert_with(|| {
+            HeaderValue::from_static(
+                "x-sequence, stream-id, etag, content-length, accept-ranges, content-range",
+            )
+        });
 }
 
 fn is_websocket_upgrade(req: &http::Request<Incoming>) -> bool {
@@ -462,4 +463,25 @@ fn header_has_token(headers: &http::HeaderMap, name: &str, token: &str) -> bool 
                 .split(',')
                 .any(|part| part.trim().eq_ignore_ascii_case(token))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cors_headers_keep_handler_exposure_fields() {
+        let mut response = Response::builder()
+            .header(
+                "access-control-expose-headers",
+                "Link, Retry-After, X-Needletail-Alternate-Edges",
+            )
+            .body(())
+            .unwrap();
+        add_cors_headers(&mut response);
+        assert_eq!(
+            response.headers()["access-control-expose-headers"],
+            "Link, Retry-After, X-Needletail-Alternate-Edges"
+        );
+    }
 }

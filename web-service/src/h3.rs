@@ -537,12 +537,13 @@ pub(crate) fn add_cors_response_headers<B>(res: &mut Response<B>) {
         .remove(HeaderName::from_static("access-control-allow-methods"));
     res.headers_mut()
         .remove(HeaderName::from_static("access-control-allow-headers"));
-    res.headers_mut().insert(
-        HeaderName::from_static("access-control-expose-headers"),
-        HeaderValue::from_static(
-            "x-sequence, stream-id, etag, content-length, accept-ranges, content-range",
-        ),
-    );
+    res.headers_mut()
+        .entry(HeaderName::from_static("access-control-expose-headers"))
+        .or_insert_with(|| {
+            HeaderValue::from_static(
+                "x-sequence, stream-id, etag, content-length, accept-ranges, content-range",
+            )
+        });
 }
 
 pub(crate) fn add_cors_preflight_headers<B>(res: &mut Response<B>) {
@@ -592,6 +593,22 @@ mod tests {
         assert!(response
             .headers()
             .contains_key("access-control-expose-headers"));
+    }
+
+    #[test]
+    fn ordinary_cors_response_keeps_handler_exposure_fields() {
+        let mut response = Response::builder()
+            .header(
+                "access-control-expose-headers",
+                "Link, Retry-After, X-Needletail-Alternate-Edges",
+            )
+            .body(())
+            .unwrap();
+        add_cors_response_headers(&mut response);
+        assert_eq!(
+            response.headers()["access-control-expose-headers"],
+            "Link, Retry-After, X-Needletail-Alternate-Edges"
+        );
     }
 
     #[test]
