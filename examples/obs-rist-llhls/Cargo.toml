@@ -19,4 +19,4 @@ serde_json = "1.0"
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-web-service = { package = "av-web-service", git = "https://github.com/wavey-ai/web-services.git" }
+web-service = { package = "av-web-service", path = "../../web-service" }
