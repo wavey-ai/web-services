@@ -877,9 +877,12 @@ impl UploadResponseService {
             return false;
         };
         let mut positions = self.response_reader_positions.write().await;
-        let inserted = positions[stream_idx]
-            .insert(reader_id.to_string(), 0)
-            .is_none();
+        let inserted = if positions[stream_idx].contains_key(reader_id) {
+            false
+        } else {
+            positions[stream_idx].insert(reader_id.to_string(), 0);
+            true
+        };
         drop(positions);
         self.response_reader_notifies[stream_idx].notify_waiters();
         inserted
@@ -3413,6 +3416,30 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+
+        upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_response_reader_registration_preserves_progress() {
+        let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 1,
+            ..Default::default()
+        }));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+        let stream_idx = upload_stream.stream_idx();
+
+        assert!(service.register_response_reader(stream_id, "client").await);
+        assert!(
+            service
+                .mark_response_reader_position(stream_id, "client", 5)
+                .await
+        );
+        assert!(!service.register_response_reader(stream_id, "client").await);
+        let positions = service.response_reader_positions.read().await;
+        assert_eq!(positions[stream_idx].get("client"), Some(&5));
+        drop(positions);
 
         upload_stream.close().await;
     }
