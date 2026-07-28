@@ -4,9 +4,9 @@ use http_pack::stream::{decode_frame, StreamFrame, StreamHeaders, StreamResponse
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
-use crate::{CachedResponse, UploadResponseService, END_MARKER};
+use crate::{CachedResponse, UploadResponseService, END_MARKER, RESPONSE_WATCHER_READER_ID};
 
 /// Watches the response cache for complete responses and delivers them
 /// to waiting clients via oneshot channels.
@@ -123,6 +123,16 @@ impl ResponseWatcher {
                     last_seen[stream_idx] = 0;
                 }
 
+                if !self
+                    .service
+                    .is_response_reader_registered(stream_id, RESPONSE_WATCHER_READER_ID)
+                    .await
+                {
+                    assemblies.remove(&stream_id);
+                    last_seen[stream_idx] = 0;
+                    continue;
+                }
+
                 let current_last = self.service.response_last(stream_id).unwrap_or(0);
                 let seen = last_seen[stream_idx];
 
@@ -130,54 +140,52 @@ impl ResponseWatcher {
                     continue;
                 }
 
+                let mut processed_last = seen;
                 for slot_id in (seen + 1)..=current_last {
-                    if let Some(bytes) = self.service.response_get(stream_id, slot_id).await {
-                        if slot_id == 1 {
-                            if let Ok(frame) = decode_frame(&bytes) {
-                                if let StreamFrame::Headers(StreamHeaders::Response(resp)) = frame {
-                                    trace!(stream_id, status = resp.status, "Response headers");
-                                    let mut assembly = ResponseAssembly::new();
-                                    assembly.set_headers(resp);
-                                    assemblies.insert(stream_id, assembly);
-                                }
-                            }
-                        } else if bytes.as_ref() == END_MARKER {
-                            debug!(stream_id, "Response end");
-                            if let Some(assembly) = assemblies.remove(&stream_id) {
-                                let result = assembly.finalize();
-                                self.deliver_response(stream_id, result).await;
-                            }
-                        } else {
-                            trace!(stream_id, len = bytes.len(), "Response body chunk");
-                            if let Some(assembly) = assemblies.get_mut(&stream_id) {
-                                assembly.add_body(bytes);
+                    let Some(bytes) = self.service.response_get(stream_id, slot_id).await else {
+                        break;
+                    };
+                    if slot_id == 1 {
+                        if let Ok(frame) = decode_frame(&bytes) {
+                            if let StreamFrame::Headers(StreamHeaders::Response(resp)) = frame {
+                                trace!(stream_id, status = resp.status, "Response headers");
+                                let mut assembly = ResponseAssembly::new();
+                                assembly.set_headers(resp);
+                                assemblies.insert(stream_id, assembly);
                             }
                         }
+                    } else if bytes.as_ref() == END_MARKER {
+                        debug!(stream_id, "Response end");
+                        if let Some(assembly) = assemblies.remove(&stream_id) {
+                            let result = assembly.finalize();
+                            self.deliver_response(stream_id, result).await;
+                        }
+                    } else {
+                        trace!(stream_id, len = bytes.len(), "Response body chunk");
+                        if let Some(assembly) = assemblies.get_mut(&stream_id) {
+                            assembly.add_body(bytes);
+                        }
                     }
+                    let _ = self
+                        .service
+                        .mark_response_reader_position(
+                            stream_id,
+                            RESPONSE_WATCHER_READER_ID,
+                            slot_id,
+                        )
+                        .await;
+                    processed_last = slot_id;
                 }
 
-                last_seen[stream_idx] = current_last;
+                last_seen[stream_idx] = processed_last;
             }
         }
     }
 
     /// Deliver a completed response to the waiting client
     async fn deliver_response(&self, stream_id: u64, result: Result<CachedResponse, String>) {
-        let channels = self.service.response_channels();
-        let tx = {
-            let mut guard = channels.write().await;
-            guard.remove(&stream_id)
-        };
-
-        if let Some(tx) = tx {
-            if tx.send(result).is_err() {
-                debug!(stream_id, "Client already disconnected");
-            } else {
-                debug!(stream_id, "Response delivered");
-            }
-        } else {
-            warn!(stream_id, "No waiting client for response");
-        }
+        self.service.complete_response(stream_id, result).await;
+        debug!(stream_id, "Response delivered");
     }
 }
 

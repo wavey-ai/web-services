@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, timeout_at, Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, error, warn};
@@ -42,6 +42,8 @@ pub use remote::{
 
 mod response_writer;
 pub use response_writer::ResponseCacheWriter;
+
+pub(crate) const RESPONSE_WATCHER_READER_ID: &str = "__upload_response_watcher";
 
 #[cfg(feature = "srt")]
 mod srt;
@@ -376,6 +378,8 @@ pub struct UploadResponseService {
     stream_workers: Arc<RwLock<Vec<std::collections::HashSet<String>>>>,
     request_reader_positions: Arc<RwLock<Vec<HashMap<String, usize>>>>,
     request_reader_notifies: Vec<Arc<Notify>>,
+    response_reader_positions: Arc<RwLock<Vec<HashMap<String, usize>>>>,
+    response_reader_notifies: Vec<Arc<Notify>>,
     /// Per-stream response claim: None = unclaimed, Some(worker_id) = exclusive write access
     response_claims: Arc<RwLock<Vec<Option<String>>>>,
     /// Worker heartbeat/capacity registry keyed by worker id.
@@ -426,6 +430,8 @@ impl UploadResponseService {
             stream_workers: Arc::new(RwLock::new(stream_workers)),
             request_reader_positions: new_reader_positions(config.num_streams),
             request_reader_notifies: new_reader_notifies(config.num_streams),
+            response_reader_positions: new_reader_positions(config.num_streams),
+            response_reader_notifies: new_reader_notifies(config.num_streams),
             response_claims: Arc::new(RwLock::new(response_claims)),
             workers: Arc::new(RwLock::new(HashMap::new())),
             config,
@@ -504,8 +510,11 @@ impl UploadResponseService {
         }
 
         let overwrite_slot = next_slot - capacity;
+        let deadline = Instant::now() + Duration::from_millis(self.config.response_timeout_ms);
         loop {
             let notified = notifies[stream_idx].notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.slot_stream_ids[stream_idx].load(Ordering::Acquire) != stream_id {
                 return Err(format!("{lane} stream closed: {stream_id}"));
             }
@@ -515,8 +524,7 @@ impl UploadResponseService {
                 let readers = &positions[stream_idx];
                 let min_consumed = readers.values().copied().min();
                 (
-                    readers.is_empty()
-                        || min_consumed.is_some_and(|min_consumed| min_consumed >= overwrite_slot),
+                    min_consumed.is_some_and(|min_consumed| min_consumed >= overwrite_slot),
                     readers.len(),
                     min_consumed,
                 )
@@ -535,7 +543,11 @@ impl UploadResponseService {
                 min_consumed = min_consumed.unwrap_or(0),
                 "waiting for upload-response reader capacity"
             );
-            notified.await;
+            timeout_at(deadline, notified).await.map_err(|_| {
+                format!(
+                    "{lane} buffer capacity wait timed out for stream {stream_id} before slot {next_slot}"
+                )
+            })?;
         }
     }
 
@@ -683,6 +695,11 @@ impl UploadResponseService {
             positions[stream_idx].clear();
         }
         self.request_reader_notifies[stream_idx].notify_waiters();
+        {
+            let mut positions = self.response_reader_positions.write().await;
+            positions[stream_idx].clear();
+        }
+        self.response_reader_notifies[stream_idx].notify_waiters();
         self.stream_worker_counts[stream_idx].store(0, Ordering::SeqCst);
         self.request_started[stream_idx].store(false, Ordering::SeqCst);
         self.response_started[stream_idx].store(false, Ordering::SeqCst);
@@ -850,6 +867,64 @@ impl UploadResponseService {
             stage,
         )
         .await
+    }
+
+    /// Register a response-stream reader.
+    ///
+    /// Response producers retain every unread slot for every registered reader.
+    pub async fn register_response_reader(&self, stream_id: u64, reader_id: &str) -> bool {
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        let mut positions = self.response_reader_positions.write().await;
+        let inserted = positions[stream_idx]
+            .insert(reader_id.to_string(), 0)
+            .is_none();
+        drop(positions);
+        self.response_reader_notifies[stream_idx].notify_waiters();
+        inserted
+    }
+
+    /// Mark a response-stream slot as consumed by a response reader.
+    pub async fn mark_response_reader_position(
+        &self,
+        stream_id: u64,
+        reader_id: &str,
+        slot_id: usize,
+    ) -> bool {
+        self.mark_lane_reader_position(
+            stream_id,
+            reader_id,
+            slot_id,
+            &self.response_reader_positions,
+            &self.response_reader_notifies,
+            "response",
+        )
+        .await
+    }
+
+    /// Remove a response-stream reader and release its retained slots.
+    pub async fn unregister_response_reader(&self, stream_id: u64, reader_id: &str) -> bool {
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        let mut positions = self.response_reader_positions.write().await;
+        let removed = positions[stream_idx].remove(reader_id).is_some();
+        drop(positions);
+        self.response_reader_notifies[stream_idx].notify_waiters();
+        removed
+    }
+
+    pub(crate) async fn is_response_reader_registered(
+        &self,
+        stream_id: u64,
+        reader_id: &str,
+    ) -> bool {
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        let positions = self.response_reader_positions.read().await;
+        positions[stream_idx].contains_key(reader_id)
     }
 
     /// Unregister a reader worker from a stream.
@@ -1404,10 +1479,16 @@ impl UploadResponseService {
                 "response headers not written for stream: {stream_id}"
             ));
         }
-        self.response_cache
-            .append(stream_idx, data)
-            .await
-            .map_err(|e| e.to_string())
+        self.append_cache_with_backpressure(
+            stream_id,
+            stream_idx,
+            &self.response_cache,
+            &self.response_reader_positions,
+            &self.response_reader_notifies,
+            "response",
+            data,
+        )
+        .await
     }
 
     /// Write end marker to response stream
@@ -1420,10 +1501,16 @@ impl UploadResponseService {
                 "response headers not written for stream: {stream_id}"
             ));
         }
-        self.response_cache
-            .append(stream_idx, Bytes::from_static(END_MARKER))
-            .await
-            .map_err(|e| e.to_string())
+        self.append_cache_with_backpressure(
+            stream_id,
+            stream_idx,
+            &self.response_cache,
+            &self.response_reader_positions,
+            &self.response_reader_notifies,
+            "response",
+            Bytes::from_static(END_MARKER),
+        )
+        .await
     }
 
     pub async fn write_handler_response(
@@ -1577,6 +1664,10 @@ impl UploadResponseService {
         let (tx, rx) = oneshot::channel();
         let mut channels = self.response_channels.write().await;
         channels.insert(stream_id, tx);
+        drop(channels);
+        let _ = self
+            .register_response_reader(stream_id, RESPONSE_WATCHER_READER_ID)
+            .await;
         debug!(stream_id, "Registered response channel");
         rx
     }
@@ -1593,12 +1684,19 @@ impl UploadResponseService {
         } else {
             warn!(stream_id, "No response channel found");
         }
+        let _ = self
+            .unregister_response_reader(stream_id, RESPONSE_WATCHER_READER_ID)
+            .await;
     }
 
     /// Drop a response channel without completing (e.g., on timeout)
     pub async fn drop_response_channel(&self, stream_id: u64) {
         let mut channels = self.response_channels.write().await;
         channels.remove(&stream_id);
+        drop(channels);
+        let _ = self
+            .unregister_response_reader(stream_id, RESPONSE_WATCHER_READER_ID)
+            .await;
     }
 }
 
@@ -2907,6 +3005,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_request_backpressure_waits_for_first_reader() {
+        let config = UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 2,
+            response_timeout_ms: 500,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+        let headers = StreamHeaders::Request(StreamRequestHeaders {
+            stream_id,
+            version: http_pack::HttpVersion::Http11,
+            method: b"POST".to_vec(),
+            scheme: None,
+            authority: Some(b"example.com".to_vec()),
+            path: b"/upload".to_vec(),
+            headers: vec![],
+        });
+
+        service
+            .write_request_headers(stream_id, headers)
+            .await
+            .unwrap();
+        service
+            .append_request_body(stream_id, Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        let append_service = Arc::clone(&service);
+        let append = tokio::spawn(async move {
+            append_service
+                .append_request_body(stream_id, Bytes::from_static(b"b"))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!append.is_finished());
+        assert!(service.request_get(stream_id, 1).await.is_some());
+        assert!(service.register_request_reader(stream_id, "worker-1").await);
+        assert!(
+            service
+                .mark_request_reader_position(stream_id, "worker-1", 1)
+                .await
+        );
+        timeout(Duration::from_millis(250), append)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        upload_stream.close().await;
+    }
+
+    #[tokio::test]
     async fn test_stage_backpressure_waits_for_reader_progress() {
         let config = UploadResponseConfig {
             num_streams: 1,
@@ -2960,6 +3112,307 @@ mod tests {
             service.stage_get(stream_id, "pcm", 4).await.unwrap(),
             Bytes::from_static(b"c")
         );
+
+        upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_stage_backpressure_waits_for_first_reader() {
+        let config = UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 3,
+            response_timeout_ms: 500,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+
+        service
+            .write_stage_head(stream_id, "pcm", Bytes::from_static(b"head"))
+            .await
+            .unwrap();
+        service
+            .append_stage_body(stream_id, "pcm", Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        service
+            .append_stage_body(stream_id, "pcm", Bytes::from_static(b"b"))
+            .await
+            .unwrap();
+
+        let append_service = Arc::clone(&service);
+        let append = tokio::spawn(async move {
+            append_service
+                .append_stage_body(stream_id, "pcm", Bytes::from_static(b"c"))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!append.is_finished());
+        assert_eq!(
+            service.stage_get(stream_id, "pcm", 1).await.unwrap(),
+            Bytes::from_static(b"head")
+        );
+
+        assert!(
+            service
+                .register_stage_reader(stream_id, "pcm", "worker-1")
+                .await
+        );
+        assert!(
+            service
+                .mark_stage_reader_position(stream_id, "pcm", "worker-1", 1)
+                .await
+        );
+        timeout(Duration::from_millis(250), append)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service.stage_get(stream_id, "pcm", 4).await.unwrap(),
+            Bytes::from_static(b"c")
+        );
+
+        upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_backpressure_uses_slowest_reader() {
+        let config = UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 3,
+            response_timeout_ms: 500,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+
+        service
+            .write_stage_head(stream_id, "pcm", Bytes::from_static(b"head"))
+            .await
+            .unwrap();
+        assert!(
+            service
+                .register_stage_reader(stream_id, "pcm", "fast")
+                .await
+        );
+        assert!(
+            service
+                .register_stage_reader(stream_id, "pcm", "slow")
+                .await
+        );
+        service
+            .append_stage_body(stream_id, "pcm", Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        service
+            .append_stage_body(stream_id, "pcm", Bytes::from_static(b"b"))
+            .await
+            .unwrap();
+
+        let append_service = Arc::clone(&service);
+        let append = tokio::spawn(async move {
+            append_service
+                .append_stage_body(stream_id, "pcm", Bytes::from_static(b"c"))
+                .await
+        });
+
+        assert!(
+            service
+                .mark_stage_reader_position(stream_id, "pcm", "fast", 1)
+                .await
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!append.is_finished());
+        assert!(
+            service
+                .mark_stage_reader_position(stream_id, "pcm", "slow", 1)
+                .await
+        );
+        timeout(Duration::from_millis(250), append)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_backpressure_times_out_without_reader_and_preserves_slots() {
+        let config = UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 2,
+            response_timeout_ms: 30,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+
+        service
+            .write_stage_head(stream_id, "pcm", Bytes::from_static(b"head"))
+            .await
+            .unwrap();
+        service
+            .append_stage_body(stream_id, "pcm", Bytes::from_static(b"body"))
+            .await
+            .unwrap();
+        let error = service
+            .append_stage_body(stream_id, "pcm", Bytes::from_static(b"overwrite"))
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("buffer capacity wait timed out"));
+        assert_eq!(
+            service.stage_get(stream_id, "pcm", 1).await.unwrap(),
+            Bytes::from_static(b"head")
+        );
+        assert_eq!(
+            service.stage_get(stream_id, "pcm", 2).await.unwrap(),
+            Bytes::from_static(b"body")
+        );
+
+        upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_backpressure_wakes_when_stream_closes() {
+        let config = UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 2,
+            response_timeout_ms: 1_000,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+
+        service
+            .write_stage_head(stream_id, "pcm", Bytes::from_static(b"head"))
+            .await
+            .unwrap();
+        service
+            .append_stage_body(stream_id, "pcm", Bytes::from_static(b"body"))
+            .await
+            .unwrap();
+        let append_service = Arc::clone(&service);
+        let append = tokio::spawn(async move {
+            append_service
+                .append_stage_body(stream_id, "pcm", Bytes::from_static(b"blocked"))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!append.is_finished());
+        upload_stream.close().await;
+        let error = timeout(Duration::from_millis(250), append)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("stream closed"));
+    }
+
+    #[tokio::test]
+    async fn test_response_watcher_drains_small_ring_without_loss() {
+        let config = UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 3,
+            response_timeout_ms: 500,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new(config));
+        let watcher = ResponseWatcher::new(Arc::clone(&service))
+            .with_poll_interval_ms(1)
+            .spawn();
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+        let rx = service.register_response(stream_id).await;
+
+        service
+            .write_response_headers(
+                stream_id,
+                StreamHeaders::Response(StreamResponseHeaders {
+                    stream_id,
+                    version: http_pack::HttpVersion::Http11,
+                    status: 200,
+                    headers: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        for byte in b"complete-response" {
+            service
+                .append_response_body(stream_id, Bytes::copy_from_slice(&[*byte]))
+                .await
+                .unwrap();
+        }
+        service.end_response(stream_id).await.unwrap();
+
+        let response = timeout(Duration::from_millis(500), rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.body, Bytes::from_static(b"complete-response"));
+
+        upload_stream.close().await;
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn test_response_backpressure_waits_for_first_reader() {
+        let config = UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 2,
+            response_timeout_ms: 500,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new(config));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+
+        service
+            .write_response_headers(
+                stream_id,
+                StreamHeaders::Response(StreamResponseHeaders {
+                    stream_id,
+                    version: http_pack::HttpVersion::Http11,
+                    status: 200,
+                    headers: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        service
+            .append_response_body(stream_id, Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        let append_service = Arc::clone(&service);
+        let append = tokio::spawn(async move {
+            append_service
+                .append_response_body(stream_id, Bytes::from_static(b"b"))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!append.is_finished());
+        assert!(service.response_get(stream_id, 1).await.is_some());
+        assert!(service.register_response_reader(stream_id, "client").await);
+        assert!(
+            service
+                .mark_response_reader_position(stream_id, "client", 1)
+                .await
+        );
+        timeout(Duration::from_millis(250), append)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
 
         upload_stream.close().await;
     }

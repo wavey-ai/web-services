@@ -13,6 +13,8 @@ use tokio::sync::oneshot;
 use tokio::time::{interval, timeout, Duration};
 use web_service::{BodyStream, HandlerResponse, HandlerResult, ServerError, StreamWriter};
 
+const STREAMING_RESPONSE_READER_ID: &str = "__streaming_response";
+
 #[derive(Debug, Clone, Copy)]
 pub struct IngressProxyConfig {
     pub response_timeout_ms: u64,
@@ -58,8 +60,6 @@ impl CachedIngress {
             .open_stream()
             .await
             .map_err(|error| anyhow!(error))?;
-        let response_rx = self.service.register_response(stream.stream_id()).await;
-        drop(response_rx);
         Ok(CachedRequestGuard {
             stream,
             response_rx: None,
@@ -177,8 +177,17 @@ impl CachedIngress {
         stream_id: u64,
         mut stream_writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()> {
+        if !self
+            .service
+            .register_response_reader(stream_id, STREAMING_RESPONSE_READER_ID)
+            .await
+        {
+            return Err(ServerError::Config(
+                "response stream is not available".into(),
+            ));
+        }
         let timeout_duration = Duration::from_millis(self.config.response_timeout_ms);
-        timeout(timeout_duration, async {
+        let result = match timeout(timeout_duration, async {
             let mut poll = interval(Duration::from_millis(self.config.watch_poll_ms.max(1)));
             let mut last_slot = 0usize;
             let mut headers_sent = false;
@@ -193,6 +202,14 @@ impl CachedIngress {
                             .await?;
                         headers_sent = true;
                         last_slot = 1;
+                        let _ = self
+                            .service
+                            .mark_response_reader_position(
+                                stream_id,
+                                STREAMING_RESPONSE_READER_ID,
+                                1,
+                            )
+                            .await;
                     } else {
                         continue;
                     }
@@ -203,6 +220,7 @@ impl CachedIngress {
                     continue;
                 }
 
+                let mut processed_last = last_slot;
                 for slot_id in (last_slot + 1)..=current_last {
                     match self.service.tail_response(stream_id, slot_id).await {
                         Some(TailSlot::Body(bytes)) => {
@@ -210,17 +228,42 @@ impl CachedIngress {
                         }
                         Some(TailSlot::End) => {
                             stream_writer.finish().await?;
+                            let _ = self
+                                .service
+                                .mark_response_reader_position(
+                                    stream_id,
+                                    STREAMING_RESPONSE_READER_ID,
+                                    slot_id,
+                                )
+                                .await;
                             return Ok(());
                         }
-                        _ => {}
+                        _ => break,
                     }
+                    let _ = self
+                        .service
+                        .mark_response_reader_position(
+                            stream_id,
+                            STREAMING_RESPONSE_READER_ID,
+                            slot_id,
+                        )
+                        .await;
+                    processed_last = slot_id;
                 }
 
-                last_slot = current_last;
+                last_slot = processed_last;
             }
         })
         .await
-        .map_err(|_| ServerError::Config("response timeout".into()))?
+        {
+            Ok(result) => result,
+            Err(_) => Err(ServerError::Config("response timeout".into())),
+        };
+        let _ = self
+            .service
+            .unregister_response_reader(stream_id, STREAMING_RESPONSE_READER_ID)
+            .await;
+        result
     }
 
     pub async fn write_handler_response(&self, stream_id: u64, response: HandlerResponse) {
