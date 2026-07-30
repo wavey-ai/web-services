@@ -473,8 +473,8 @@ dependencies = [
  "quinn",
  "raptorq-datagram-fec",
  "reqwest",
- "rist-core",
- "rist-mio",
+ "rist-core 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4)",
+ "rist-mio 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4)",
  "rustls 0.23.42",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
@@ -3189,6 +3189,19 @@ dependencies = [
 
 [[package]]
 name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset 0.9.1",
+]
+
+[[package]]
+name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
@@ -3290,8 +3303,8 @@ dependencies = [
  "clap 4.6.4",
  "http",
  "playlists",
- "rist-core",
- "rist-mio",
+ "rist-core 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rist-mio 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "tokio",
@@ -4282,13 +4295,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "rist-core"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/rist-rs.git?rev=95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4#95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "ctr",
+ "getrandom 0.2.17",
+ "hkdf",
+ "num-bigint",
+ "num-traits",
+ "pbkdf2",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.19",
+ "zeroize",
+]
+
+[[package]]
 name = "rist-mio"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e39d03348adb25c7593a8aa1e0ffeb3078cf2b501fa73e02d19c0e69488653b0"
 dependencies = [
  "mio",
- "rist-core",
+ "rist-core 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "socket2 0.6.5",
+]
+
+[[package]]
+name = "rist-mio"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/rist-rs.git?rev=95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4#95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4"
+dependencies = [
+ "libc",
+ "mio",
+ "nix 0.29.0",
+ "rist-core 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=95c80b8981f74bf0f6b098ea6cc5a07f80ab34b4)",
  "socket2 0.6.5",
 ]
 
