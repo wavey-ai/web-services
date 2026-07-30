@@ -227,7 +227,7 @@ impl<A: PureRistAuth> PureRistIngest<A> {
             }
 
             if let Some(request) = request.take() {
-                finish_request(service.as_ref(), request).await;
+                finish_request_in_background(&service, request);
             }
         });
 
@@ -294,7 +294,7 @@ async fn drain_receiver<A: PureRistAuth>(
                         "pure Rust RIST sequence gap exceeded reorder bound; closing stream"
                     );
                     if let Some(failed) = request.take() {
-                        finish_request(service.as_ref(), failed).await;
+                        finish_request_in_background(service, failed);
                     }
                     continue;
                 }
@@ -323,7 +323,7 @@ async fn drain_receiver<A: PureRistAuth>(
                     "closing idle pure Rust RIST stream with an unresolved sequence gap"
                 );
             }
-            finish_request(service.as_ref(), finished).await;
+            finish_request_in_background(service, finished);
         }
     }
 }
@@ -431,6 +431,13 @@ async fn append_payload(
             "pure Rust RIST body slot written"
         );
     }
+}
+
+fn finish_request_in_background(service: &Arc<UploadResponseService>, request: PureRistRequest) {
+    let service = Arc::clone(service);
+    tokio::spawn(async move {
+        finish_request(service.as_ref(), request).await;
+    });
 }
 
 async fn finish_request(service: &UploadResponseService, mut request: PureRistRequest) {
@@ -641,6 +648,78 @@ mod tests {
         assert_eq!(body.len(), FLUSH_BYTES);
         assert_eq!(&body[..RIST_PACKET_BYTES], first);
         assert_eq!(&body[RIST_PACKET_BYTES..], second);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn response_wait_does_not_block_the_next_rist_request() {
+        const RIST_PACKET_BYTES: usize = 1_316;
+        let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 2,
+            slot_size_kb: 47,
+            slots_per_stream: 16,
+            response_timeout_ms: 10_000,
+        }));
+        let probe = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ingest_addr = probe.local_addr().unwrap();
+        drop(probe);
+        let shutdown = PureRistIngest::new(service.clone())
+            .with_profile(PureRistProfile::Main)
+            .with_session_idle_timeout(Duration::from_millis(25))
+            .with_body_flush_bytes(RIST_PACKET_BYTES)
+            .start(ingest_addr)
+            .await
+            .unwrap();
+
+        let mut sender = MainMioSender::connect(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            ingest_addr,
+            DEFAULT_FLOW_ID,
+            64,
+        )
+        .unwrap();
+        let first_payload = [0x31; RIST_PACKET_BYTES];
+        sender
+            .send_payload(&first_payload, ntp_now(), Instant::now())
+            .unwrap();
+
+        let first_stream_id = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(stream) = service
+                    .active_streams()
+                    .await
+                    .into_iter()
+                    .find(|stream| stream.request_last >= 3)
+                {
+                    break stream.stream_id;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first RIST request did not become idle");
+
+        let second_payload = [0x52; RIST_PACKET_BYTES];
+        sender
+            .send_payload(&second_payload, ntp_now(), Instant::now())
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if service
+                    .active_streams()
+                    .await
+                    .into_iter()
+                    .any(|stream| stream.stream_id != first_stream_id && stream.request_last >= 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("response wait blocked the next RIST request");
+
         let _ = shutdown.send(());
     }
 }
