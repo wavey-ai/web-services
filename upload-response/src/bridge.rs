@@ -1,5 +1,6 @@
 use crate::{
-    CachedResponse, RequestControl, ResponseResult, TailSlot, UploadResponseService, UploadStream,
+    CachedResponse, RequestControl, ResponseResult, TailSlot, UploadResponseService,
+    UploadResponseTimeouts, UploadStream,
 };
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -24,7 +25,7 @@ pub struct IngressProxyConfig {
 #[derive(Clone)]
 pub struct CachedIngress {
     service: Arc<UploadResponseService>,
-    config: IngressProxyConfig,
+    timeouts: UploadResponseTimeouts,
 }
 
 pub struct CachedRequestGuard {
@@ -34,7 +35,16 @@ pub struct CachedRequestGuard {
 
 impl CachedIngress {
     pub fn new(service: Arc<UploadResponseService>, config: IngressProxyConfig) -> Self {
-        Self { service, config }
+        let timeouts =
+            UploadResponseTimeouts::from_legacy_response_timeout(config.response_timeout_ms);
+        Self { service, timeouts }
+    }
+
+    pub fn new_with_timeouts(
+        service: Arc<UploadResponseService>,
+        timeouts: UploadResponseTimeouts,
+    ) -> Self {
+        Self { service, timeouts }
     }
 
     pub fn service(&self) -> Arc<UploadResponseService> {
@@ -154,7 +164,7 @@ impl CachedIngress {
         stream_id: u64,
         rx: oneshot::Receiver<ResponseResult>,
     ) -> Result<HandlerResponse> {
-        let timeout_duration = Duration::from_millis(self.config.response_timeout_ms);
+        let timeout_duration = Duration::from_millis(self.timeouts.response_deadline_ms);
         match timeout(timeout_duration, rx).await {
             Ok(Ok(Ok(cached))) => Ok(handler_response_from_cached(cached)),
             Ok(Ok(Err(error))) => {
@@ -195,7 +205,7 @@ impl CachedIngress {
                 "response stream is not available".into(),
             ));
         };
-        let timeout_duration = Duration::from_millis(self.config.response_timeout_ms);
+        let timeout_duration = Duration::from_millis(self.timeouts.response_deadline_ms);
         let result = match timeout(timeout_duration, async {
             let mut last_slot = 0usize;
             let mut headers_sent = false;

@@ -1,7 +1,7 @@
 use crate::{
     encode_request_control, request_from_headers_slot, RequestControl, StageState,
-    WorkerCapacitySummary, WorkerHeartbeat, WorkerHeartbeatUpdate, RESPONSE_CAPABILITY_HEADER,
-    RESPONSE_SEQUENCE_HEADER,
+    UploadResponseTimeouts, WorkerCapacitySummary, WorkerHeartbeat, WorkerHeartbeatUpdate,
+    RESPONSE_CAPABILITY_HEADER, RESPONSE_SEQUENCE_HEADER,
 };
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -71,9 +71,19 @@ pub enum RemoteStageSlot {
 
 impl RemoteIngressClient {
     pub fn new(slot_bytes: usize, insecure_tls: bool) -> Result<Self> {
+        Self::new_with_timeouts(slot_bytes, insecure_tls, UploadResponseTimeouts::default())
+    }
+
+    /// Create a client with an independent remote I/O deadline.
+    pub fn new_with_timeouts(
+        slot_bytes: usize,
+        insecure_tls: bool,
+        timeouts: UploadResponseTimeouts,
+    ) -> Result<Self> {
         Self::from_builder(
             slot_bytes,
             Client::builder().tls_danger_accept_invalid_certs(insecure_tls),
+            timeouts.remote_io_timeout_ms,
         )
     }
 
@@ -85,6 +95,21 @@ impl RemoteIngressClient {
         server_ca_pem: &[u8],
         identity_pem: &[u8],
     ) -> Result<Self> {
+        Self::new_with_mtls_pem_and_timeouts(
+            slot_bytes,
+            server_ca_pem,
+            identity_pem,
+            UploadResponseTimeouts::default(),
+        )
+    }
+
+    /// Create a mutual TLS client with an independent remote I/O deadline.
+    pub fn new_with_mtls_pem_and_timeouts(
+        slot_bytes: usize,
+        server_ca_pem: &[u8],
+        identity_pem: &[u8],
+        timeouts: UploadResponseTimeouts,
+    ) -> Result<Self> {
         let server_roots = Certificate::from_pem_bundle(server_ca_pem)
             .map_err(|error| anyhow!("failed to parse control server CA: {error}"))?;
         anyhow::ensure!(!server_roots.is_empty(), "control server CA is empty");
@@ -95,14 +120,19 @@ impl RemoteIngressClient {
             Client::builder()
                 .tls_certs_only(server_roots)
                 .identity(identity),
+            timeouts.remote_io_timeout_ms,
         )
     }
 
-    fn from_builder(slot_bytes: usize, builder: ClientBuilder) -> Result<Self> {
+    fn from_builder(
+        slot_bytes: usize,
+        builder: ClientBuilder,
+        remote_io_timeout_ms: u64,
+    ) -> Result<Self> {
         let client = builder
             .http2_adaptive_window(true)
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_millis(remote_io_timeout_ms))
             .build()
             .map_err(|error| anyhow!("failed to build reqwest client: {error}"))?;
         Ok(Self {

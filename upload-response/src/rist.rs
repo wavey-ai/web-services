@@ -182,7 +182,7 @@ impl<A: RistAuth> RistIngest<A> {
 
             debug!(stream_id, "RIST request complete, waiting for response");
 
-            let timeout_duration = Duration::from_millis(service.config.response_timeout_ms);
+            let timeout_duration = Duration::from_millis(service.timeouts().response_deadline_ms);
             match tokio::time::timeout(timeout_duration, rx).await {
                 Ok(Ok(Ok(cached))) => {
                     debug!(

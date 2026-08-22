@@ -258,9 +258,15 @@ Resolve each alert or record a reviewed reachability exception before public pro
 
 ### Split timeout purposes
 
+Status: implemented without changing existing `UploadResponseConfig` struct literals.
+
 `response_timeout_ms` controls application responses and cache backpressure. These events need different operating limits.
 
-Add `response_deadline_ms`, `reader_backpressure_timeout_ms`, `stream_admission_timeout_ms`, and `remote_io_timeout_ms`. Preserve the old field during one migration release.
+`UploadResponseTimeouts` now provides `response_deadline_ms`, `reader_backpressure_timeout_ms`, `stream_admission_timeout_ms`, and `remote_io_timeout_ms`.
+
+Existing constructors map the legacy field to response, backpressure, and admission waits. The worker client retains its previous 60-second I/O default.
+
+New constructors accept independent timeouts for the service, cached ingress bridge, and mutual TLS worker client. Remove the legacy field in a later breaking release.
 
 ### Validate memory configuration before allocation
 

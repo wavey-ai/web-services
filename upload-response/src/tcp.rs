@@ -327,7 +327,7 @@ where
         reads, bytes_read, body_slots_written, "TCP request complete, waiting for response"
     );
 
-    let timeout_duration = Duration::from_millis(service.config.response_timeout_ms);
+    let timeout_duration = Duration::from_millis(service.timeouts().response_deadline_ms);
     let result = match timeout(timeout_duration, rx).await {
         Ok(Ok(Ok(cached))) => {
             debug!(stream_id, status = ?cached.status, len = cached.body.len(), "Sending TCP response");

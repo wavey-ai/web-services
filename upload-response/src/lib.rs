@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::sync::{
     oneshot, Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore,
+    TryAcquireError,
 };
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
@@ -204,8 +205,39 @@ pub struct UploadResponseConfig {
     pub slot_size_kb: usize,
     /// Maximum slots per stream (headers + body chunks + end)
     pub slots_per_stream: usize,
-    /// Maximum time to wait for a response in milliseconds
+    /// Legacy response and backpressure timeout retained for migration.
     pub response_timeout_ms: u64,
+}
+
+/// Independent deadlines for upload-response work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadResponseTimeouts {
+    /// Maximum wait after a request finishes before its response must complete.
+    pub response_deadline_ms: u64,
+    /// Maximum wait before a writer may overwrite a cache ring slot.
+    pub reader_backpressure_timeout_ms: u64,
+    /// Maximum wait for a protocol adapter to acquire a stream slot.
+    pub stream_admission_timeout_ms: u64,
+    /// Maximum duration for one remote worker control request.
+    pub remote_io_timeout_ms: u64,
+}
+
+impl UploadResponseTimeouts {
+    /// Map the legacy response timeout into the migration policy.
+    pub const fn from_legacy_response_timeout(response_timeout_ms: u64) -> Self {
+        Self {
+            response_deadline_ms: response_timeout_ms,
+            reader_backpressure_timeout_ms: response_timeout_ms,
+            stream_admission_timeout_ms: response_timeout_ms,
+            remote_io_timeout_ms: 60_000,
+        }
+    }
+}
+
+impl Default for UploadResponseTimeouts {
+    fn default() -> Self {
+        Self::from_legacy_response_timeout(30_000)
+    }
 }
 
 /// Worst-case capacity implied by an upload-response configuration.
@@ -275,6 +307,11 @@ impl UploadResponseConfig {
     /// Slot capacity in bytes
     pub fn slot_bytes(&self) -> usize {
         self.slot_size_kb.saturating_mul(1024)
+    }
+
+    /// Derive the migration timeout policy from `response_timeout_ms`.
+    pub const fn legacy_timeouts(&self) -> UploadResponseTimeouts {
+        UploadResponseTimeouts::from_legacy_response_timeout(self.response_timeout_ms)
     }
 
     fn normalize(&mut self) {
@@ -634,6 +671,7 @@ pub struct UploadResponseService {
     /// Worker heartbeat/capacity registry keyed by worker id.
     workers: Arc<RwLock<HashMap<String, WorkerHeartbeat>>>,
     config: UploadResponseConfig,
+    timeouts: UploadResponseTimeouts,
 }
 
 impl UploadResponseService {
@@ -643,8 +681,26 @@ impl UploadResponseService {
             .unwrap_or_else(|error| panic!("invalid upload-response config: {error}"))
     }
 
+    /// Create a service with independent timeout purposes.
+    pub fn new_with_timeouts(
+        config: UploadResponseConfig,
+        timeouts: UploadResponseTimeouts,
+    ) -> Self {
+        Self::try_new_with_timeouts(config, timeouts)
+            .unwrap_or_else(|error| panic!("invalid upload-response config: {error}"))
+    }
+
     /// Validate capacity before allocation and create a service.
-    pub fn try_new(mut config: UploadResponseConfig) -> Result<Self, UploadResponseConfigError> {
+    pub fn try_new(config: UploadResponseConfig) -> Result<Self, UploadResponseConfigError> {
+        let timeouts = config.legacy_timeouts();
+        Self::try_new_with_timeouts(config, timeouts)
+    }
+
+    /// Validate capacity and create a service with independent timeouts.
+    pub fn try_new_with_timeouts(
+        mut config: UploadResponseConfig,
+        timeouts: UploadResponseTimeouts,
+    ) -> Result<Self, UploadResponseConfigError> {
         config.normalize();
         let capacity = config.validate()?;
         let options = chunk_cache_options(&config);
@@ -705,6 +761,7 @@ impl UploadResponseService {
             response_updates: Arc::new(Notify::new()),
             workers: Arc::new(RwLock::new(HashMap::new())),
             config,
+            timeouts,
         })
     }
 
@@ -845,7 +902,8 @@ impl UploadResponseService {
         }
 
         let overwrite_slot = next_slot - capacity;
-        let deadline = Instant::now() + Duration::from_millis(self.config.response_timeout_ms);
+        let deadline =
+            Instant::now() + Duration::from_millis(self.timeouts.reader_backpressure_timeout_ms);
         loop {
             let notified = notifies[stream_idx].notified();
             tokio::pin!(notified);
@@ -1149,12 +1207,7 @@ impl UploadResponseService {
     }
 
     pub async fn open_stream(self: &Arc<Self>) -> Result<UploadStream, String> {
-        let permit = self
-            .slot_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| "streams closed".to_string())?;
+        let permit = self.acquire_stream().await?;
 
         self.open_stream_with_permit(permit).await
     }
@@ -1614,7 +1667,7 @@ impl UploadResponseService {
     }
 
     fn response_claim_ttl(&self) -> Duration {
-        Duration::from_millis(self.config.response_timeout_ms.max(1_000))
+        Duration::from_millis(self.timeouts.response_deadline_ms.max(1_000))
     }
 
     fn capability_digest(capability: &str) -> [u8; 32] {
@@ -1866,17 +1919,31 @@ impl UploadResponseService {
         &self.config
     }
 
+    /// Get the independent timeout policy.
+    pub fn timeouts(&self) -> &UploadResponseTimeouts {
+        &self.timeouts
+    }
+
     /// Get the response channels map for the watcher
     pub fn response_channels(&self) -> Arc<RwLock<HashMap<u64, oneshot::Sender<ResponseResult>>>> {
         Arc::clone(&self.response_channels)
     }
 
-    /// Acquire a stream slot, blocking if at capacity
+    /// Acquire a stream slot before the admission deadline.
     pub async fn acquire_stream(&self) -> Result<OwnedSemaphorePermit, String> {
-        self.slot_semaphore
-            .clone()
-            .acquire_owned()
+        let semaphore = Arc::clone(&self.slot_semaphore);
+        match Arc::clone(&semaphore).try_acquire_owned() {
+            Ok(permit) => return Ok(permit),
+            Err(TryAcquireError::Closed) => return Err("streams closed".to_string()),
+            Err(TryAcquireError::NoPermits) => {}
+        }
+        let timeout_duration = Duration::from_millis(self.timeouts.stream_admission_timeout_ms);
+        if timeout_duration.is_zero() {
+            return Err("stream admission timed out".to_string());
+        }
+        timeout(timeout_duration, semaphore.acquire_owned())
             .await
+            .map_err(|_| "stream admission timed out".to_string())?
             .map_err(|_| "streams closed".to_string())
     }
 
@@ -3223,7 +3290,7 @@ impl UploadResponseRouter {
         stream_id: u64,
         rx: oneshot::Receiver<ResponseResult>,
     ) -> HandlerResult<HandlerResponse> {
-        let timeout_duration = Duration::from_millis(self.service.config.response_timeout_ms);
+        let timeout_duration = Duration::from_millis(self.service.timeouts.response_deadline_ms);
         match timeout(timeout_duration, rx).await {
             Ok(Ok(Ok(cached))) => {
                 debug!(stream_id, status = ?cached.status, "Received response");
@@ -3555,7 +3622,8 @@ impl WebSocketHandler for UploadResponseWsHandler {
                 .map_err(ServerError::Config)?;
 
             debug!(stream_id, "Request complete, waiting for response");
-            let timeout_duration = Duration::from_millis(self.service.config.response_timeout_ms);
+            let timeout_duration =
+                Duration::from_millis(self.service.timeouts.response_deadline_ms);
             match timeout(timeout_duration, rx).await {
                 Ok(Ok(Ok(cached))) => {
                     debug!(stream_id, status = ?cached.status, "Sending WebSocket response");
@@ -3752,6 +3820,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_response_timeout_maps_to_original_purposes() {
+        let config = UploadResponseConfig {
+            response_timeout_ms: 1_234,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.legacy_timeouts(),
+            UploadResponseTimeouts {
+                response_deadline_ms: 1_234,
+                reader_backpressure_timeout_ms: 1_234,
+                stream_admission_timeout_ms: 1_234,
+                remote_io_timeout_ms: 60_000,
+            }
+        );
+    }
+
+    #[test]
     fn try_new_normalizes_zero_capacity() {
         let service = UploadResponseService::try_new(UploadResponseConfig {
             num_streams: 0,
@@ -3826,6 +3912,53 @@ mod tests {
         // Third acquisition should block
         let result = timeout(Duration::from_millis(10), service.acquire_stream()).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_admission_has_an_independent_deadline() {
+        let service = Arc::new(UploadResponseService::new_with_timeouts(
+            UploadResponseConfig {
+                num_streams: 1,
+                response_timeout_ms: 1_000,
+                ..Default::default()
+            },
+            UploadResponseTimeouts {
+                stream_admission_timeout_ms: 20,
+                ..Default::default()
+            },
+        ));
+        let active = service.open_stream().await.unwrap();
+
+        let result = timeout(Duration::from_millis(250), service.open_stream())
+            .await
+            .expect("stream admission ignored its deadline");
+        assert_eq!(result.err().as_deref(), Some("stream admission timed out"));
+
+        active.close().await;
+    }
+
+    #[tokio::test]
+    async fn response_wait_has_an_independent_deadline() {
+        let service = Arc::new(UploadResponseService::new_with_timeouts(
+            UploadResponseConfig {
+                response_timeout_ms: 1_000,
+                ..Default::default()
+            },
+            UploadResponseTimeouts {
+                response_deadline_ms: 20,
+                ..Default::default()
+            },
+        ));
+        let router = UploadResponseRouter::new(service);
+        let request = Request::builder().uri("/upload").body(()).unwrap();
+
+        let result = timeout(Duration::from_millis(250), router.route(request))
+            .await
+            .expect("response wait ignored its deadline");
+        assert!(matches!(
+            result,
+            Err(ServerError::Config(error)) if error == "response timeout"
+        ));
     }
 
     #[tokio::test]
@@ -4490,10 +4623,16 @@ mod tests {
         let config = UploadResponseConfig {
             num_streams: 1,
             slots_per_stream: 2,
-            response_timeout_ms: 30,
+            response_timeout_ms: 1_000,
             ..Default::default()
         };
-        let service = Arc::new(UploadResponseService::new(config));
+        let service = Arc::new(UploadResponseService::new_with_timeouts(
+            config,
+            UploadResponseTimeouts {
+                reader_backpressure_timeout_ms: 30,
+                ..Default::default()
+            },
+        ));
         let upload_stream = service.open_stream().await.unwrap();
         let stream_id = upload_stream.stream_id();
 

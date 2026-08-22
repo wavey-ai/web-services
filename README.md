@@ -216,7 +216,7 @@ and transcode pods own the client connection and cache. GPU workers read request
 slots and write response slots through internal H2. A future high-throughput
 data plane can use raw TCP/TLS with the same semantics and `HPKS` framing.
 
-Create worker clients with `RemoteIngressClient::new_with_mtls_pem`. Provide the control server CA and a PEM containing the worker certificate and private key.
+Create worker clients with `RemoteIngressClient::new_with_mtls_pem_and_timeouts`. Provide the control server CA, worker identity PEM, and the service timeout policy.
 
 The claim response returns a random 256-bit capability in `x-upload-response-capability`. Only its SHA-256 digest remains in server memory.
 
@@ -309,7 +309,9 @@ SRT streams write raw bytes directly to the cache with no additional framing. Wo
 ### Configuration
 
 ```rust
-use upload_response::{UploadResponseConfig, UploadResponseService};
+use upload_response::{
+    UploadResponseConfig, UploadResponseService, UploadResponseTimeouts,
+};
 
 let config = UploadResponseConfig {
     num_streams: 4096,
@@ -319,12 +321,20 @@ let config = UploadResponseConfig {
 };
 
 let capacity = config.validate()?;
-let service = UploadResponseService::try_new(config)?;
+let timeouts = UploadResponseTimeouts {
+    response_deadline_ms: 30_000,
+    reader_backpressure_timeout_ms: 5_000,
+    stream_admission_timeout_ms: 1_000,
+    remote_io_timeout_ms: 15_000,
+};
+let service = UploadResponseService::try_new_with_timeouts(config, timeouts)?;
 ```
 
 Validation includes the request lane, response lane, and all 16 possible stage lanes. It rejects more than 512 MiB of estimated metadata or 1 TiB of logical payload capacity.
 
 `UploadResponseService::new` remains available as a compatibility wrapper. It panics when capacity validation fails.
+
+The compatibility constructors map `response_timeout_ms` to response, backpressure, and admission waits. Remote worker requests retain their previous 60-second default.
 
 ### Slot Size Selection
 

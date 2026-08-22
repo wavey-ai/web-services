@@ -928,7 +928,7 @@ async fn finish_request(service: &UploadResponseService, mut request: PureRistRe
         "pure Rust RIST request complete, waiting for response"
     );
 
-    let timeout_duration = Duration::from_millis(service.config().response_timeout_ms);
+    let timeout_duration = Duration::from_millis(service.timeouts().response_deadline_ms);
     match tokio::time::timeout(timeout_duration, request.response_rx).await {
         Ok(Ok(Ok(cached))) => {
             debug!(

@@ -159,7 +159,7 @@ impl<A: WebRtcAuth> WebRtcIngest<A> {
                                         let _ = service.end_request(stream_id).await;
 
                                         // Wait for response and send back
-                                        let timeout_duration = Duration::from_millis(service.config().response_timeout_ms);
+                                        let timeout_duration = Duration::from_millis(service.timeouts().response_deadline_ms);
 
                                         match tokio::time::timeout(timeout_duration, ctx.response_rx).await {
                                             Ok(Ok(Ok(cached))) => {
