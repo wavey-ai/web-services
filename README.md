@@ -575,6 +575,14 @@ allocate temporary strings.
 These sequential one-second local samples are diagnostic controls. Use
 dedicated-host medians before making a release capacity claim.
 
+The next cache experiment replicated only the latest encoded payload for one
+hot stream. Eight readers increased from 8.96 million to 38.62 million reads/s.
+CPU cost fell from 279.9 to 116.5 ns/read.
+
+Eight replicas retained 7,304 encoded bytes instead of 911 bytes. The write
+diagnostic added nine allocations/write and 9% CPU cost. Replication is
+therefore opt-in; balanced and write-heavy workloads retain one payload.
+
 ### HTTP/3 capacity investigation
 
 Persistent HTTP/3 is still the production target for low-latency delivery. In

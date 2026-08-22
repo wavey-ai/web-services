@@ -16,8 +16,8 @@ The two code security gates are implemented. The production soak test remains op
 
 | Component | Reviewed revision |
 | --- | --- |
-| `playlists` | `e5410022` |
-| `rist-rs` | `faac3923` |
+| `playlists` | `e107101e` |
+| `rist-rs` | `904e3e8` |
 | `web-services` | This change set after `066bf4b` |
 
 The `rist-rs` revision is the current upstream `main` revision. Crates.io also reports `wavey-rist 0.1.0` and `rist-sys 0.1.1` as current.
@@ -401,9 +401,22 @@ The benchmark acceptance threshold passed with one allocation per write.
 
 ### Reduce shared hot-read cache traffic
 
-One cached playlist value is faster on one core than on eight contending cores. Shared atomic and lock cache lines cause this result.
+This work is complete as an opt-in policy. The default cache keeps one latest
+payload and retains its original write and memory costs.
 
-Measure per-core snapshot replication before changing the cache. Use replication only when the read fan-out justifies its memory cost.
+New cache and `Playlists` constructors accept up to 64 latest-payload replicas.
+Runtime threads select stable replicas without allocating during reads.
+
+An immediate two-second local A/B used one hot cached delta playlist. Eight
+readers increased from 8.96 million to 38.62 million reads/s. CPU cost fell from
+279.9 to 116.5 ns/read.
+
+Actual payload grew from 911 to 7,304 bytes. The configured maximum grew by
+5.47 MiB at an 800 KiB snapshot limit. The write diagnostic added nine
+allocations/write and 9% CPU cost.
+
+Keep one replica for balanced or write-heavy workloads. Match replicas to HLS
+runtime threads only when measured hot-stream read fan-out justifies the cost.
 
 ### Separate service-only memory measurements
 
@@ -415,10 +428,11 @@ responses, cancellation, stream churn, and hostile RIST input.
 
 ## Verification
 
-The `playlists` all-feature release suite passed 97 tests and every benchmark
+The `playlists` all-feature release suite passed 100 tests and every benchmark
 target. Its strict all-target Clippy pass has no warnings.
 
-The `rist-rs` all-feature workspace passed 187 unit tests. Its strict all-target Clippy pass has no warnings.
+The `rist-rs` all-feature workspace passed 209 unit and integration tests plus
+two documentation tests. Its strict all-target Clippy pass has no warnings.
 
 The web-services workspace passed 160 regular unit, integration, and smoke
 tests. It ignored 25 explicit stress tests and passed all documentation tests.
