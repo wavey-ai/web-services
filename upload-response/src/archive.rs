@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -365,10 +365,11 @@ impl ArchiveStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut encoded = serde_json::to_vec(descriptor)?;
         encoded.push(b'\n');
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.directory.join(ARCHIVE_MANIFEST_LOG))?;
+        let path = self.directory.join(ARCHIVE_MANIFEST_LOG);
+        if manifest_log_needs_separator(&path)? {
+            encoded.insert(0, b'\n');
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         file.write_all(&encoded)?;
         file.sync_data()?;
         Ok(())
@@ -412,6 +413,22 @@ impl ArchiveStore {
     fn object_path(&self, sequence: u64) -> String {
         format!("/v1/archives/{}/chunks/{sequence}", self.archive_id)
     }
+}
+
+fn manifest_log_needs_separator(path: &Path) -> io::Result<bool> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(length - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 pub struct ArchiveHttpRouter {
@@ -956,10 +973,17 @@ mod tests {
             .unwrap();
         log.write_all(b"{\"torn\":").unwrap();
         log.sync_all().unwrap();
+        write_chunk(&directory, 3, &iarc(3, 8));
 
         let reopened = ArchiveStore::open(&directory).unwrap();
-        assert_eq!(reopened.manifest(0, 10).chunks.len(), 1);
+        assert_eq!(reopened.manifest(0, 10).chunks.len(), 2);
         assert_eq!(reopened.manifest(0, 10).chunks[0].sequence, 1);
+        assert_eq!(reopened.manifest(0, 10).chunks[1].sequence, 3);
+        let log = fs::read_to_string(directory.join(ARCHIVE_MANIFEST_LOG)).unwrap();
+        assert!(log.lines().any(|line| {
+            serde_json::from_str::<ArchiveChunkDescriptor>(line)
+                .is_ok_and(|descriptor| descriptor.sequence == 3)
+        }));
         let _ = fs::remove_dir_all(directory);
     }
 
