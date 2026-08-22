@@ -3517,7 +3517,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "playlists"
 version = "0.1.6"
-source = "git+https://github.com/wavey-ai/playlists.git#c5bb88567f1d6541d09d04e33201a8eaea5fdc48"
+source = "git+https://github.com/wavey-ai/playlists.git#e5410022f6adeab5ae0dac8f9079a9c023a76e4f"
 dependencies = [
  "access-unit",
  "arc-swap",

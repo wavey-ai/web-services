@@ -16,7 +16,7 @@ The two code security gates are implemented. The production soak test remains op
 
 | Component | Reviewed revision |
 | --- | --- |
-| `playlists` | `c5bb8856` |
+| `playlists` | `e5410022` |
 | `rist-rs` | `faac3923` |
 | `web-services` | This change set after `066bf4b` |
 
@@ -115,7 +115,22 @@ Independent playlist writes reached 109,083 operations/s at eight workers. They 
 
 One hot playlist reached 43,964 operations/s with one worker. It fell to 29,878 operations/s with eight contending writers.
 
-The hot playlist result is expected for ordered writes. The allocation rate is not expected and is the main remaining playlist CPU target.
+Revision `e5410022` removed the manifest renderer's temporary strings. The
+manifest-only benchmark produced these immediate local results:
+
+| Revision | Workers | Rate | Allocations/write | Reallocations/write |
+| --- | ---: | ---: | ---: | ---: |
+| `c5bb8856` | 1 | 250,451/s | 46 | 10 |
+| `e5410022` | 1 | 363,557/s | 1 | effectively 0 |
+| `c5bb8856` | 8 | 354,214/s | 46 | 10 |
+| `e5410022` | 8 | 647,743/s | 1 | effectively 0 |
+
+The sequential one-second samples are diagnostic controls. They are not
+dedicated-host release claims. The output API needs one owned allocation so
+earlier returned playlists remain immutable.
+
+The hot playlist result remains expected for ordered writes. Rendering
+allocation churn is no longer the main playlist CPU target.
 
 The latency sampler collected few hot-write samples. Do not use its tail values for a service objective.
 
@@ -374,13 +389,15 @@ Clients open separate QUIC connections for concurrent sessions. Revisit pooling 
 
 ## P2 optimization work
 
-### Reduce playlist rendering allocations
+### Reduce playlist rendering allocations: complete
 
-Profile `M3u8Manifest::add_part` and its render functions with allocation stacks. The benchmark shows approximately 62 allocation calls for each playlist write.
+`M3u8Manifest` now keeps one render buffer per stream. It precomputes both
+invariant headers and writes integer-backed durations and timestamps directly.
 
-Keep one reusable render buffer per stream. Precompute invariant tags and use direct integer formatting for changing fields.
+Each returned `Bytes` owns one copy. Later renders cannot mutate earlier output.
 
-Retain the exact output bytes as the compatibility test. Require lower allocation counts before accepting a more complex renderer.
+Tests retain exact output bytes and compare timestamp formatting with Chrono.
+The benchmark acceptance threshold passed with one allocation per write.
 
 ### Reduce shared hot-read cache traffic
 
@@ -390,17 +407,21 @@ Measure per-core snapshot replication before changing the cache. Use replication
 
 ### Separate service-only memory measurements
 
-The current benchmark runs clients and servers in one process. Add an external load generator and collect server RSS independently.
+The London static test used a separate load generator. It collected server RSS,
+CPU, thread count, file descriptors, UDP queues, errors, and latency.
 
-Record steady RSS after warmup and after client churn. Report payload bytes separately from allocator and protocol memory.
+The static path is complete. Extend the harness with mixed uploads, worker
+responses, cancellation, stream churn, and hostile RIST input.
 
 ## Verification
 
-The `playlists` all-feature library suite passed 95 tests. Its strict all-target Clippy pass has no warnings.
+The `playlists` all-feature release suite passed 97 tests and every benchmark
+target. Its strict all-target Clippy pass has no warnings.
 
 The `rist-rs` all-feature workspace passed 187 unit tests. Its strict all-target Clippy pass has no warnings.
 
-The web-services workspace passed all regular unit, integration, smoke, and documentation tests. Stress benchmarks remain explicit opt-in tests.
+The web-services workspace passed 160 regular unit, integration, and smoke
+tests. It ignored 25 explicit stress tests and passed all documentation tests.
 
 Use these commands for the final local gate:
 

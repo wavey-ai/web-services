@@ -559,6 +559,22 @@ RSS remained between 19.16 MiB and 20.61 MiB. The process retained five threads 
 
 This static test passed. The mixed upload, worker, stage, cancellation, and hostile RIST soak remains a production gate.
 
+### Playlist rendering allocation diagnostic, August 22, 2026
+
+The playlist renderer now reuses one scratch buffer and precomputes invariant
+LL-HLS headers. Changing timestamps, durations, and identifiers no longer
+allocate temporary strings.
+
+| Revision | Workers | Rate | Allocations/write | Reallocations/write |
+| --- | ---: | ---: | ---: | ---: |
+| `c5bb8856` | 1 | 250,451/s | 46 | 10 |
+| `e5410022` | 1 | 363,557/s | 1 | effectively 0 |
+| `c5bb8856` | 8 | 354,214/s | 46 | 10 |
+| `e5410022` | 8 | 647,743/s | 1 | effectively 0 |
+
+These sequential one-second local samples are diagnostic controls. Use
+dedicated-host medians before making a release capacity claim.
+
 ### HTTP/3 capacity investigation
 
 Persistent HTTP/3 is still the production target for low-latency delivery. In
