@@ -316,9 +316,11 @@ Wake the receiver thread for socket input, keepalive work, or shutdown. Keep the
 
 ### Supervise completion tasks
 
-RIST request completion currently creates detached tasks. Their count is bounded indirectly by stream capacity, but shutdown does not own them.
+Status: implemented.
 
-Store completion work in a `JoinSet` or `TaskTracker`. Abort or drain it during shutdown with a configured deadline.
+The Pure RIST writer now owns request finish and abort work in a `JoinSet`. It reaps completed work during sustained ingress.
+
+Shutdown joins the receiver thread and writer task. The writer drains completion work until the response deadline, then aborts remaining work.
 
 ### Support multiple WebTransport sessions explicitly
 

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinSet;
 use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
@@ -463,7 +464,7 @@ impl<A: PureRistAuth> PureRistIngest<A> {
             session_idle_timeout,
             body_flush_bytes,
         };
-        tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             run_writer(ingress_rx, writer_service, writer_stats, writer_config).await;
         });
 
@@ -474,6 +475,9 @@ impl<A: PureRistAuth> PureRistIngest<A> {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => warn!("pure Rust RIST receiver thread panicked"),
                 Err(error) => warn!(%error, "pure Rust RIST receiver join task failed"),
+            }
+            if let Err(error) = writer_task.await {
+                warn!(%error, "pure Rust RIST writer task failed");
             }
         });
 
@@ -632,8 +636,13 @@ async fn run_writer(
     let mut overflow_epoch = 0;
     let mut idle_poll = tokio::time::interval(DEFAULT_POLL_INTERVAL);
     idle_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut completion_tasks = JoinSet::new();
 
     loop {
+        while let Some(result) = completion_tasks.try_join_next() {
+            log_completion_task_result(result);
+        }
+
         tokio::select! {
             biased;
             packet = ingress_rx.recv() => {
@@ -649,7 +658,7 @@ async fn run_writer(
                             overflow_packets = packet.overflow_epoch - overflow_epoch,
                             "aborting pure Rust RIST stream at receive-queue discontinuity"
                         );
-                        abort_request_in_background(failed);
+                        abort_request_in_background(&mut completion_tasks, failed);
                     }
                     overflow_epoch = packet.overflow_epoch;
                 }
@@ -657,16 +666,22 @@ async fn run_writer(
                 process_ingress_packet(
                     &service,
                     &mut requests,
+                    &mut completion_tasks,
                     packet,
-                    config.local_addr,
-                    config.profile,
-                    config.flow_id,
-                    config.body_flush_bytes,
+                    &config,
                 ).await;
                 stats.writer_state.store(1, Ordering::Relaxed);
             }
             _ = idle_poll.tick() => {
-                finish_idle_requests(&service, &mut requests, config.session_idle_timeout);
+                finish_idle_requests(
+                    &service,
+                    &mut requests,
+                    &mut completion_tasks,
+                    config.session_idle_timeout,
+                );
+            }
+            Some(result) = completion_tasks.join_next(), if !completion_tasks.is_empty() => {
+                log_completion_task_result(result);
             }
         }
     }
@@ -675,28 +690,31 @@ async fn run_writer(
     stats.writer_active.store(0, Ordering::Relaxed);
     stats.writer_state.store(0, Ordering::Relaxed);
     for request in requests.into_values() {
-        finish_request_in_background(&service, request);
+        finish_request_in_background(&mut completion_tasks, &service, request);
     }
+    drain_completion_tasks(
+        &mut completion_tasks,
+        Duration::from_millis(service.timeouts().response_deadline_ms),
+    )
+    .await;
 }
 
 async fn process_ingress_packet(
     service: &Arc<UploadResponseService>,
     requests: &mut HashMap<SocketAddr, PureRistRequest>,
+    completion_tasks: &mut JoinSet<()>,
     packet: RistIngressPacket,
-    local_addr: SocketAddr,
-    profile: PureRistProfile,
-    flow_id: u32,
-    body_flush_bytes: usize,
+    config: &RistWriterConfig,
 ) {
     let peer = packet.peer;
     if let std::collections::hash_map::Entry::Vacant(entry) = requests.entry(peer) {
         match open_request(
             service,
-            local_addr,
+            config.local_addr,
             peer,
-            profile,
-            flow_id,
-            body_flush_bytes,
+            config.profile,
+            config.flow_id,
+            config.body_flush_bytes,
         )
         .await
         {
@@ -728,7 +746,7 @@ async fn process_ingress_packet(
                 "pure Rust RIST sequence gap exceeded reorder bound; aborting stream"
             );
             if let Some(failed) = requests.remove(&peer) {
-                abort_request_in_background(failed);
+                abort_request_in_background(completion_tasks, failed);
             }
             return;
         }
@@ -751,7 +769,7 @@ async fn process_ingress_packet(
                 "failed to write pure Rust RIST body; closing stream"
             );
             if let Some(failed) = requests.remove(&peer) {
-                abort_request_in_background(failed);
+                abort_request_in_background(completion_tasks, failed);
             }
             return;
         }
@@ -761,6 +779,7 @@ async fn process_ingress_packet(
 fn finish_idle_requests(
     service: &Arc<UploadResponseService>,
     requests: &mut HashMap<SocketAddr, PureRistRequest>,
+    completion_tasks: &mut JoinSet<()>,
     session_idle_timeout: Duration,
 ) {
     let now = Instant::now();
@@ -780,9 +799,9 @@ fn finish_idle_requests(
                     pending_packets,
                     "aborting idle pure Rust RIST stream with an unresolved sequence gap"
                 );
-                abort_request_in_background(finished);
+                abort_request_in_background(completion_tasks, finished);
             } else {
-                finish_request_in_background(service, finished);
+                finish_request_in_background(completion_tasks, service, finished);
             }
         }
     }
@@ -888,17 +907,50 @@ async fn append_payload(
     Ok(())
 }
 
-fn abort_request_in_background(request: PureRistRequest) {
-    tokio::spawn(async move {
+fn abort_request_in_background(completion_tasks: &mut JoinSet<()>, request: PureRistRequest) {
+    completion_tasks.spawn(async move {
         request.stream.close().await;
     });
 }
 
-fn finish_request_in_background(service: &Arc<UploadResponseService>, request: PureRistRequest) {
+fn finish_request_in_background(
+    completion_tasks: &mut JoinSet<()>,
+    service: &Arc<UploadResponseService>,
+    request: PureRistRequest,
+) {
     let service = Arc::clone(service);
-    tokio::spawn(async move {
+    completion_tasks.spawn(async move {
         finish_request(service.as_ref(), request).await;
     });
+}
+
+fn log_completion_task_result(result: Result<(), tokio::task::JoinError>) {
+    match result {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => warn!(%error, "pure Rust RIST completion task failed"),
+    }
+}
+
+async fn drain_completion_tasks(completion_tasks: &mut JoinSet<()>, deadline: Duration) {
+    let drain = async {
+        while let Some(result) = completion_tasks.join_next().await {
+            log_completion_task_result(result);
+        }
+    };
+    if tokio::time::timeout(deadline, drain).await.is_ok() {
+        return;
+    }
+
+    let remaining = completion_tasks.len();
+    warn!(
+        remaining,
+        "aborting pure Rust RIST completion tasks at shutdown deadline"
+    );
+    completion_tasks.abort_all();
+    while let Some(result) = completion_tasks.join_next().await {
+        log_completion_task_result(result);
+    }
 }
 
 async fn finish_request(service: &UploadResponseService, mut request: PureRistRequest) {
@@ -1288,15 +1340,31 @@ mod tests {
             },
         )]);
 
-        finish_idle_requests(&service, &mut requests, Duration::from_millis(1));
+        let mut completion_tasks = JoinSet::new();
+        finish_idle_requests(
+            &service,
+            &mut requests,
+            &mut completion_tasks,
+            Duration::from_millis(1),
+        );
         assert!(requests.is_empty());
-        tokio::time::timeout(Duration::from_millis(250), async {
-            while !service.active_streams().await.is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("gapped RIST stream waited for a normal response timeout");
+        drain_completion_tasks(&mut completion_tasks, Duration::from_millis(250)).await;
+        assert!(completion_tasks.is_empty());
+        assert!(service.active_streams().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_drain_aborts_work_at_its_deadline() {
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let mut completion_tasks = JoinSet::new();
+        completion_tasks.spawn(async move {
+            let _ = release_rx.await;
+        });
+
+        drain_completion_tasks(&mut completion_tasks, Duration::from_millis(10)).await;
+
+        assert!(completion_tasks.is_empty());
+        assert!(release_tx.send(()).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
