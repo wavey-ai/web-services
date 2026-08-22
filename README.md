@@ -8,55 +8,6 @@ The `web-service` crate owns protocol plumbing only. Raw TCP helpers expose
 generic `[u32_be length][payload]` frame reads/writes. Callers decide whether a
 frame is mesh JSON, media access-unit bytes, or another application payload.
 
-## HTTP/3 capacity investigation
-
-Persistent HTTP/3 is still the production target for low-latency delivery. In
-the current isolated two-host test, `web-service` delivered a 5 ms, 16-channel
-PCM-shaped workload exactly through 48 simulated customers. It delivered
-`19,200` responses per second and `884.7 Mbit/s` of response payload. The wire
-rate was approximately `947.7 Mbit/s`. Request-latency p99 was `14.1 ms` on a
-path with approximately `12.9 ms`
-ICMP RTT. At 56 customers the test stopped holding the requested cadence.
-
-The capacity gap relative to the TCP controls requires an implementation
-investigation. It is not a reason to replace H3. The profile and packet capture
-found much UDP send and kernel work. Each 5,760-byte response used the minimum
-practical number of QUIC packets. However, UDP transmit segmentation was off on
-the virtio NIC. Thus, software segmented the batched output.
-
-A dedicated Linode control had the same offload
-constraint and was not faster than GCP at the same exact workload. The existing
-H1/H2 figures were collected with a different topology and are controls only.
-They are not a valid final protocol comparison.
-
-Quinn remains the default and continues to own WebTransport. Enabling the
-`h3-tokio-quiche` Cargo feature adds Cloudflare's `tokio-quiche` as a selectable
-plain-H3 server backend. The same router and a Quinn client can then measure the
-two implementations without a copied server. Selecting
-tokio-quiche together with WebTransport is rejected until feature parity is
-implemented.
-
-The isolation work has produced its first proven capacity fix. Ordinary media
-GET responses carried two CORS fields that belong on preflight responses. Tests
-removed this repeated header and QPACK work on the same two-vCPU GCP server. The
-mean saturated 64-byte H3 response rate increased from `71,946` to `79,702`
-responses/s (`+10.78%`). The change reduced p99 from approximately `18.4 ms` to
-`16.1 ms`.
-
-It also reduced wire traffic while it served more requests. An immediate
-restart of the old build reproduced the old ceiling. This is a small-response
-transport result.
-
-On the full 5,760-byte control, the same change reduced
-server CPU by about `2.4%` at 40 customers while completing every scheduled
-request.
-
-The nearly 1 Gbit/s PCM result above remains the current qualified
-full-media boundary.
-
-See [HTTP/3 capacity investigation](./docs/http3-capacity-investigation.md) for
-the workload, results, profile, current interpretation, and bug-audit plan.
-
 ## Workspace Overview
 
 | Crate | Purpose |
@@ -589,6 +540,57 @@ cargo check -p av-upload-response --features rist-pure
 - [`playlists`](https://github.com/wavey-ai/playlists) provides the shared-memory `ChunkCache`.
 - [`http-pack`](https://github.com/wavey-ai/http-pack) provides the HPKS framing used for headers.
 - `raptorq-datagram-fec` is optional and only needed for `udp-fec`.
+
+## Ongoing and historical test results
+
+### HTTP/3 capacity investigation
+
+Persistent HTTP/3 is still the production target for low-latency delivery. In
+the current isolated two-host test, `web-service` delivered a 5 ms, 16-channel
+PCM-shaped workload exactly through 48 simulated customers. It delivered
+`19,200` responses per second and `884.7 Mbit/s` of response payload. The wire
+rate was approximately `947.7 Mbit/s`. Request-latency p99 was `14.1 ms` on a
+path with approximately `12.9 ms`
+ICMP RTT. At 56 customers the test stopped holding the requested cadence.
+
+The capacity gap relative to the TCP controls requires an implementation
+investigation. It is not a reason to replace H3. The profile and packet capture
+found much UDP send and kernel work. Each 5,760-byte response used the minimum
+practical number of QUIC packets. However, UDP transmit segmentation was off on
+the virtio NIC. Thus, software segmented the batched output.
+
+A dedicated Linode control had the same offload
+constraint and was not faster than GCP at the same exact workload. The existing
+H1/H2 figures were collected with a different topology and are controls only.
+They are not a valid final protocol comparison.
+
+Quinn remains the default and continues to own WebTransport. Enabling the
+`h3-tokio-quiche` Cargo feature adds Cloudflare's `tokio-quiche` as a selectable
+plain-H3 server backend. The same router and a Quinn client can then measure the
+two implementations without a copied server. Selecting
+tokio-quiche together with WebTransport is rejected until feature parity is
+implemented.
+
+The isolation work has produced its first proven capacity fix. Ordinary media
+GET responses carried two CORS fields that belong on preflight responses. Tests
+removed this repeated header and QPACK work on the same two-vCPU GCP server. The
+mean saturated 64-byte H3 response rate increased from `71,946` to `79,702`
+responses/s (`+10.78%`). The change reduced p99 from approximately `18.4 ms` to
+`16.1 ms`.
+
+It also reduced wire traffic while it served more requests. An immediate
+restart of the old build reproduced the old ceiling. This is a small-response
+transport result.
+
+On the full 5,760-byte control, the same change reduced
+server CPU by about `2.4%` at 40 customers while completing every scheduled
+request.
+
+The nearly 1 Gbit/s PCM result above remains the current qualified
+full-media boundary.
+
+See [HTTP/3 capacity investigation](./docs/http3-capacity-investigation.md) for
+the workload, results, profile, current interpretation, and bug-audit plan.
 
 ## License
 
