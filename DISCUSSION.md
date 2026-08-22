@@ -298,9 +298,15 @@ Integration tests cover HTTP/1.1 overload, HTTP/3 overload, connection upgrades,
 
 ### Remove lifecycle bypasses
 
+Status: implemented for external read access.
+
 Raw cache getters let local callers bypass stream identity and lane locks. Mark these APIs as deprecated.
 
-Add generation-safe lane handles for request, response, and stage access. Remove raw access in the next breaking release.
+The raw request, response, and stage cache getters are now deprecated. They remain available for one compatibility release.
+
+Generation-fenced lane handles provide slot reads, hashes, last positions, and update notifications. Every operation checks identity before and after cache access.
+
+Writers continue to use service methods, which enforce lifecycle locks and response capabilities. Remove the deprecated raw getters in the next breaking release.
 
 ### Replace the RIST idle poll
 

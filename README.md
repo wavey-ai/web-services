@@ -224,6 +224,8 @@ Create worker clients with `RemoteIngressClient::new_with_mtls_pem_and_timeouts`
 
 The claim response returns a random 256-bit capability in `x-upload-response-capability`. Only its SHA-256 digest remains in server memory.
 
+External cache readers should use `request_lane_handle`, `response_lane_handle`, or `stage_lane_handle`. Each handle rejects reads after its physical slot is reused.
+
 Response writes require that capability and a positive `x-upload-response-sequence`. Exact retries are idempotent; conflicting or skipped sequences fail.
 
 Use a Kubernetes `NetworkPolicy` as a second boundary. Mutual TLS provides the required worker authentication.

@@ -637,6 +637,103 @@ impl Drop for UploadStream {
     }
 }
 
+enum UploadLane {
+    Request,
+    Response,
+    Stage { name: String, lane: Arc<StageLane> },
+}
+
+/// Generation-fenced read access to one active upload cache lane.
+pub struct UploadLaneHandle {
+    service: Arc<UploadResponseService>,
+    stream_id: u64,
+    stream_idx: usize,
+    lane: UploadLane,
+}
+
+impl UploadLaneHandle {
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    pub fn lane_name(&self) -> &str {
+        match &self.lane {
+            UploadLane::Request => "request",
+            UploadLane::Response => "response",
+            UploadLane::Stage { name, .. } => name,
+        }
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.service
+            .is_current_slot(self.stream_id, self.stream_idx)
+    }
+
+    fn cache(&self) -> &ChunkCache {
+        match &self.lane {
+            UploadLane::Request => &self.service.request_cache,
+            UploadLane::Response => &self.service.response_cache,
+            UploadLane::Stage { lane, .. } => &lane.cache,
+        }
+    }
+
+    /// Return the last published slot while this handle remains current.
+    pub fn last(&self) -> Option<usize> {
+        if !self.is_current() {
+            return None;
+        }
+        let last = match &self.lane {
+            UploadLane::Request => {
+                if self.service.request_started[self.stream_idx].load(Ordering::Acquire) {
+                    self.service
+                        .request_cache
+                        .last(self.stream_idx)
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            UploadLane::Response => {
+                if self.service.response_started[self.stream_idx].load(Ordering::Acquire) {
+                    self.service
+                        .response_cache
+                        .last(self.stream_idx)
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            UploadLane::Stage { lane, .. } => lane.last(self.stream_idx),
+        };
+        self.is_current().then_some(last)
+    }
+
+    /// Read one slot and reject data from a reused physical stream slot.
+    pub async fn get(&self, slot_id: usize) -> Option<Bytes> {
+        self.get_with_hash(slot_id).await.map(|(bytes, _)| bytes)
+    }
+
+    /// Read one slot and its hash while fencing physical slot reuse.
+    pub async fn get_with_hash(&self, slot_id: usize) -> Option<(Bytes, u64)> {
+        if !self.is_current() {
+            return None;
+        }
+        let value = self.cache().get(self.stream_idx, slot_id).await;
+        self.is_current().then_some(value).flatten()
+    }
+
+    /// Return the lane notifier while this handle remains current.
+    ///
+    /// Recheck the handle after every notification because stream closure also wakes waiters.
+    pub fn update_notifier(&self) -> Option<Arc<Notify>> {
+        if !self.is_current() {
+            return None;
+        }
+        let notifier = self.cache().update_notifier(self.stream_idx)?;
+        self.is_current().then_some(notifier)
+    }
+}
+
 /// Main service for handling upload-response lifecycle.
 ///
 /// Format per stream (playlist):
@@ -1885,18 +1982,71 @@ impl UploadResponseService {
         }
     }
 
+    /// Return generation-fenced request-lane access for one active stream.
+    pub fn request_lane_handle(self: &Arc<Self>, stream_id: u64) -> Option<UploadLaneHandle> {
+        let stream_idx = self.stream_idx(stream_id)?;
+        self.is_current_slot(stream_id, stream_idx)
+            .then(|| UploadLaneHandle {
+                service: Arc::clone(self),
+                stream_id,
+                stream_idx,
+                lane: UploadLane::Request,
+            })
+    }
+
+    /// Return generation-fenced response-lane access for one active stream.
+    pub fn response_lane_handle(self: &Arc<Self>, stream_id: u64) -> Option<UploadLaneHandle> {
+        let stream_idx = self.stream_idx(stream_id)?;
+        self.is_current_slot(stream_id, stream_idx)
+            .then(|| UploadLaneHandle {
+                service: Arc::clone(self),
+                stream_id,
+                stream_idx,
+                lane: UploadLane::Response,
+            })
+    }
+
+    /// Return generation-fenced stage-lane access for one active stream.
+    pub async fn stage_lane_handle(
+        self: &Arc<Self>,
+        stream_id: u64,
+        stage: &str,
+    ) -> Result<Option<UploadLaneHandle>, String> {
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return Ok(None);
+        };
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return Ok(None);
+        }
+        let lane = self.get_or_create_stage_lane(stage).await?;
+        Ok(self
+            .is_current_slot(stream_id, stream_idx)
+            .then(|| UploadLaneHandle {
+                service: Arc::clone(self),
+                stream_id,
+                stream_idx,
+                lane: UploadLane::Stage {
+                    name: stage.to_string(),
+                    lane,
+                },
+            }))
+    }
+
     /// Get a reference to the request cache for external consumers
+    #[deprecated(note = "use request_lane_handle to fence stream-slot reuse")]
     pub fn request_cache(&self) -> Arc<ChunkCache> {
         Arc::clone(&self.request_cache)
     }
 
     /// Get a reference to a named stage cache for external consumers.
+    #[deprecated(note = "use stage_lane_handle to fence stream-slot reuse")]
     pub async fn stage_cache(&self, stage: &str) -> Result<Arc<ChunkCache>, String> {
         let lane = self.get_or_create_stage_lane(stage).await?;
         Ok(Arc::clone(&lane.cache))
     }
 
     /// Get a reference to the response cache for external consumers
+    #[deprecated(note = "use response_lane_handle to fence stream-slot reuse")]
     pub fn response_cache(&self) -> Arc<ChunkCache> {
         Arc::clone(&self.response_cache)
     }
@@ -4211,6 +4361,25 @@ mod tests {
             .await
             .unwrap();
         service.end_response(first_id).await.unwrap();
+        let old_request = service.request_lane_handle(first_id).unwrap();
+        let old_stage = service
+            .stage_lane_handle(first_id, "decode")
+            .await
+            .unwrap()
+            .unwrap();
+        let old_response = service.response_lane_handle(first_id).unwrap();
+        assert_eq!(
+            old_request.get(2).await.unwrap(),
+            Bytes::from_static(b"old-request")
+        );
+        assert_eq!(
+            old_stage.get(2).await.unwrap(),
+            Bytes::from_static(b"old-stage")
+        );
+        assert_eq!(
+            old_response.get(2).await.unwrap(),
+            Bytes::from_static(b"old-response")
+        );
         first_stream.close().await;
 
         let second_stream = service.open_stream().await.unwrap();
@@ -4243,7 +4412,15 @@ mod tests {
             .await
             .unwrap();
         service
+            .append_request_body(second_id, Bytes::from_static(b"new-request"))
+            .await
+            .unwrap();
+        service
             .write_stage_head(second_id, "decode", Bytes::from_static(b"new-head"))
+            .await
+            .unwrap();
+        service
+            .append_stage_body(second_id, "decode", Bytes::from_static(b"new-stage"))
             .await
             .unwrap();
         service
@@ -4258,13 +4435,45 @@ mod tests {
             )
             .await
             .unwrap();
+        service
+            .append_response_body(second_id, Bytes::from_static(b"new-response"))
+            .await
+            .unwrap();
 
-        assert_eq!(service.request_last(second_id), Some(1));
-        assert_eq!(service.response_last(second_id), Some(1));
-        assert_eq!(service.stage_last(second_id, "decode").await, Some(1));
-        assert!(service.request_get(second_id, 2).await.is_none());
-        assert!(service.stage_get(second_id, "decode", 2).await.is_none());
-        assert!(service.response_get(second_id, 2).await.is_none());
+        assert!(!old_request.is_current());
+        assert!(!old_stage.is_current());
+        assert!(!old_response.is_current());
+        assert_eq!(old_request.last(), None);
+        assert_eq!(old_stage.last(), None);
+        assert_eq!(old_response.last(), None);
+        assert!(old_request.get(2).await.is_none());
+        assert!(old_stage.get(2).await.is_none());
+        assert!(old_response.get(2).await.is_none());
+        assert!(old_request.update_notifier().is_none());
+
+        let new_request = service.request_lane_handle(second_id).unwrap();
+        let new_stage = service
+            .stage_lane_handle(second_id, "decode")
+            .await
+            .unwrap()
+            .unwrap();
+        let new_response = service.response_lane_handle(second_id).unwrap();
+        assert_eq!(new_request.last(), Some(2));
+        assert_eq!(new_stage.last(), Some(2));
+        assert_eq!(new_response.last(), Some(2));
+        assert_eq!(
+            new_request.get(2).await.unwrap(),
+            Bytes::from_static(b"new-request")
+        );
+        assert_eq!(
+            new_stage.get(2).await.unwrap(),
+            Bytes::from_static(b"new-stage")
+        );
+        assert_eq!(
+            new_response.get(2).await.unwrap(),
+            Bytes::from_static(b"new-response")
+        );
+        assert!(new_response.update_notifier().is_some());
 
         second_stream.close().await;
     }
