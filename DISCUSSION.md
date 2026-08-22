@@ -264,11 +264,17 @@ Add `response_deadline_ms`, `reader_backpressure_timeout_ms`, `stream_admission_
 
 ### Validate memory configuration before allocation
 
+Status: implemented.
+
 `UploadResponseService::new` normalizes zero values, but extreme trusted values can panic or exhaust memory.
 
-Add `UploadResponseService::try_new`. Use checked multiplication for streams, slots, lanes, and slot bytes.
+`UploadResponseService::try_new` now validates with checked multiplication before constructing a cache. The compatibility `new` wrapper reports a descriptive panic.
 
-Return the logical maximum and estimated metadata bytes in the validation error. Keep `new` only as a compatibility wrapper.
+Errors report the logical maximum and estimated metadata bytes. Validation includes all 16 possible stage lanes and permits 4,096 streams with 16 slots each.
+
+The current guard limits estimated metadata to 512 MiB and logical payload capacity to 1 TiB. It also bounds each configuration dimension.
+
+These limits prevent unsafe trusted configurations. They do not convert an operating-system allocation failure into a recoverable Rust error.
 
 ### Bound all request and upgraded-session work
 

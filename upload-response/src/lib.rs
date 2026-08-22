@@ -13,6 +13,7 @@ use playlists::Options;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -98,6 +99,15 @@ const MAX_STAGE_NAME_BYTES: usize = 64;
 const MAX_STAGE_LANES: usize = 16;
 const MAX_WORKER_HEARTBEATS: usize = 4_096;
 const RESPONSE_CAPABILITY_BYTES: usize = 32;
+const EAGER_CACHE_LANES: usize = 2;
+const ESTIMATED_CACHE_SLOT_METADATA_BYTES: u128 = 128;
+const ESTIMATED_CACHE_STREAM_METADATA_BYTES: u128 = 512;
+const ESTIMATED_SERVICE_STREAM_METADATA_BYTES: u128 = 4 * 1024;
+pub const MAX_UPLOAD_RESPONSE_STREAMS: usize = 65_536;
+pub const MAX_UPLOAD_RESPONSE_SLOTS_PER_STREAM: usize = 1_048_576;
+pub const MAX_UPLOAD_RESPONSE_SLOT_BYTES: u128 = 64 * 1024 * 1024;
+pub const MAX_UPLOAD_RESPONSE_LOGICAL_BYTES: u128 = 1024 * 1024 * 1024 * 1024;
+pub const MAX_UPLOAD_RESPONSE_ESTIMATED_METADATA_BYTES: u128 = 512 * 1024 * 1024;
 pub const RESPONSE_CAPABILITY_HEADER: &str = "x-upload-response-capability";
 pub const RESPONSE_SEQUENCE_HEADER: &str = "x-upload-response-sequence";
 
@@ -198,10 +208,186 @@ pub struct UploadResponseConfig {
     pub response_timeout_ms: u64,
 }
 
+/// Worst-case capacity implied by an upload-response configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadResponseCapacity {
+    pub streams: usize,
+    pub slots_per_stream: usize,
+    pub slot_bytes: u128,
+    pub cache_lanes: usize,
+    pub logical_maximum_bytes: u128,
+    pub estimated_metadata_bytes: u128,
+    pub eager_estimated_metadata_bytes: u128,
+}
+
+/// Configuration failure reported before cache allocation begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadResponseConfigError {
+    pub reason: String,
+    pub logical_maximum_bytes: u128,
+    pub estimated_metadata_bytes: u128,
+}
+
+impl UploadResponseConfigError {
+    fn new(reason: impl Into<String>, capacity: UploadResponseCapacity) -> Self {
+        Self {
+            reason: reason.into(),
+            logical_maximum_bytes: capacity.logical_maximum_bytes,
+            estimated_metadata_bytes: capacity.estimated_metadata_bytes,
+        }
+    }
+}
+
+impl fmt::Display for UploadResponseConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}; logical maximum: {} bytes; estimated metadata: {} bytes",
+            self.reason, self.logical_maximum_bytes, self.estimated_metadata_bytes
+        )
+    }
+}
+
+impl std::error::Error for UploadResponseConfigError {}
+
+#[derive(Default)]
+struct CapacityArithmetic {
+    overflowed: bool,
+}
+
+impl CapacityArithmetic {
+    fn multiply(&mut self, left: u128, right: u128) -> u128 {
+        left.checked_mul(right).unwrap_or_else(|| {
+            self.overflowed = true;
+            u128::MAX
+        })
+    }
+
+    fn add(&mut self, left: u128, right: u128) -> u128 {
+        left.checked_add(right).unwrap_or_else(|| {
+            self.overflowed = true;
+            u128::MAX
+        })
+    }
+}
+
 impl UploadResponseConfig {
     /// Slot capacity in bytes
     pub fn slot_bytes(&self) -> usize {
         self.slot_size_kb.saturating_mul(1024)
+    }
+
+    fn normalize(&mut self) {
+        self.num_streams = self.num_streams.max(1);
+        self.slot_size_kb = self.slot_size_kb.max(1);
+        self.slots_per_stream = self.slots_per_stream.max(1);
+    }
+
+    fn capacity_estimate(&self) -> (UploadResponseCapacity, bool) {
+        let mut arithmetic = CapacityArithmetic::default();
+        let streams = self.num_streams as u128;
+        let slots_per_stream = self.slots_per_stream as u128;
+        let slot_bytes = arithmetic.multiply(self.slot_size_kb as u128, 1024);
+        let cache_lanes = EAGER_CACHE_LANES + MAX_STAGE_LANES;
+        let cache_lanes_u128 = cache_lanes as u128;
+        let slots_per_cache = arithmetic.multiply(streams, slots_per_stream);
+        let total_cache_slots = arithmetic.multiply(slots_per_cache, cache_lanes_u128);
+        let total_cache_streams = arithmetic.multiply(streams, cache_lanes_u128);
+        let initialization_kb = arithmetic.multiply(Options::default().init_size_kb as u128, 1024);
+        let initialization_bytes = arithmetic.multiply(initialization_kb, total_cache_streams);
+        let maximum_slot_bytes = arithmetic.multiply(total_cache_slots, slot_bytes);
+        let logical_maximum_bytes = arithmetic.add(maximum_slot_bytes, initialization_bytes);
+        let estimated_service_metadata =
+            arithmetic.multiply(streams, ESTIMATED_SERVICE_STREAM_METADATA_BYTES);
+        let estimated_slot_metadata =
+            arithmetic.multiply(total_cache_slots, ESTIMATED_CACHE_SLOT_METADATA_BYTES);
+        let estimated_stream_metadata =
+            arithmetic.multiply(total_cache_streams, ESTIMATED_CACHE_STREAM_METADATA_BYTES);
+        let estimated_cache_metadata =
+            arithmetic.add(estimated_slot_metadata, estimated_stream_metadata);
+        let estimated_metadata_bytes =
+            arithmetic.add(estimated_cache_metadata, estimated_service_metadata);
+        let eager_cache_slots = arithmetic.multiply(slots_per_cache, EAGER_CACHE_LANES as u128);
+        let eager_cache_streams = arithmetic.multiply(streams, EAGER_CACHE_LANES as u128);
+        let eager_slot_metadata =
+            arithmetic.multiply(eager_cache_slots, ESTIMATED_CACHE_SLOT_METADATA_BYTES);
+        let eager_stream_metadata =
+            arithmetic.multiply(eager_cache_streams, ESTIMATED_CACHE_STREAM_METADATA_BYTES);
+        let eager_cache_metadata = arithmetic.add(eager_slot_metadata, eager_stream_metadata);
+        let eager_estimated_metadata_bytes =
+            arithmetic.add(eager_cache_metadata, estimated_service_metadata);
+
+        (
+            UploadResponseCapacity {
+                streams: self.num_streams,
+                slots_per_stream: self.slots_per_stream,
+                slot_bytes,
+                cache_lanes,
+                logical_maximum_bytes,
+                estimated_metadata_bytes,
+                eager_estimated_metadata_bytes,
+            },
+            arithmetic.overflowed,
+        )
+    }
+
+    /// Validate capacity before the service allocates cache metadata.
+    pub fn validate(&self) -> Result<UploadResponseCapacity, UploadResponseConfigError> {
+        let mut config = self.clone();
+        config.normalize();
+        let (capacity, arithmetic_overflowed) = config.capacity_estimate();
+        if config.num_streams > MAX_UPLOAD_RESPONSE_STREAMS {
+            return Err(UploadResponseConfigError::new(
+                format!(
+                    "num_streams {} exceeds limit {MAX_UPLOAD_RESPONSE_STREAMS}",
+                    config.num_streams
+                ),
+                capacity,
+            ));
+        }
+        if config.slots_per_stream > MAX_UPLOAD_RESPONSE_SLOTS_PER_STREAM {
+            return Err(UploadResponseConfigError::new(
+                format!(
+                    "slots_per_stream {} exceeds limit {MAX_UPLOAD_RESPONSE_SLOTS_PER_STREAM}",
+                    config.slots_per_stream
+                ),
+                capacity,
+            ));
+        }
+        if arithmetic_overflowed {
+            return Err(UploadResponseConfigError::new(
+                "capacity arithmetic overflow",
+                capacity,
+            ));
+        }
+        if capacity.slot_bytes > MAX_UPLOAD_RESPONSE_SLOT_BYTES {
+            return Err(UploadResponseConfigError::new(
+                format!(
+                    "slot size {} bytes exceeds limit {MAX_UPLOAD_RESPONSE_SLOT_BYTES}",
+                    capacity.slot_bytes
+                ),
+                capacity,
+            ));
+        }
+        if capacity.estimated_metadata_bytes > MAX_UPLOAD_RESPONSE_ESTIMATED_METADATA_BYTES {
+            return Err(UploadResponseConfigError::new(
+                format!(
+                    "estimated metadata {} bytes exceeds limit {MAX_UPLOAD_RESPONSE_ESTIMATED_METADATA_BYTES}",
+                    capacity.estimated_metadata_bytes
+                ),
+                capacity,
+            ));
+        }
+        if capacity.logical_maximum_bytes > MAX_UPLOAD_RESPONSE_LOGICAL_BYTES {
+            return Err(UploadResponseConfigError::new(
+                format!(
+                    "logical maximum {} bytes exceeds limit {MAX_UPLOAD_RESPONSE_LOGICAL_BYTES}",
+                    capacity.logical_maximum_bytes
+                ),
+                capacity,
+            ));
+        }
+        Ok(capacity)
     }
 }
 
@@ -452,13 +638,24 @@ pub struct UploadResponseService {
 
 impl UploadResponseService {
     /// Create a new upload-response service with the given configuration
-    pub fn new(mut config: UploadResponseConfig) -> Self {
-        config.num_streams = config.num_streams.max(1);
-        config.slot_size_kb = config.slot_size_kb.max(1);
-        config.slots_per_stream = config.slots_per_stream.max(1);
+    pub fn new(config: UploadResponseConfig) -> Self {
+        Self::try_new(config)
+            .unwrap_or_else(|error| panic!("invalid upload-response config: {error}"))
+    }
+
+    /// Validate capacity before allocation and create a service.
+    pub fn try_new(mut config: UploadResponseConfig) -> Result<Self, UploadResponseConfigError> {
+        config.normalize();
+        let capacity = config.validate()?;
         let options = chunk_cache_options(&config);
-        let request_cache = Arc::new(ChunkCache::new(options));
-        let response_cache = Arc::new(ChunkCache::new(chunk_cache_options(&config)));
+        let request_cache = Arc::new(ChunkCache::try_new(options).map_err(|error| {
+            UploadResponseConfigError::new(format!("invalid request cache: {error}"), capacity)
+        })?);
+        let response_cache = Arc::new(ChunkCache::try_new(chunk_cache_options(&config)).map_err(
+            |error| {
+                UploadResponseConfigError::new(format!("invalid response cache: {error}"), capacity)
+            },
+        )?);
         let slot_semaphore = Arc::new(Semaphore::new(config.num_streams));
         let free_slots: Vec<usize> = (0..config.num_streams).rev().collect();
 
@@ -480,7 +677,7 @@ impl UploadResponseService {
         // Initialize per-stream response claims (for exclusive writer)
         let response_claims = (0..config.num_streams).map(|_| Mutex::new(None)).collect();
 
-        Self {
+        Ok(Self {
             request_cache,
             response_cache,
             stages: Arc::new(RwLock::new(HashMap::new())),
@@ -508,7 +705,7 @@ impl UploadResponseService {
             response_updates: Arc::new(Notify::new()),
             workers: Arc::new(RwLock::new(HashMap::new())),
             config,
-        }
+        })
     }
 
     fn allocate_slot(&self) -> Option<usize> {
@@ -3515,6 +3712,104 @@ mod tests {
         let config = UploadResponseConfig::default();
         let service = UploadResponseService::new(config);
         assert!(service.next_id() >= 1);
+    }
+
+    #[test]
+    fn capacity_estimate_includes_all_cache_lanes() {
+        let config = UploadResponseConfig::default();
+        let capacity = config.validate().unwrap();
+        let expected_slots = (config.num_streams as u128)
+            * (config.slots_per_stream as u128)
+            * (capacity.cache_lanes as u128);
+        let expected_initialization = (config.num_streams as u128)
+            * (capacity.cache_lanes as u128)
+            * (Options::default().init_size_kb as u128)
+            * 1024;
+
+        assert_eq!(capacity.cache_lanes, EAGER_CACHE_LANES + MAX_STAGE_LANES);
+        assert_eq!(
+            capacity.logical_maximum_bytes,
+            expected_slots * (config.slot_bytes() as u128) + expected_initialization
+        );
+        assert!(capacity.eager_estimated_metadata_bytes < capacity.estimated_metadata_bytes);
+    }
+
+    #[test]
+    fn capacity_validation_allows_high_stream_concurrency() {
+        let capacity = UploadResponseConfig {
+            num_streams: 4_096,
+            slot_size_kb: 32,
+            slots_per_stream: 16,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+
+        assert_eq!(capacity.streams, 4_096);
+        assert_eq!(capacity.slots_per_stream, 16);
+        assert!(capacity.logical_maximum_bytes < MAX_UPLOAD_RESPONSE_LOGICAL_BYTES);
+        assert!(capacity.estimated_metadata_bytes < MAX_UPLOAD_RESPONSE_ESTIMATED_METADATA_BYTES);
+    }
+
+    #[test]
+    fn try_new_normalizes_zero_capacity() {
+        let service = UploadResponseService::try_new(UploadResponseConfig {
+            num_streams: 0,
+            slot_size_kb: 0,
+            slots_per_stream: 0,
+            response_timeout_ms: 0,
+        })
+        .unwrap();
+        assert_eq!(service.config().num_streams, 1);
+        assert_eq!(service.config().slot_bytes(), 1024);
+        assert_eq!(service.config().slots_per_stream, 1);
+    }
+
+    #[test]
+    fn try_new_rejects_extreme_capacity_before_allocation() {
+        let stream_error = UploadResponseService::try_new(UploadResponseConfig {
+            num_streams: usize::MAX,
+            ..Default::default()
+        })
+        .err()
+        .expect("extreme stream count must fail");
+        assert!(stream_error.reason.contains("num_streams"));
+        assert!(stream_error.logical_maximum_bytes > MAX_UPLOAD_RESPONSE_LOGICAL_BYTES);
+
+        let arithmetic_overflow = UploadResponseConfig {
+            num_streams: usize::MAX,
+            slot_size_kb: usize::MAX,
+            slots_per_stream: usize::MAX,
+            ..Default::default()
+        };
+        let (overflow_capacity, overflowed) = arithmetic_overflow.capacity_estimate();
+        assert!(overflowed);
+        assert_eq!(overflow_capacity.logical_maximum_bytes, u128::MAX);
+
+        let metadata_error = UploadResponseService::try_new(UploadResponseConfig {
+            num_streams: 4_096,
+            slot_size_kb: 1,
+            slots_per_stream: 512,
+            ..Default::default()
+        })
+        .err()
+        .expect("extreme metadata must fail");
+        assert!(metadata_error.reason.contains("estimated metadata"));
+        assert!(
+            metadata_error.estimated_metadata_bytes > MAX_UPLOAD_RESPONSE_ESTIMATED_METADATA_BYTES
+        );
+
+        let logical_error = UploadResponseService::try_new(UploadResponseConfig {
+            slot_size_kb: (MAX_UPLOAD_RESPONSE_SLOT_BYTES / 1024) as usize,
+            ..Default::default()
+        })
+        .err()
+        .expect("extreme logical capacity must fail");
+        assert!(logical_error.reason.contains("logical maximum"));
+        assert!(logical_error.to_string().contains(&format!(
+            "estimated metadata: {} bytes",
+            logical_error.estimated_metadata_bytes
+        )));
     }
 
     #[tokio::test]

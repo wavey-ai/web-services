@@ -312,25 +312,31 @@ SRT streams write raw bytes directly to the cache with no additional framing. Wo
 use upload_response::{UploadResponseConfig, UploadResponseService};
 
 let config = UploadResponseConfig {
-    num_streams: 100,
-    slot_size_kb: 64,
-    slots_per_stream: 16384,
+    num_streams: 4096,
+    slot_size_kb: 32,
+    slots_per_stream: 16,
     response_timeout_ms: 30000,
 };
 
-let service = UploadResponseService::new(config);
+let capacity = config.validate()?;
+let service = UploadResponseService::try_new(config)?;
 ```
+
+Validation includes the request lane, response lane, and all 16 possible stage lanes. It rejects more than 512 MiB of estimated metadata or 1 TiB of logical payload capacity.
+
+`UploadResponseService::new` remains available as a compatibility wrapper. It panics when capacity validation fails.
 
 ### Slot Size Selection
 
 | Slot Size | Throughput | Use Case |
 | --- | --- | --- |
 | 16 KB | ~1400 MB/s | Many small requests |
-| 64 KB | ~1390 MB/s | Default, good balance |
+| 32 KB | ~1374 MB/s | Default, good balance |
+| 64 KB | ~1390 MB/s | Fewer slots for larger writes |
 | 128-512 KB | ~1410-1430 MB/s | Large uploads |
 | 1+ MB | ~1300 MB/s | Slight performance drop |
 
-`64 KB` is the default because it keeps slot counts manageable while still delivering strong throughput.
+`32 KB` is the default because it limits per-stream payload capacity while retaining strong throughput.
 
 ### Worker Integration
 
