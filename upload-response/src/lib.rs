@@ -34,11 +34,6 @@ use web_service::{
 mod watcher;
 pub use watcher::{ResponseWatcher, ResponseWatcherHandle};
 
-mod archive;
-pub use archive::{
-    ArchiveChunkDescriptor, ArchiveHttpRouter, ArchiveManifest, ArchiveStore, ArchiveStoreError,
-};
-
 mod bridge;
 pub use bridge::{
     build_streaming_response_head, clone_request_head, handler_response_from_cached,
