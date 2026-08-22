@@ -86,6 +86,8 @@ The shared-memory `ChunkCache` and slot-based streaming architecture are inspire
 
 Some protocols require optional crate features such as `srt`, `rist`, `rist-pure`, `webrtc`, or `udp-fec`. The default feature set only enables `tcp`.
 
+WebTransport permits one session on each QUIC connection. Clients open separate connections for concurrent sessions.
+
 `H2H3ServerBuilder::with_max_in_flight_requests` sets one handler limit across HTTP/1.1, HTTP/2, HTTP/3, WebSocket, and raw TCP. The default is 4,096.
 
 Excess HTTP work receives `503` with `Retry-After: 1`. The server does not consume rejected request bodies, which preserves transport flow control.

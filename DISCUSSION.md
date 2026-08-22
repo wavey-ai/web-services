@@ -330,9 +330,11 @@ Shutdown joins the receiver thread and writer task. The writer drains completion
 
 ### Support multiple WebTransport sessions explicitly
 
-The Quinn H3 handler returns after one WebTransport session. That return closes the owning H3 connection.
+Status: implemented as an explicit one-session-per-connection rule.
 
-Confirm whether one session per connection is a product rule. Otherwise, drive session tasks while the connection continues to accept requests.
+`h3-webtransport 0.1.2` transfers the complete H3 connection into one session. The server now advertises one session instead of the previous unsupported value of 100.
+
+Clients open separate QUIC connections for concurrent sessions. Revisit pooling after the upstream session driver supports shared connection ownership.
 
 ## P2 optimization work
 

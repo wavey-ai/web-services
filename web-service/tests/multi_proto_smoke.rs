@@ -370,7 +370,7 @@ async fn run_with_webtransport_server<F, Fut>(
         .await;
 
     let port = pick_localhost_port();
-    let (accepted_tx, accepted_rx) = tokio::sync::mpsc::channel(1);
+    let (accepted_tx, accepted_rx) = tokio::sync::mpsc::channel(2);
     let handle = start_server_with_webtransport(cert_b64, key_b64, port, accepted_tx)
         .await
         .expect("start WebTransport server");
@@ -776,7 +776,7 @@ async fn websocket_works() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn webtransport_bidi_stream_works() {
+async fn concurrent_webtransport_sessions_use_separate_connections() {
     ensure_rustls_provider();
     let (cert_b64, key_b64, host) = match load_test_env() {
         Some(v) => v,
@@ -791,14 +791,18 @@ async fn webtransport_bidi_stream_works() {
         key_b64,
         host.clone(),
         |port, host, mut accepted_rx| async move {
-            let body = webtransport_echo_roundtrip(&cert_b64, &host, port)
-                .await
-                .expect("WebTransport echo roundtrip");
-            assert_eq!(body, b"wt-echo:ping");
-            accepted_rx
-                .recv()
-                .await
-                .expect("WebTransport handler accepted session");
+            let (first, second) = tokio::join!(
+                webtransport_echo_roundtrip(&cert_b64, &host, port),
+                webtransport_echo_roundtrip(&cert_b64, &host, port),
+            );
+            assert_eq!(first.expect("first WebTransport echo"), b"wt-echo:ping");
+            assert_eq!(second.expect("second WebTransport echo"), b"wt-echo:ping");
+            for _ in 0..2 {
+                accepted_rx
+                    .recv()
+                    .await
+                    .expect("WebTransport handler accepted session");
+            }
         },
     )
     .await;

@@ -98,6 +98,8 @@ pub trait StreamWriter: Send + Sync {
 
 #[async_trait]
 pub trait WebTransportHandler: Send + Sync + 'static {
+    /// Handle the only WebTransport session on its owning HTTP/3 connection.
+    /// Clients must open another QUIC connection for another concurrent session.
     async fn handle_session(
         &self,
         session: WebTransportSession<h3_quinn::Connection, Bytes>,

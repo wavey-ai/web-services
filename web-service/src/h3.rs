@@ -30,6 +30,7 @@ const H3_MAX_DATA_CHUNK: usize = 16 * 1024 - 1;
 // Keep request work independently schedulable while bounding the tasks retained by a connection.
 // This matches the QUIC concurrent bidirectional-stream limit configured below.
 const H3_MAX_IN_FLIGHT_REQUESTS: usize = 256;
+const H3_MAX_WEBTRANSPORT_SESSIONS_PER_CONNECTION: u64 = 1;
 
 pub struct Http3Server {
     config: ServerConfig,
@@ -576,7 +577,7 @@ impl Default for Http3Config {
             enable_webtransport: true,
             enable_connect: true,
             enable_datagram: true,
-            max_webtransport_sessions: 100,
+            max_webtransport_sessions: H3_MAX_WEBTRANSPORT_SESSIONS_PER_CONNECTION,
             send_grease: true,
         }
     }
@@ -723,5 +724,13 @@ mod tests {
         assert!(response
             .headers()
             .contains_key("access-control-allow-headers"));
+    }
+
+    #[test]
+    fn webtransport_advertises_one_session_per_connection() {
+        assert_eq!(
+            Http3Config::default().max_webtransport_sessions,
+            H3_MAX_WEBTRANSPORT_SESSIONS_PER_CONNECTION
+        );
     }
 }
