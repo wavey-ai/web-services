@@ -1,6 +1,7 @@
 use crate::{
     config::ServerConfig,
     error::{ServerError, ServerResult},
+    request_limit::RequestLimiter,
     traits::{RawStream, RawTcpHandler, StartupSender},
 };
 use bytes::Bytes;
@@ -86,12 +87,12 @@ where
 pub struct RawTcpServer {
     config: ServerConfig,
     handler: Arc<dyn RawTcpHandler>,
-    request_limit: Arc<Semaphore>,
+    request_limit: Arc<RequestLimiter>,
 }
 
 impl RawTcpServer {
     pub fn new(config: ServerConfig, handler: Arc<dyn RawTcpHandler>) -> Self {
-        let request_limit = Arc::new(Semaphore::new(config.max_in_flight_requests.max(1)));
+        let request_limit = Arc::new(RequestLimiter::new(config.max_in_flight_requests));
         Self {
             config,
             handler,
@@ -102,7 +103,7 @@ impl RawTcpServer {
     pub(crate) fn new_with_request_limit(
         config: ServerConfig,
         handler: Arc<dyn RawTcpHandler>,
-        request_limit: Arc<Semaphore>,
+        request_limit: Arc<RequestLimiter>,
     ) -> Self {
         Self {
             config,

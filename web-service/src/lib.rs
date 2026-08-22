@@ -10,6 +10,7 @@ mod http_range;
 pub mod proxy;
 pub mod quic_relay;
 pub mod raw_tcp;
+mod request_limit;
 pub mod server;
 pub mod tls;
 pub mod traits;

@@ -3,6 +3,7 @@ use crate::{
     error::{H3Error, ServerError, ServerResult},
     h3::{add_cors_preflight_headers, add_cors_response_headers},
     http_range::apply_byte_range,
+    request_limit::{RequestLimiter, RequestPermit},
     traits::{
         response_header_name, response_header_value, BodyStream, HandlerResponse, Router,
         StartupSender, StreamWriter,
@@ -24,7 +25,7 @@ use std::{
 use tempfile::TempDir;
 use tokio::{
     net::UdpSocket,
-    sync::{watch, OwnedSemaphorePermit, Semaphore},
+    sync::{watch, Semaphore},
     task::{JoinError, JoinSet},
 };
 use tokio_quiche::{
@@ -50,12 +51,12 @@ const QPACK_BLOCKED_STREAMS: u64 = 16;
 pub struct TokioQuicheHttp3Server {
     config: ServerConfig,
     router: Arc<dyn Router>,
-    request_limit: Arc<Semaphore>,
+    request_limit: Arc<RequestLimiter>,
 }
 
 impl TokioQuicheHttp3Server {
     pub fn new(config: ServerConfig, router: Arc<dyn Router>) -> Self {
-        let request_limit = Arc::new(Semaphore::new(config.max_in_flight_requests.max(1)));
+        let request_limit = Arc::new(RequestLimiter::new(config.max_in_flight_requests));
         Self {
             config,
             router,
@@ -66,7 +67,7 @@ impl TokioQuicheHttp3Server {
     pub(crate) fn new_with_request_limit(
         config: ServerConfig,
         router: Arc<dyn Router>,
-        request_limit: Arc<Semaphore>,
+        request_limit: Arc<RequestLimiter>,
     ) -> Self {
         Self {
             config,
@@ -271,7 +272,7 @@ fn set_private_permissions(_path: &Path) -> ServerResult<()> {
 async fn serve_connection(
     events: &mut ServerEventStream,
     router: Arc<dyn Router>,
-    request_limit: Arc<Semaphore>,
+    request_limit: Arc<RequestLimiter>,
 ) -> Result<(), H3Error> {
     let mut request_tasks = JoinSet::new();
     loop {
@@ -349,7 +350,7 @@ async fn send_overload_response(incoming: IncomingH3Headers) -> Result<(), H3Err
 async fn handle_request(
     incoming: IncomingH3Headers,
     router: Arc<dyn Router>,
-    _request_permit: OwnedSemaphorePermit,
+    _request_permit: RequestPermit,
 ) -> Result<(), H3Error> {
     let IncomingH3Headers {
         headers,

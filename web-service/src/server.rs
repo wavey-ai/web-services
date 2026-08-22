@@ -6,10 +6,11 @@ use crate::{
     h2::Http2Server,
     h3::Http3Server,
     raw_tcp::RawTcpServer,
+    request_limit::RequestLimiter,
     traits::{HandlerResult, RawTcpHandler, Router, Server, ServerBuilder, ServerHandle},
 };
 use std::{net::IpAddr, sync::Arc};
-use tokio::sync::{oneshot, watch, Semaphore};
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 
 pub struct H2H3Server {
@@ -33,7 +34,7 @@ impl Server for H2H3Server {
 
         let mut tasks = JoinSet::new();
         let mut startups = Vec::new();
-        let request_limit = Arc::new(Semaphore::new(self.config.max_in_flight_requests.max(1)));
+        let request_limit = Arc::new(RequestLimiter::new(self.config.max_in_flight_requests));
 
         // Start Raw TCP server if enabled
         if self.config.enable_raw_tcp {

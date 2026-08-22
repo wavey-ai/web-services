@@ -2,6 +2,7 @@ use crate::{
     config::ServerConfig,
     error::{H3Error, ServerError, ServerResult},
     http_range::apply_byte_range,
+    request_limit::{RequestLimiter, RequestPermit},
     traits::{
         response_header_name, response_header_value, BodyStream, Router, StartupSender,
         StreamWriter,
@@ -18,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
 use tokio::{
-    sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{watch, Mutex, Semaphore},
     task::{JoinError, JoinSet},
     time::{timeout, Duration},
 };
@@ -33,7 +34,7 @@ const H3_MAX_IN_FLIGHT_REQUESTS: usize = 256;
 pub struct Http3Server {
     config: ServerConfig,
     router: Arc<dyn Router>,
-    request_limit: Arc<Semaphore>,
+    request_limit: Arc<RequestLimiter>,
 }
 
 pub struct H3StreamWriter {
@@ -182,7 +183,7 @@ impl StreamWriter for H3SplitStreamWriter {
 
 impl Http3Server {
     pub fn new(config: ServerConfig, router: Arc<dyn Router>) -> Self {
-        let request_limit = Arc::new(Semaphore::new(config.max_in_flight_requests.max(1)));
+        let request_limit = Arc::new(RequestLimiter::new(config.max_in_flight_requests));
         Self {
             config,
             router,
@@ -193,7 +194,7 @@ impl Http3Server {
     pub(crate) fn new_with_request_limit(
         config: ServerConfig,
         router: Arc<dyn Router>,
-        request_limit: Arc<Semaphore>,
+        request_limit: Arc<RequestLimiter>,
     ) -> Self {
         Self {
             config,
@@ -322,7 +323,7 @@ impl Http3Server {
 async fn handle_h3_connection(
     mut conn: Connection<h3_quinn::Connection, Bytes>,
     router: Arc<dyn Router>,
-    request_limit: Arc<Semaphore>,
+    request_limit: Arc<RequestLimiter>,
 ) -> Result<(), H3Error> {
     let mut request_tasks = JoinSet::new();
     loop {
@@ -419,7 +420,7 @@ async fn dispatch_h3_request(
     has_body_stream_handler: bool,
     is_streaming: bool,
     has_body_handler: bool,
-    _request_permit: OwnedSemaphorePermit,
+    _request_permit: RequestPermit,
 ) -> Result<(), H3Error> {
     if has_body_stream_handler {
         handle_h3_body_stream_request(req, stream, router).await

@@ -2,6 +2,7 @@ use crate::{
     config::ServerConfig,
     error::{H2Error, ServerError, ServerResult},
     http_range::apply_byte_range,
+    request_limit::{RequestLimiter, RequestPermit},
     traits::{
         response_header_name, response_header_value, BodyStream, HandlerResponse, Router,
         StartupSender, StreamWriter,
@@ -68,7 +69,7 @@ impl VerifiedClientCertificate {
 pub struct Http2Server {
     config: ServerConfig,
     router: Arc<dyn Router>,
-    request_limit: Arc<Semaphore>,
+    request_limit: Arc<RequestLimiter>,
 }
 
 type H2ResponseBody = BoxBody<Bytes, Infallible>;
@@ -131,7 +132,7 @@ impl StreamWriter for H2StreamWriter {
 
 impl Http2Server {
     pub fn new(config: ServerConfig, router: Arc<dyn Router>) -> Self {
-        let request_limit = Arc::new(Semaphore::new(config.max_in_flight_requests.max(1)));
+        let request_limit = Arc::new(RequestLimiter::new(config.max_in_flight_requests));
         Self {
             config,
             router,
@@ -142,7 +143,7 @@ impl Http2Server {
     pub(crate) fn new_with_request_limit(
         config: ServerConfig,
         router: Arc<dyn Router>,
-        request_limit: Arc<Semaphore>,
+        request_limit: Arc<RequestLimiter>,
     ) -> Self {
         Self {
             config,
@@ -384,7 +385,7 @@ async fn handle_h2_request(
     req: http::Request<Incoming>,
     router: Arc<dyn Router>,
     enable_websocket: bool,
-    request_permit: OwnedSemaphorePermit,
+    request_permit: RequestPermit,
     connection_permit: ConnectionPermitSlot,
     detached_tasks: TaskTracker,
     detached_shutdown: CancellationToken,
@@ -551,7 +552,7 @@ fn incoming_body_stream(body: Incoming) -> BodyStream {
 async fn handle_h2_stream(
     req: http::Request<()>,
     router: Arc<dyn Router>,
-    request_permit: OwnedSemaphorePermit,
+    request_permit: RequestPermit,
     detached_tasks: TaskTracker,
     detached_shutdown: CancellationToken,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
@@ -586,7 +587,7 @@ async fn handle_h2_body_stream(
     req: http::Request<()>,
     body: BodyStream,
     router: Arc<dyn Router>,
-    request_permit: OwnedSemaphorePermit,
+    request_permit: RequestPermit,
     detached_tasks: TaskTracker,
     detached_shutdown: CancellationToken,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
