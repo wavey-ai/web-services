@@ -545,6 +545,20 @@ cargo check -p av-upload-response --features rist-pure
 
 ## Ongoing and historical test results
 
+### London saturation soak, August 22, 2026
+
+A four-vCPU Google Cloud server sustained a one-hour H3 test after ten warmup minutes. The load generator ran on a separate eight-vCPU host.
+
+The long run used revision `782f466`. Short H1, H2, and H3 regressions covered the request-limiting changes through `4564584`.
+
+| Requests | Errors | Rate | Payload rate | Wire rate | Mean p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 269,074,634 | 0 | 74,734/s | 3.444 Gbit/s | 3.644 Gbit/s | 31.98 ms |
+
+RSS remained between 19.16 MiB and 20.61 MiB. The process retained five threads and 11 file descriptors throughout the measured hour.
+
+This static test passed. The mixed upload, worker, stage, cancellation, and hostile RIST soak remains a production gate.
+
 ### HTTP/3 capacity investigation
 
 Persistent HTTP/3 is still the production target for low-latency delivery. In

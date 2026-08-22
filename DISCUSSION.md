@@ -132,6 +132,42 @@ The complete client and server process used 55.4 MB maximum RSS. It used 5.52 CP
 
 This memory value includes clients, TLS, runtimes, and the server. It is not a server-only measurement.
 
+### Google Cloud two-host saturation
+
+The server used four `n2-highcpu` vCPUs in London. The load generator used eight `c4-highcpu` vCPUs in the same zone.
+
+The measured path had 0.278 ms ICMP RTT. Each static H3 response contained 5,760 bytes.
+
+After ten warmup minutes, 32 connections with eight requests each ran for one hour.
+
+The long run used revision `782f466`. Short saturation regressions covered the request-limiting changes through `4564584`.
+
+| Requests | Errors | Rate | Payload | Observed wire rate | Mean sampled p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 269,074,634 | 0 | 74,734 requests/s | 3.444 Gbit/s | 3.644 Gbit/s | 31.98 ms |
+
+The twelve five-minute segments ranged from 73,675 to 76,232 requests/s. Their sampled p99 values remained below 32.55 ms.
+
+Server CPU averaged 376.85% of four vCPUs. RSS started at 19.16 MiB, ended at 20.40 MiB, and never exceeded 20.61 MiB.
+
+The process retained five threads and 11 file descriptors throughout the measured hour. No request or byte errors occurred.
+
+This static test found no unbounded resource growth. It does not replace the mixed upload, worker, stage, cancellation, and RIST soak.
+
+An immediate three-build A/B measured the global request limiter overhead:
+
+| Build | HTTP/2 | HTTP/1.1 | Failures |
+| --- | ---: | ---: | ---: |
+| Before global limiting, `782f466` | 128,293 requests/s | 137,968 requests/s | 0 |
+| Tokio semaphore, `9735467` | 121,882 requests/s | 134,524 requests/s | 0 |
+| Atomic limiter, `4564584` | 125,918 requests/s | 136,087 requests/s | 0 |
+
+The atomic limiter recovered 3.31% on HTTP/2 and 1.16% on HTTP/1.1 relative to the semaphore build.
+
+It remained 1.85% and 1.36% below the unlimited build. This is the measured cost of an exact shared limit under saturation.
+
+Warm H3 runs varied from 72,599 to 75,599 requests/s across these builds. That variance exceeded any limiter effect.
+
 ### Proxy request writes
 
 The test used 64 clients, 63 backend workers, and 65,536-byte request bodies.
@@ -223,7 +259,7 @@ Recommended implementation:
 
 ### P0: Complete a production soak test
 
-Status: running a static H3 saturation soak. The mixed upload, worker, stage, and RIST workload remains required.
+Status: the static one-hour H3 saturation soak passed. The mixed upload, worker, stage, and RIST workload remains required.
 
 Run the test for at least one hour after a ten-minute warmup. Use twice the expected steady connection count.
 
@@ -235,7 +271,7 @@ Fail the test after any byte mismatch or stale-slot access. Also fail if RSS, ta
 
 ## Dependency advisories
 
-GitHub currently reports seven open Dependabot alerts. They include two critical, one high, one medium, and three low alerts.
+GitHub currently reports six open Dependabot alerts. They include two critical, one high, one medium, and two low alerts.
 
 The critical alerts affect `failure 0.1.8` through `xmpegts` and `bytesio`. The flaw requires a hostile in-process `Fail` implementation.
 
@@ -245,7 +281,7 @@ The high alert affects `rustls-webpki 0.101.7`. Its malformed-CRL panic requires
 
 The medium alert affects `opentelemetry_sdk 0.31.0` through `tokio-quiche`. This code does not install its vulnerable baggage propagator.
 
-The remaining low alerts affect legacy certificate name constraints and `atty`. These findings do not change the controlled saturation test.
+The two low alerts affect legacy certificate name constraints. These findings do not change the controlled saturation test.
 
 Recommended implementation:
 
