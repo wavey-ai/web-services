@@ -2,11 +2,13 @@ use crate::{ResponseResult, UploadResponseService, UploadStream};
 use bytes::BytesMut;
 use http_pack::stream::{StreamHeaders, StreamRequestHeaders};
 use http_pack::{HeaderField, HttpVersion};
+use mio::event::Source;
+use mio::{Events, Interest, Poll, Registry, Token, Waker};
 use rist_core_pure::packet::gre::GreKeepalive;
 use rist_core_pure::packet::rtcp::NackMode;
 use rist_core_pure::time::ntp_now;
 use rist_core_pure::{OrderedPayloadBuffer, ReceivedPayload};
-use rist_mio_pure::{MainMioReceiver, SimpleMioReceiver};
+use rist_mio_pure::{MainMioReceiver, MainReceiverEvent, SimpleMioReceiver};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -27,6 +29,8 @@ const DEFAULT_INGRESS_QUEUE_PACKETS: usize = 16_384;
 const DEFAULT_SOCKET_RECEIVE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REORDERED_PACKETS: usize = 16_384;
 const RIST_KEEPALIVE_ID: [u8; 6] = [0x02, 0x57, 0x41, 0x56, 0x45, 0x59];
+const RIST_SOCKET_TOKEN: Token = Token(0);
+const RIST_SHUTDOWN_TOKEN: Token = Token(1);
 
 /// Point-in-time counters for the bounded RIST receive-to-writer handoff.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -211,6 +215,12 @@ enum Receiver {
     Main(Box<MainMioReceiver>),
 }
 
+enum ReceiverRead {
+    Payload(SocketAddr, ReceivedPayload),
+    Control,
+    Empty,
+}
+
 impl Receiver {
     fn bind(profile: PureRistProfile, addr: SocketAddr, flow_id: u32) -> io::Result<Self> {
         match profile {
@@ -227,13 +237,19 @@ impl Receiver {
         }
     }
 
-    fn try_recv_payload(
-        &mut self,
-        buf: &mut [u8],
-    ) -> io::Result<Option<(SocketAddr, ReceivedPayload)>> {
+    fn try_recv(&mut self, buf: &mut [u8]) -> io::Result<ReceiverRead> {
         match self {
-            Self::Simple(receiver) => receiver.try_recv_payload(buf),
-            Self::Main(receiver) => receiver.try_recv_payload(buf),
+            Self::Simple(receiver) => Ok(match receiver.try_recv_payload(buf)? {
+                Some((peer, payload)) => ReceiverRead::Payload(peer, payload),
+                None => ReceiverRead::Empty,
+            }),
+            Self::Main(receiver) => Ok(match receiver.try_recv_event(buf)? {
+                Some(MainReceiverEvent::Payload { from, payload }) => {
+                    ReceiverRead::Payload(from, payload)
+                }
+                Some(_) => ReceiverRead::Control,
+                None => ReceiverRead::Empty,
+            }),
         }
     }
 
@@ -278,6 +294,39 @@ impl Receiver {
                 let send = receiver.socket_buffer_sizes()?.send;
                 Ok(receiver.set_socket_buffer_sizes(receive, send)?.receive)
             }
+        }
+    }
+}
+
+impl Source for Receiver {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        match self {
+            Self::Simple(receiver) => receiver.register(registry, token, interests),
+            Self::Main(receiver) => receiver.register(registry, token, interests),
+        }
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        match self {
+            Self::Simple(receiver) => receiver.reregister(registry, token, interests),
+            Self::Main(receiver) => receiver.reregister(registry, token, interests),
+        }
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        match self {
+            Self::Simple(receiver) => receiver.deregister(registry),
+            Self::Main(receiver) => receiver.deregister(registry),
         }
     }
 }
@@ -403,7 +452,7 @@ impl<A: PureRistAuth> PureRistIngest<A> {
         let ingress_queue_packets = self.ingress_queue_packets;
         let socket_receive_buffer_bytes = self.socket_receive_buffer_bytes;
         let stats = self.stats;
-        let receiver = Receiver::bind(profile, addr, flow_id)?;
+        let mut receiver = Receiver::bind(profile, addr, flow_id)?;
         let effective_socket_receive_buffer_bytes = receiver
             .set_socket_receive_buffer_size(socket_receive_buffer_bytes)
             .or_else(|error| {
@@ -439,7 +488,13 @@ impl<A: PureRistAuth> PureRistIngest<A> {
         }
 
         let receiver_stop = Arc::new(AtomicBool::new(false));
+        let receiver_poll = Poll::new()?;
+        receiver_poll
+            .registry()
+            .register(&mut receiver, RIST_SOCKET_TOKEN, Interest::READABLE)?;
+        let receiver_waker = Arc::new(Waker::new(receiver_poll.registry(), RIST_SHUTDOWN_TOKEN)?);
         let receiver_thread_stop = Arc::clone(&receiver_stop);
+        let receiver_thread_waker = Arc::clone(&receiver_waker);
         let receiver_stats = Arc::clone(&stats);
         let receiver_thread_name = format!("pure-rist-recv-{}", addr.port());
         let receiver_thread =
@@ -448,6 +503,7 @@ impl<A: PureRistAuth> PureRistIngest<A> {
                 .spawn(move || {
                     run_receiver(
                         receiver,
+                        receiver_poll,
                         auth,
                         ingress_tx,
                         receiver_stats,
@@ -471,6 +527,9 @@ impl<A: PureRistAuth> PureRistIngest<A> {
         tokio::spawn(async move {
             let _ = shutdown_rx.changed().await;
             receiver_stop.store(true, Ordering::Release);
+            if let Err(error) = receiver_thread_waker.wake() {
+                debug!(%error, "failed to wake pure Rust RIST receiver for shutdown");
+            }
             match tokio::task::spawn_blocking(move || receiver_thread.join()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => warn!("pure Rust RIST receiver thread panicked"),
@@ -487,6 +546,7 @@ impl<A: PureRistAuth> PureRistIngest<A> {
 
 fn run_receiver<A: PureRistAuth>(
     mut receiver: Receiver,
+    mut receiver_poll: Poll,
     auth: Arc<A>,
     ingress_tx: mpsc::Sender<RistIngressPacket>,
     stats: Arc<PureRistIngestStats>,
@@ -495,6 +555,7 @@ fn run_receiver<A: PureRistAuth>(
     stats.receiver_active.store(1, Ordering::Relaxed);
     stats.receiver_state.store(1, Ordering::Relaxed);
     let mut buf = vec![0u8; 65_536];
+    let mut events = Events::with_capacity(2);
     let mut last_rtcp = Instant::now();
 
     while !stop.load(Ordering::Acquire) {
@@ -531,7 +592,18 @@ fn run_receiver<A: PureRistAuth>(
 
         if drained == 0 {
             stats.receiver_state.store(3, Ordering::Relaxed);
-            thread::sleep(DEFAULT_POLL_INTERVAL);
+            let poll_timeout = DEFAULT_RTCP_INTERVAL
+                .saturating_sub(Instant::now().saturating_duration_since(last_rtcp));
+            match receiver_poll.poll(&mut events, Some(poll_timeout)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    stats.receive_errors.fetch_add(1, Ordering::Relaxed);
+                    stats.receiver_exit_reason.store(3, Ordering::Relaxed);
+                    error!(%error, "pure Rust RIST readiness poll failed");
+                    break;
+                }
+            }
             stats.receiver_state.store(1, Ordering::Relaxed);
         } else if drained == 128 {
             thread::yield_now();
@@ -555,10 +627,20 @@ fn drain_receiver<A: PureRistAuth>(
 ) -> Option<usize> {
     let mut drained = 0;
     for _ in 0..128 {
-        let received = match receiver.try_recv_payload(buf) {
-            Ok(Some(received)) => received,
-            Ok(None) => break,
+        let received = match receiver.try_recv(buf) {
+            Ok(ReceiverRead::Payload(peer, payload)) => (peer, payload),
+            Ok(ReceiverRead::Control) => {
+                drained += 1;
+                continue;
+            }
+            Ok(ReceiverRead::Empty) => break,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                drained += 1;
+                stats.receive_errors.fetch_add(1, Ordering::Relaxed);
+                debug!(error = %error, "invalid pure Rust RIST datagram discarded");
+                continue;
+            }
             Err(error) => {
                 stats.receive_errors.fetch_add(1, Ordering::Relaxed);
                 error!(error = %error, "pure Rust RIST receive failed");

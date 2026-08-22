@@ -17,7 +17,7 @@ The two code security gates are implemented. The production soak test remains op
 | Component | Reviewed revision |
 | --- | --- |
 | `playlists` | `c5bb8856` |
-| `rist-rs` | `44f7d430` |
+| `rist-rs` | `faac3923` |
 | `web-services` | This change set after `066bf4b` |
 
 The `rist-rs` revision is the current upstream `main` revision. Crates.io also reports `wavey-rist 0.1.0` and `rist-sys 0.1.1` as current.
@@ -155,6 +155,8 @@ The upstream CPU defect created a new session and two 8,192-entry loss trackers 
 
 Revision `44f7d430` creates state only for a new peer or flow. It also skips loss scans when no packet is missing.
 
+Revision `faac3923` exposes Mio readiness for Simple and Main Profile receiver payload sockets.
+
 ## CPU and memory interpretation
 
 The chunk rings retain `Bytes` values. A write normally replaces one pointer-backed value and does not copy its complete payload.
@@ -167,7 +169,9 @@ This logical total is not immediate RSS. However, a valid workload can fill it, 
 
 The principal CPU costs are manifest rendering, TLS, proxy hashing, and shared hot-stream contention. Periodic one-millisecond polling is no longer used in HLS or proxy workers.
 
-The pure RIST receiver still polls an idle nonblocking socket each millisecond. That loop can cause approximately 1,000 idle wakeups each second.
+The pure RIST receiver now blocks on socket readiness. RTCP deadlines cause at most 50 idle timer wakeups each second.
+
+An explicit Mio wake stops the receiver promptly during shutdown.
 
 ## Production gates
 
@@ -310,9 +314,11 @@ Writers continue to use service methods, which enforce lifecycle locks and respo
 
 ### Replace the RIST idle poll
 
-Expose socket readiness from `rist-mio`, or add a blocking poll method with an RTCP deadline.
+Status: implemented in `rist-rs` revision `faac3923` and this service.
 
-Wake the receiver thread for socket input, keepalive work, or shutdown. Keep the bounded channel and current overflow metrics.
+Simple and Main Profile receivers now implement Mio `Source`. The ingest thread blocks until payload readiness, its RTCP deadline, or shutdown.
+
+The bounded handoff channel and its overflow metrics remain unchanged.
 
 ### Supervise completion tasks
 

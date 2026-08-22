@@ -445,14 +445,15 @@ dependencies = [
  "hyper-util",
  "matchbox_signaling",
  "matchbox_socket",
+ "mio",
  "playlists",
  "portpicker",
  "quinn",
  "raptorq-datagram-fec",
  "rcgen",
  "reqwest",
- "rist-core 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=44f7d4305683f235feb4101f1f0c4ad1526a8892)",
- "rist-mio 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=44f7d4305683f235feb4101f1f0c4ad1526a8892)",
+ "rist-core 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=faac39232e67d3b2ef331925a132350997c7f36e)",
+ "rist-mio 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=faac39232e67d3b2ef331925a132350997c7f36e)",
  "rustls 0.23.42",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
@@ -4222,7 +4223,7 @@ dependencies = [
 [[package]]
 name = "rist-core"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/rist-rs.git?rev=44f7d4305683f235feb4101f1f0c4ad1526a8892#44f7d4305683f235feb4101f1f0c4ad1526a8892"
+source = "git+https://github.com/wavey-ai/rist-rs.git?rev=faac39232e67d3b2ef331925a132350997c7f36e#faac39232e67d3b2ef331925a132350997c7f36e"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4252,12 +4253,12 @@ dependencies = [
 [[package]]
 name = "rist-mio"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/rist-rs.git?rev=44f7d4305683f235feb4101f1f0c4ad1526a8892#44f7d4305683f235feb4101f1f0c4ad1526a8892"
+source = "git+https://github.com/wavey-ai/rist-rs.git?rev=faac39232e67d3b2ef331925a132350997c7f36e#faac39232e67d3b2ef331925a132350997c7f36e"
 dependencies = [
  "libc",
  "mio",
  "nix 0.29.0",
- "rist-core 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=44f7d4305683f235feb4101f1f0c4ad1526a8892)",
+ "rist-core 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=faac39232e67d3b2ef331925a132350997c7f36e)",
  "socket2 0.6.5",
 ]
 

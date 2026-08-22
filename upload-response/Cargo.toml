@@ -13,7 +13,7 @@ name = "upload_response"
 default = ["tcp"]
 srt = ["dep:srt"]
 rist = ["dep:rist"]
-rist-pure = ["dep:rist-core-pure", "dep:rist-mio-pure"]
+rist-pure = ["dep:rist-core-pure", "dep:rist-mio-pure", "dep:mio"]
 webrtc = ["dep:matchbox_socket", "dep:futures-timer", "dep:futures"]
 tcp = []
 udp-fec = ["dep:raptorq-datagram-fec", "raptorq-datagram-fec/udp"]
@@ -42,8 +42,9 @@ subtle = "2.6"
 srt = { package = "wavey-srt", version = "0.1.0", features = ["async"], optional = true }
 raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git", package = "raptorq-datagram-fec", default-features = false, optional = true }
 rist = { package = "wavey-rist", version = "0.1.0", features = ["tokio"], optional = true }
-rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", rev = "44f7d4305683f235feb4101f1f0c4ad1526a8892", optional = true }
-rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", rev = "44f7d4305683f235feb4101f1f0c4ad1526a8892", optional = true }
+rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", rev = "faac39232e67d3b2ef331925a132350997c7f36e", optional = true }
+rist-mio-pure = { package = "rist-mio", git = "https://github.com/wavey-ai/rist-rs.git", rev = "faac39232e67d3b2ef331925a132350997c7f36e", optional = true }
+mio = { version = "1", features = ["os-poll"], optional = true }
 
 # WebRTC Data Channels (optional)
 matchbox_socket = { version = "0.13.0", optional = true }
