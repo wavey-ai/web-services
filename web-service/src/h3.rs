@@ -2,7 +2,10 @@ use crate::{
     config::ServerConfig,
     error::{H3Error, ServerError, ServerResult},
     http_range::apply_byte_range,
-    traits::{response_header_name, response_header_value, BodyStream, Router, StreamWriter},
+    traits::{
+        response_header_name, response_header_value, BodyStream, Router, StartupSender,
+        StreamWriter,
+    },
 };
 use bytes::{Buf, Bytes};
 use futures_util::stream::unfold;
@@ -15,8 +18,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
 use tokio::{
-    sync::{watch, Mutex},
+    sync::{watch, Mutex, Semaphore},
     task::{JoinError, JoinSet},
+    time::{timeout, Duration},
 };
 
 // Stay below the 16,384-byte QUIC varint boundary to avoid 4-byte length encodings.
@@ -180,53 +184,113 @@ impl Http3Server {
         Self { config, router }
     }
 
-    pub async fn start(&self, mut shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
-        let certs = load_certs_from_base64(&self.config.cert_pem_base64)
-            .map_err(|e| ServerError::Tls(e.to_string()))?;
-        let key = load_keys_from_base64(&self.config.privkey_pem_base64)
-            .map_err(|e| ServerError::Tls(e.to_string()))?;
+    pub async fn start(&self, shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
+        self.run(shutdown_rx, None).await
+    }
 
-        let mut tls_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| ServerError::Tls(e.to_string()))?;
+    pub(crate) async fn start_with_ready(
+        &self,
+        shutdown_rx: watch::Receiver<()>,
+        startup_tx: StartupSender,
+    ) -> ServerResult<()> {
+        self.run(shutdown_rx, Some(startup_tx)).await
+    }
 
-        tls_config.max_early_data_size = u32::MAX;
-        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+    async fn run(
+        &self,
+        mut shutdown_rx: watch::Receiver<()>,
+        startup_tx: Option<StartupSender>,
+    ) -> ServerResult<()> {
+        let startup: ServerResult<_> = (|| {
+            let certs = load_certs_from_base64(&self.config.cert_pem_base64)
+                .map_err(|e| ServerError::Tls(e.to_string()))?;
+            let key = load_keys_from_base64(&self.config.privkey_pem_base64)
+                .map_err(|e| ServerError::Tls(e.to_string()))?;
 
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-            QuicServerConfig::try_from(tls_config).map_err(|e| ServerError::Tls(e.to_string()))?,
-        ));
-        server_config.transport_config(Arc::new(build_quic_transport_config()));
+            let mut tls_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| ServerError::Tls(e.to_string()))?;
 
-        let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.config.port);
-        let endpoint = quinn::Endpoint::server(server_config, addr)
-            .map_err(|e| ServerError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            tls_config.max_early_data_size = u32::MAX;
+            tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+            let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+                QuicServerConfig::try_from(tls_config)
+                    .map_err(|e| ServerError::Tls(e.to_string()))?,
+            ));
+            server_config.transport_config(Arc::new(build_quic_transport_config()));
+
+            let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.config.port);
+            let endpoint = quinn::Endpoint::server(server_config, addr)
+                .map_err(|e| ServerError::Io(std::io::Error::other(e)))?;
+            Ok(endpoint)
+        })();
+        let endpoint = match startup {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                if let Some(startup_tx) = startup_tx {
+                    let _ = startup_tx.send(Err(error.to_string()));
+                }
+                return Err(error);
+            }
+        };
+        if let Some(startup_tx) = startup_tx {
+            let _ = startup_tx.send(Ok(()));
+        }
 
         let router = Arc::clone(&self.router);
+        let connection_limit = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
+        let handshake_timeout = Duration::from_millis(self.config.handshake_timeout_ms.max(1));
+        let mut connection_tasks = JoinSet::new();
 
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
+                Some(result) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                    if let Err(error) = result {
+                        tracing::error!(%error, "HTTP/3 connection task failed");
+                    }
+                }
                 res = endpoint.accept() => {
                     if let Some(new_conn) = res {
+                        let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
+                            tracing::debug!("HTTP/3 connection limit reached");
+                            continue;
+                        };
                         let router = Arc::clone(&router);
                         let config = self.config.clone();
-                        tokio::spawn(async move {
-                            if let Ok(conn) = new_conn.await {
-                                let h3_config = Http3Config::from_server_config(&config);
-                                let builder = configure_h3_connection(h3::server::builder(), &h3_config);
-                                if let Ok(h3_conn) = builder.build(h3_quinn::Connection::new(conn)).await {
+                        connection_tasks.spawn(async move {
+                            let _connection_permit = connection_permit;
+                            let conn = match timeout(handshake_timeout, new_conn).await {
+                                Ok(Ok(conn)) => conn,
+                                Ok(Err(error)) => {
+                                    tracing::debug!(%error, "QUIC handshake failed");
+                                    return;
+                                }
+                                Err(_) => {
+                                    tracing::debug!("QUIC handshake timed out");
+                                    return;
+                                }
+                            };
+                            let h3_config = Http3Config::from_server_config(&config);
+                            let builder = configure_h3_connection(h3::server::builder(), &h3_config);
+                            match builder.build(h3_quinn::Connection::new(conn)).await {
+                                Ok(h3_conn) => {
                                     if let Err(e) = handle_h3_connection(h3_conn, router).await {
                                         tracing::error!("Failed to handle HTTP/3 connection: {}", e);
                                     }
                                 }
+                                Err(error) => tracing::debug!(%error, "HTTP/3 handshake failed"),
                             }
                         });
                     }
                 }
             }
         }
+
+        endpoint.close(0u32.into(), b"server shutdown");
+        connection_tasks.shutdown().await;
 
         Ok(())
     }
@@ -254,7 +318,7 @@ async fn handle_h3_connection(
                     let (req, stream) = resolved
                         .map_err(|e| H3Error::Transport(e.to_string()))?;
                     let ext = req.extensions();
-                    if req.method() == &Method::CONNECT
+                    if req.method() == Method::CONNECT
                         && ext.get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT)
                     {
                         if let Some(handler) = router.webtransport_handler() {
@@ -407,7 +471,7 @@ async fn handle_h3_request(
         let mut guard = shared_stream.lock().await;
         return send_h3_response(
             apply_byte_range(range_header.as_ref(), handler_response),
-            &mut *guard,
+            &mut guard,
             is_preflight,
         )
         .await;

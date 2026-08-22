@@ -3,7 +3,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use http::{Method, Request, StatusCode};
-use playlists::{chunk_cache::ChunkCache, Options as CacheOptions};
+use playlists::{
+    chunk_cache::{ChunkCache, StreamHandle},
+    Options as CacheOptions,
+};
 use rist_core_pure::{packet::rtcp::NackMode, time::ntp_now, ReceivedPayload};
 use rist_mio_pure::{MainMioReceiver, SimpleMioReceiver};
 use serde::Serialize;
@@ -196,8 +199,8 @@ fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
 }
 
 enum Receiver {
-    Simple(SimpleMioReceiver),
-    Main(MainMioReceiver),
+    Simple(Box<SimpleMioReceiver>),
+    Main(Box<MainMioReceiver>),
 }
 
 impl Receiver {
@@ -205,10 +208,12 @@ impl Receiver {
         match profile {
             RistProfile::Simple => {
                 SimpleMioReceiver::bind(addr, flow_id, "obs-rist-llhls", NackMode::Range)
+                    .map(Box::new)
                     .map(Self::Simple)
             }
             RistProfile::Main => {
                 MainMioReceiver::bind(addr, flow_id, "obs-rist-llhls", NackMode::Range)
+                    .map(Box::new)
                     .map(Self::Main)
             }
         }
@@ -293,7 +298,7 @@ async fn run_rist_receiver(
 struct TsHlsCache {
     chunk_cache: Arc<ChunkCache>,
     stream_id: u64,
-    stream_idx: usize,
+    stream_handle: StreamHandle,
     part_target: Duration,
     parts_per_segment: usize,
     window_parts: usize,
@@ -309,17 +314,19 @@ impl TsHlsCache {
         window_parts: usize,
         slot_kb: usize,
     ) -> Arc<Self> {
-        let mut options = CacheOptions::default();
-        options.num_playlists = 1;
-        options.max_segments = 1;
-        options.max_parts_per_segment = window_parts.saturating_mul(2).max(8);
-        options.buffer_size_kb = slot_kb;
+        let options = CacheOptions {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: window_parts.saturating_mul(2).max(8),
+            buffer_size_kb: slot_kb,
+            ..CacheOptions::default()
+        };
         let chunk_cache = Arc::new(ChunkCache::new(options));
-        let stream_idx = chunk_cache.get_or_create_stream_idx(stream_id).await;
+        let stream_handle = chunk_cache.resolve_or_create_stream(stream_id).await;
         Arc::new(Self {
             chunk_cache,
             stream_id,
-            stream_idx,
+            stream_handle,
             part_target,
             parts_per_segment,
             window_parts,
@@ -385,8 +392,8 @@ impl TsHlsCache {
 
     async fn commit_part(&self, part: PendingPart) -> Result<()> {
         self.chunk_cache
-            .add(
-                self.stream_idx,
+            .add_for_handle(
+                self.stream_handle,
                 part.meta.seq as usize,
                 Bytes::from(part.data),
             )
@@ -470,7 +477,10 @@ impl TsHlsCache {
             };
 
             if known {
-                return self.chunk_cache.get(self.stream_idx, seq as usize).await;
+                return self
+                    .chunk_cache
+                    .get_for_handle(self.stream_handle, seq as usize)
+                    .await;
             }
             if too_old || too_far || Instant::now() >= deadline {
                 return None;

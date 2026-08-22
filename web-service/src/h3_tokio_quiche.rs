@@ -5,7 +5,7 @@ use crate::{
     http_range::apply_byte_range,
     traits::{
         response_header_name, response_header_value, BodyStream, HandlerResponse, Router,
-        StreamWriter,
+        StartupSender, StreamWriter,
     },
 };
 use base64::{engine::general_purpose::STANDARD as base64_engine, Engine as _};
@@ -24,7 +24,7 @@ use std::{
 use tempfile::TempDir;
 use tokio::{
     net::UdpSocket,
-    sync::watch,
+    sync::{watch, Semaphore},
     task::{JoinError, JoinSet},
 };
 use tokio_quiche::{
@@ -57,53 +57,104 @@ impl TokioQuicheHttp3Server {
         Self { config, router }
     }
 
-    pub async fn start(&self, mut shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
-        if self.config.enable_webtransport {
-            return Err(ServerError::Config(
-                "tokio-quiche H3 backend does not yet provide web-service WebTransport sessions"
-                    .into(),
-            ));
-        }
+    pub async fn start(&self, shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
+        self.run(shutdown_rx, None).await
+    }
 
-        let tls_files = MaterializedTls::new(&self.config)?;
-        let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.config.port);
-        let socket = UdpSocket::bind(addr).await?;
+    pub(crate) async fn start_with_ready(
+        &self,
+        shutdown_rx: watch::Receiver<()>,
+        startup_tx: StartupSender,
+    ) -> ServerResult<()> {
+        self.run(shutdown_rx, Some(startup_tx)).await
+    }
 
-        let quic = quic_settings();
+    async fn run(
+        &self,
+        mut shutdown_rx: watch::Receiver<()>,
+        startup_tx: Option<StartupSender>,
+    ) -> ServerResult<()> {
+        let startup = async {
+            if self.config.enable_webtransport {
+                return Err(ServerError::Config(
+                    "tokio-quiche H3 backend does not yet provide web-service WebTransport sessions"
+                        .into(),
+                ));
+            }
 
-        let cert_path = tls_files.path_string(&tls_files.cert_path)?;
-        let key_path = tls_files.path_string(&tls_files.key_path)?;
-        let params = ConnectionParams::new_server(
-            quic,
-            TlsCertificatePaths {
-                cert: &cert_path,
-                private_key: &key_path,
-                kind: CertificateKind::X509,
-            },
-            Hooks::default(),
-        );
-        let mut listeners =
-            tokio_quiche::listen([socket], params, DefaultMetrics).map_err(ServerError::Io)?;
+            let tls_files = MaterializedTls::new(&self.config)?;
+            let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.config.port);
+            let socket = UdpSocket::bind(addr).await?;
+
+            let quic = quic_settings(
+                self.config.handshake_timeout_ms,
+                self.config.max_connections,
+            );
+            let cert_path = tls_files.path_string(&tls_files.cert_path)?;
+            let key_path = tls_files.path_string(&tls_files.key_path)?;
+            let params = ConnectionParams::new_server(
+                quic,
+                TlsCertificatePaths {
+                    cert: &cert_path,
+                    private_key: &key_path,
+                    kind: CertificateKind::X509,
+                },
+                Hooks::default(),
+            );
+            let listeners =
+                tokio_quiche::listen([socket], params, DefaultMetrics).map_err(ServerError::Io)?;
+            if listeners.is_empty() {
+                return Err(ServerError::Config(
+                    "tokio-quiche created no UDP listener".into(),
+                ));
+            }
+            Ok((tls_files, listeners))
+        };
+        let (tls_files, mut listeners) = match startup.await {
+            Ok(startup) => startup,
+            Err(error) => {
+                if let Some(startup_tx) = startup_tx {
+                    let _ = startup_tx.send(Err(error.to_string()));
+                }
+                return Err(error);
+            }
+        };
         let accepted = listeners
             .first_mut()
-            .ok_or_else(|| ServerError::Config("tokio-quiche created no UDP listener".into()))?;
+            .expect("tokio-quiche listener list was checked during startup");
+        if let Some(startup_tx) = startup_tx {
+            let _ = startup_tx.send(Ok(()));
+        }
+
+        let connection_limit = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
+        let mut connection_tasks = JoinSet::new();
 
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
+                Some(result) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                    if let Err(error) = result {
+                        tracing::warn!(backend = "tokio-quiche", %error, "H3 connection task failed");
+                    }
+                }
                 connection = accepted.next() => {
                     let Some(connection) = connection else { break };
                     match connection {
                         Ok(connection) => {
+                            let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
+                                tracing::debug!(backend = "tokio-quiche", "H3 connection limit reached");
+                                continue;
+                            };
                             let h3_settings = Http3Settings {
                                 qpack_max_table_capacity: Some(QPACK_TABLE_BYTES),
                                 qpack_blocked_streams: Some(QPACK_BLOCKED_STREAMS),
                                 ..Http3Settings::default()
                             };
                             let (driver, mut controller) = ServerH3Driver::new(h3_settings);
-                            connection.start(driver);
                             let router = Arc::clone(&self.router);
-                            tokio::spawn(async move {
+                            connection_tasks.spawn(async move {
+                                let _connection_permit = connection_permit;
+                                let _connection = connection.start(driver);
                                 if let Err(error) = serve_connection(
                                     controller.event_receiver_mut(),
                                     router,
@@ -120,12 +171,13 @@ impl TokioQuicheHttp3Server {
             }
         }
 
+        connection_tasks.shutdown().await;
         drop(tls_files);
         Ok(())
     }
 }
 
-fn quic_settings() -> QuicSettings {
+fn quic_settings(handshake_timeout_ms: u64, max_connections: usize) -> QuicSettings {
     let mut quic = QuicSettings::default();
     quic.disable_client_ip_validation = true;
     quic.enable_dgram = false;
@@ -140,6 +192,10 @@ fn quic_settings() -> QuicSettings {
     quic.max_recv_udp_payload_size = MAX_UDP_PAYLOAD_BYTES;
     quic.max_send_udp_payload_size = MAX_UDP_PAYLOAD_BYTES;
     quic.discover_path_mtu = true;
+    quic.handshake_timeout = Some(std::time::Duration::from_millis(
+        handshake_timeout_ms.max(1),
+    ));
+    quic.listen_backlog = max_connections.max(1);
     quic
 }
 
@@ -553,9 +609,14 @@ mod tests {
 
     #[test]
     fn transport_settings_allow_pmtu_above_the_conservative_default() {
-        let settings = quic_settings();
+        let settings = quic_settings(1_234, 321);
         assert_eq!(settings.max_recv_udp_payload_size, 1_400);
         assert_eq!(settings.max_send_udp_payload_size, 1_400);
         assert!(settings.discover_path_mtu);
+        assert_eq!(
+            settings.handshake_timeout,
+            Some(std::time::Duration::from_millis(1_234))
+        );
+        assert_eq!(settings.listen_backlog, 321);
     }
 }

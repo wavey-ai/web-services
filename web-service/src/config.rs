@@ -21,6 +21,10 @@ pub struct ServerConfig {
     pub enable_raw_tcp: bool,
     pub raw_tcp_port: u16,
     pub raw_tcp_tls: bool,
+    /// Maximum active connections for each enabled transport.
+    pub max_connections: usize,
+    /// Maximum TLS or QUIC handshake time.
+    pub handshake_timeout_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -37,6 +41,8 @@ impl Default for ServerConfig {
             enable_raw_tcp: false,
             raw_tcp_port: 9000,
             raw_tcp_tls: false,
+            max_connections: 4_096,
+            handshake_timeout_ms: 10_000,
         }
     }
 }

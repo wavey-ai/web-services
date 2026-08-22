@@ -12,9 +12,7 @@ use hyper::body::Frame;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 const BODY_CHANNEL_SIZE: usize = 16;
@@ -43,9 +41,32 @@ impl ProxyWorker {
         let mut last_processed = 0usize;
         let mut body_channels: HashMap<u64, mpsc::Sender<Result<Frame<Bytes>, Infallible>>> =
             HashMap::new();
+        let request_updates = self.queue.request_updates();
 
         loop {
-            let next_id = last_processed + 1;
+            let update = request_updates.notified();
+            tokio::pin!(update);
+            update.as_mut().enable();
+            let Some(next_id) = last_processed.checked_add(1) else {
+                error!(
+                    worker_id = self.worker_id,
+                    "Request queue cursor overflowed"
+                );
+                return;
+            };
+            let oldest_retained = self.queue.request_oldest_retained();
+            if next_id < oldest_retained {
+                warn!(
+                    worker_id = self.worker_id,
+                    next_id,
+                    oldest_retained,
+                    dropped_frames = oldest_retained - next_id,
+                    "Worker fell behind the retained request queue"
+                );
+                body_channels.clear();
+                last_processed = oldest_retained - 1;
+                continue;
+            }
 
             if let Some(bytes) = self.queue.request_get(next_id).await {
                 last_processed = next_id;
@@ -123,8 +144,7 @@ impl ProxyWorker {
                     }
                 }
             } else {
-                // No request available yet, sleep briefly (HLS pattern uses 1-5ms)
-                sleep(Duration::from_millis(1)).await;
+                update.await;
             }
         }
     }
@@ -230,10 +250,7 @@ async fn process_stream_request(
     );
 
     let body_stream = stream::unfold(body_rx, |mut rx| async {
-        match rx.recv().await {
-            Some(frame) => Some((frame, rx)),
-            None => None,
-        }
+        rx.recv().await.map(|frame| (frame, rx))
     });
 
     let body = HttpStreamBody::new(body_stream).boxed();

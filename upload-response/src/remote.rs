@@ -8,7 +8,9 @@ use http::{header::CONTENT_TYPE, Request};
 use http_pack::stream::{encode_frame, StreamFrame, StreamHeaders};
 use reqwest::{Client, StatusCode};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 use tokio::net::lookup_host;
+use tokio::time::timeout;
 use web_service::HandlerResponse;
 
 #[derive(Clone)]
@@ -58,6 +60,8 @@ impl RemoteIngressClient {
         let client = Client::builder()
             .danger_accept_invalid_certs(insecure_tls)
             .http2_adaptive_window(true)
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(60))
             .build()
             .map_err(|error| anyhow!("failed to build reqwest client: {error}"))?;
         Ok(Self {
@@ -762,8 +766,9 @@ pub async fn discover_ingress_origins(
     if let Some(discovery_dns) = discovery_dns {
         let discovery_dns = discovery_dns.trim();
         if !discovery_dns.is_empty() {
-            for socket in lookup_host(discovery_dns)
+            for socket in timeout(Duration::from_secs(5), lookup_host(discovery_dns))
                 .await
+                .map_err(|_| anyhow!("DNS lookup timed out for {discovery_dns}"))?
                 .map_err(|error| anyhow!("failed to resolve {discovery_dns}: {error}"))?
             {
                 origins.insert(format!("https://{}", socket));

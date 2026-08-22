@@ -8,7 +8,7 @@ use hyper_util::rt::TokioIo;
 use playlists::chunk_cache::ChunkCache;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio::time::{Duration, Instant, sleep, timeout};
+use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 use tracing::{debug, error, info};
 use web_service::{
@@ -17,6 +17,8 @@ use web_service::{
 };
 use xmpegts::define::epsi_stream_type;
 use xmpegts::ts::TsMuxer;
+
+use crate::ChunkStream;
 
 pub const AUDIO_EPOCH_SUBSCRIPTION: &[u8] = b"WAVEY-AUDIO-EPOCH/1";
 
@@ -101,27 +103,26 @@ impl StreamingHandler for TailStreamHandler {
         let stream_id = parts[0]
             .parse::<u64>()
             .map_err(|_| ServerError::Config("Invalid stream ID".into()))?;
-        let requested_idx = usize::try_from(stream_id)
-            .map_err(|_| ServerError::Config("Stream ID cannot fit this platform".into()))?;
-        let idx = match self.chunk_cache.get_stream_idx(stream_id).await {
-            Some(idx) => idx,
-            None if requested_idx < self.chunk_cache.options.num_playlists => requested_idx,
-            None => return Err(ServerError::Config("Stream not found".into())),
-        };
+        let stream = ChunkStream::resolve(&self.chunk_cache, stream_id)
+            .ok_or_else(|| ServerError::Config("Stream not found".into()))?;
         let request = TailRequest::from_request(&req);
-        let current_last = self.chunk_cache.last(idx).unwrap_or(0);
+        let current_last = stream.last(&self.chunk_cache).unwrap_or(0);
         let mut next = request
             .after
             .map(|after| after.saturating_add(1))
             .unwrap_or_else(|| current_last.saturating_add(1));
         info!(
             "{} [{}] tail from sequence {} (last cached {}, mode {:?})",
-            stream_id, idx, next, current_last, request.mode
+            stream_id,
+            stream.index(),
+            next,
+            current_last,
+            request.mode
         );
 
         if request.mode == TailMode::OnePart {
-            if let Some((data, _)) = self
-                .get_part_with_timeout(idx, next, Duration::from_secs(30))
+            if let Some((data, _)) = stream
+                .get_with_timeout(&self.chunk_cache, next, Duration::from_secs(30))
                 .await
             {
                 let response = Response::builder()
@@ -136,7 +137,9 @@ impl StreamingHandler for TailStreamHandler {
                 if let Err(e) = writer.send_data(data).await {
                     info!(
                         "tail client disconnected for stream {} [{}]: {}",
-                        stream_id, idx, e
+                        stream_id,
+                        stream.index(),
+                        e
                     );
                 }
             } else {
@@ -161,19 +164,24 @@ impl StreamingHandler for TailStreamHandler {
         writer.send_response(response).await?;
 
         loop {
-            if let Some((data, _)) = self
-                .get_part_with_timeout(idx, next, Duration::from_secs(3))
+            if let Some((data, _)) = stream
+                .get_with_timeout(&self.chunk_cache, next, Duration::from_secs(3))
                 .await
             {
                 if let Err(e) = writer.send_data(data).await {
                     info!(
                         "tail client disconnected for stream {} [{}]: {}",
-                        stream_id, idx, e
+                        stream_id,
+                        stream.index(),
+                        e
                     );
                     return Ok(());
                 }
                 next += 1;
             } else {
+                if !stream.is_current(&self.chunk_cache) {
+                    return Ok(());
+                }
                 sleep(Duration::from_millis(5)).await;
             }
         }
@@ -182,26 +190,6 @@ impl StreamingHandler for TailStreamHandler {
     fn is_streaming(&self, path: &str) -> bool {
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         parts.len() == 2 && parts[1] == "tail"
-    }
-}
-
-impl TailStreamHandler {
-    async fn get_part_with_timeout(
-        &self,
-        idx: usize,
-        id: usize,
-        timeout: Duration,
-    ) -> Option<(Bytes, u64)> {
-        let start = Instant::now();
-        let interval = Duration::from_millis(1);
-
-        while start.elapsed() < timeout {
-            if let Some(d) = self.chunk_cache.get(idx, id).await {
-                return Some(d.clone());
-            }
-            sleep(interval).await;
-        }
-        None
     }
 }
 
@@ -276,7 +264,7 @@ async fn handle_transport_session(
         Ok(pid) => pid,
         Err(e) => {
             error!("Failed to add stream to TS muxer: {:?}", e);
-            let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+            let io_err = std::io::Error::other(e.to_string());
             return Err(ServerError::Handler(Box::new(io_err)));
         }
     };
@@ -298,14 +286,16 @@ async fn handle_transport_session(
             continue;
         }
         let stream_id_u64 = buf.get_u64();
-        let stream_idx = stream_id_u64 as usize;
-        let mut last = chunk_cache.last(stream_idx).unwrap_or(0);
+        let Some(stream) = ChunkStream::resolve(&chunk_cache, stream_id_u64) else {
+            continue;
+        };
+        let mut last = stream.last(&chunk_cache).unwrap_or(0);
 
-        while let Some((data, _seq)) = chunk_cache.get(stream_idx, last).await {
+        while let Some((data, _seq)) = stream.get(&chunk_cache, last).await {
             // 2) Mux to TS, logging + returning on error
             if let Err(e) = muxer.write(pid, 0, 0, 0, BytesMut::from(data)) {
                 error!("TS muxer write error: {:?}", e);
-                let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+                let io_err = std::io::Error::other(e.to_string());
                 return Err(ServerError::Handler(Box::new(io_err)));
             }
 
@@ -318,15 +308,13 @@ async fn handle_transport_session(
                 // 3) Send datagram, logging + returning on error
                 if let Err(e) = sender.send_datagram(out.freeze()) {
                     error!("Failed to send datagram: {:?}", e);
-                    let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+                    let io_err = std::io::Error::other(e.to_string());
                     return Err(ServerError::Handler(Box::new(io_err)));
                 }
             }
 
             last += 1;
         }
-
-        sleep(Duration::from_millis(1)).await;
     }
 
     info!("WebTransport session finished");
@@ -365,7 +353,7 @@ async fn handle_raw_ts_transport_session(
         Ok(d) => d,
         Err(e) => {
             error!("Failed to read stream subscription datagram: {}", e);
-            let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+            let io_err = std::io::Error::other(e.to_string());
             return Err(ServerError::Handler(Box::new(io_err)));
         }
     };
@@ -378,20 +366,9 @@ async fn handle_raw_ts_transport_session(
     }
 
     let stream_id_u64 = buf.get_u64();
-    let stream_idx = usize::try_from(stream_id_u64).map_err(|_| {
-        ServerError::Config(format!(
-            "WebTransport stream id {} cannot fit this platform",
-            stream_id_u64
-        ))
-    })?;
-    if stream_idx >= chunk_cache.options.num_playlists {
-        return Err(ServerError::Config(format!(
-            "WebTransport stream index {} exceeds configured stream count {}",
-            stream_idx, chunk_cache.options.num_playlists
-        )));
-    }
-
-    let mut next = match chunk_cache.last(stream_idx) {
+    let stream = ChunkStream::resolve(&chunk_cache, stream_id_u64)
+        .ok_or_else(|| ServerError::Config("WebTransport stream not found".into()))?;
+    let mut next = match stream.last(&chunk_cache) {
         Some(0) | None => 1,
         Some(last) => last,
     };
@@ -401,17 +378,18 @@ async fn handle_raw_ts_transport_session(
     );
 
     loop {
-        if let Some((data, _seq)) = chunk_cache.get(stream_idx, next).await {
+        if let Some((data, _seq)) = stream
+            .get_with_timeout(&chunk_cache, next, Duration::from_secs(30))
+            .await
+        {
             for chunk in data.chunks(188 * 6) {
                 if let Err(e) = sender.send_datagram(Bytes::copy_from_slice(chunk)) {
                     error!("Failed to send raw TS datagram: {:?}", e);
-                    let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+                    let io_err = std::io::Error::other(e.to_string());
                     return Err(ServerError::Handler(Box::new(io_err)));
                 }
             }
             next += 1;
-        } else {
-            sleep(Duration::from_millis(1)).await;
         }
     }
 }
@@ -448,34 +426,34 @@ impl WebSocketHandler for TailWebSocketHandler {
             .parse::<u64>()
             .map_err(|_| ServerError::Config("Invalid stream ID".into()))?;
 
-        let requested_idx = usize::try_from(stream_id)
-            .map_err(|_| ServerError::Config("Stream ID cannot fit this platform".into()))?;
-        let idx = match self.chunk_cache.get_stream_idx(stream_id).await {
-            Some(idx) => idx,
-            None if requested_idx < self.chunk_cache.options.num_playlists => requested_idx,
-            None => return Err(ServerError::Config("Stream not found".into())),
-        };
-        let mut last = self.chunk_cache.last(idx).unwrap_or(0);
+        let chunk_stream = ChunkStream::resolve(&self.chunk_cache, stream_id)
+            .ok_or_else(|| ServerError::Config("Stream not found".into()))?;
+        let mut last = chunk_stream.last(&self.chunk_cache).unwrap_or(0);
 
         loop {
-            match tokio::time::timeout(Duration::from_millis(1), stream.next()).await {
-                Ok(Some(Ok(Message::Close(_)))) => break,
-                Ok(Some(Ok(Message::Ping(payload)))) => {
-                    let _ = stream.send(Message::Pong(payload)).await;
+            tokio::select! {
+                message = stream.next() => match message {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = stream.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(ServerError::Handler(Box::new(error))),
+                },
+                data = chunk_stream.get_with_timeout(
+                    &self.chunk_cache,
+                    last,
+                    Duration::from_secs(30),
+                ) => match data {
+                    Some((data, _)) => {
+                        if let Err(error) = stream.send(Message::Binary(data)).await {
+                            return Err(ServerError::Handler(Box::new(error)));
+                        }
+                        last += 1;
+                    }
+                    None if !chunk_stream.is_current(&self.chunk_cache) => break,
+                    None => {}
                 }
-                Ok(Some(Ok(_))) => {}
-                Ok(Some(Err(e))) => return Err(ServerError::Handler(Box::new(e))),
-                Ok(None) => break,
-                Err(_) => {}
-            }
-
-            if let Some((data, _)) = self.chunk_cache.get(idx, last).await {
-                if let Err(e) = stream.send(Message::Binary(data)).await {
-                    return Err(ServerError::Handler(Box::new(e)));
-                }
-                last += 1;
-            } else {
-                sleep(Duration::from_millis(5)).await;
             }
         }
 

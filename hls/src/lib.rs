@@ -5,13 +5,14 @@ use http::{
     Method, Request, StatusCode,
     header::{ACCEPT_ENCODING, ACCEPT_RANGES, RANGE, VARY},
 };
-use playlists::chunk_cache::ChunkCache;
-use playlists::m3u8_cache::M3u8Cache;
-use regex::Regex;
+use playlists::chunk_cache::{ChunkCache, StreamHandle};
+use playlists::m3u8_cache::{M3u8Cache, M3u8StreamHandle};
 use std::borrow::Cow;
 use std::io::Read;
 use std::{collections::HashMap, sync::Arc};
-use tokio::time::{Duration, sleep, timeout};
+#[cfg(test)]
+use tokio::time::timeout;
+use tokio::time::{Duration, Instant, sleep, timeout_at};
 use tracing::debug;
 use web_service::{
     HandlerResponse, HandlerResult, RequestHandler, Router, ServerError, StreamWriter,
@@ -27,6 +28,101 @@ const PRIORITY_HEADER: &str = "priority";
 const PLAYLIST_PRIORITY: &str = "u=1, i";
 const MEDIA_PRIORITY: &str = "u=2";
 
+/// One chunk-cache address resolved for a request or subscription lifetime.
+///
+/// Logical streams retain their generation-safe handle. The fixed variant is
+/// only for the legacy callers that deliberately write an unregistered cache
+/// lane whose numeric index is also exposed as the stream ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChunkStream {
+    Logical(StreamHandle),
+    Fixed(usize),
+}
+
+impl ChunkStream {
+    pub(crate) fn resolve(cache: &ChunkCache, stream_id: u64) -> Option<Self> {
+        if let Some(handle) = cache.resolve_stream(stream_id) {
+            return Some(Self::Logical(handle));
+        }
+
+        let index = usize::try_from(stream_id).ok()?;
+        (index < cache.options.num_playlists).then_some(Self::Fixed(index))
+    }
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Logical(handle) => handle.index(),
+            Self::Fixed(index) => index,
+        }
+    }
+
+    pub(crate) fn last(self, cache: &ChunkCache) -> Option<usize> {
+        match self {
+            Self::Logical(handle) => cache.last_for_handle(handle),
+            Self::Fixed(index) => cache.last(index),
+        }
+    }
+
+    pub(crate) async fn get(self, cache: &ChunkCache, id: usize) -> Option<(Bytes, u64)> {
+        match self {
+            Self::Logical(handle) => cache.get_for_handle(handle, id).await,
+            Self::Fixed(index) => cache.get(index, id).await,
+        }
+    }
+
+    pub(crate) fn is_current(self, cache: &ChunkCache) -> bool {
+        match self {
+            Self::Logical(handle) => cache.resolve_stream(handle.stream_id()) == Some(handle),
+            Self::Fixed(index) => index < cache.options.num_playlists,
+        }
+    }
+
+    fn exact_part_notifier(
+        self,
+        cache: &ChunkCache,
+        id: usize,
+    ) -> Option<Arc<tokio::sync::Notify>> {
+        match self {
+            Self::Logical(handle) => cache.exact_part_waiter(handle.stream_id(), id),
+            Self::Fixed(index) => cache.update_notifier(index),
+        }
+    }
+
+    pub(crate) async fn get_with_timeout(
+        self,
+        cache: &ChunkCache,
+        id: usize,
+        wait: Duration,
+    ) -> Option<(Bytes, u64)> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(data) = self.get(cache, id).await {
+                return Some(data);
+            }
+            if !self.is_current(cache) {
+                return None;
+            }
+
+            if let Some(notifier) = self.exact_part_notifier(cache, id) {
+                let update = notifier.notified();
+                tokio::pin!(update);
+                update.as_mut().enable();
+                if let Some(data) = self.get(cache, id).await {
+                    return Some(data);
+                }
+                if !self.is_current(cache) {
+                    return None;
+                }
+                timeout_at(deadline, update).await.ok()?;
+            } else {
+                timeout_at(deadline, sleep(BLOCKING_RELOAD_POLL_INTERVAL))
+                    .await
+                    .ok()?;
+            }
+        }
+    }
+}
+
 enum BlockingPlaylistReload {
     Found(Bytes, u64),
     Status(StatusCode),
@@ -35,6 +131,12 @@ enum BlockingPlaylistReload {
 enum SegmentResponse {
     Found(Bytes),
     Status(StatusCode),
+}
+
+enum SegmentRead {
+    Found(Bytes),
+    Missing(ChunkStream, usize),
+    NotFound,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,6 +185,12 @@ impl HlsRouter {
     }
     fn parse_path(path: &str) -> Vec<&str> {
         path.split('/').filter(|s| !s.is_empty()).collect()
+    }
+}
+
+impl Default for HlsRouter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -168,11 +276,17 @@ impl HlsHandler {
         (Cow::Borrowed(PRIORITY_HEADER), Cow::Borrowed(value))
     }
     fn extract_id(s: &str) -> Option<usize> {
-        Regex::new(r"(s|p)(\d+)(\.mp4|\.ts)$")
-            .unwrap()
-            .captures(s)
-            .and_then(|c| c.get(2))
-            .and_then(|m| m.as_str().parse().ok())
+        let bytes = s.as_bytes();
+        if !matches!(bytes.first(), Some(b's' | b'p')) {
+            return None;
+        }
+        let numeric = s[1..]
+            .strip_suffix(".mp4")
+            .or_else(|| s[1..].strip_suffix(".ts"))?;
+        if numeric.is_empty() || !numeric.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        numeric.parse().ok()
     }
 
     fn request_byte_range(req: &Request<()>) -> Option<ByteRangeRequest> {
@@ -195,17 +309,8 @@ impl HlsHandler {
         Some(ByteRangeRequest { start, end })
     }
 
-    async fn resolve_chunk_stream_idx(&self, stream_id: u64) -> Option<usize> {
-        if let Some(idx) = self.chunk_cache.get_stream_idx(stream_id).await {
-            return Some(idx);
-        }
-
-        let requested_idx = usize::try_from(stream_id).ok()?;
-        if requested_idx < self.chunk_cache.options.num_playlists {
-            Some(requested_idx)
-        } else {
-            None
-        }
+    fn resolve_chunk_stream(&self, stream_id: u64) -> Option<ChunkStream> {
+        ChunkStream::resolve(&self.chunk_cache, stream_id)
     }
 
     async fn handle_m3u8(
@@ -262,7 +367,13 @@ impl HlsHandler {
                 },
                 None => None,
             };
-            match self.get_m3u8_with_blocking(id, msn, part, skip).await {
+            let Some(handle) = self.m3u8_cache.resolve_stream(id) else {
+                return Ok(HandlerResponse {
+                    status: StatusCode::NOT_FOUND,
+                    ..Default::default()
+                });
+            };
+            match self.get_m3u8_with_blocking(handle, msn, part, skip).await {
                 BlockingPlaylistReload::Found(bytes, hash) => {
                     debug!(
                         stream_id = id,
@@ -291,7 +402,9 @@ impl HlsHandler {
                 }
             }
         } else {
-            self.latest_m3u8(id, skip)
+            self.m3u8_cache
+                .resolve_stream(id)
+                .and_then(|handle| self.latest_m3u8(handle, skip))
         };
 
         if let Some((bytes, hash)) = data {
@@ -391,9 +504,10 @@ impl HlsHandler {
         matches!(qp.get("_HLS_skip"), Some(&"YES" | &"v2"))
     }
 
-    fn latest_m3u8(&self, sid: u64, skip: bool) -> Option<(Bytes, u64)> {
+    fn latest_m3u8(&self, handle: M3u8StreamHandle, skip: bool) -> Option<(Bytes, u64)> {
+        let sid = handle.stream_id();
         if skip {
-            match self.m3u8_cache.last_delta(sid) {
+            match self.m3u8_cache.last_delta_for_handle(handle) {
                 Ok(Some(delta)) => {
                     debug!(
                         stream_id = sid,
@@ -418,32 +532,44 @@ impl HlsHandler {
                 }
             }
         }
-        self.m3u8_cache.last(sid).unwrap_or(None)
+        self.m3u8_cache.last_for_handle(handle).unwrap_or(None)
     }
 
-    fn blocking_request_is_behind_latest(&self, sid: u64, msn: usize, part: Option<usize>) -> bool {
-        let Some((last_msn, last_part)) = self.m3u8_cache.last_position(sid) else {
+    fn blocking_request_is_behind_latest(
+        &self,
+        handle: M3u8StreamHandle,
+        msn: usize,
+        part: Option<usize>,
+    ) -> bool {
+        let Some(position) = self.m3u8_cache.position_for_handle(handle) else {
             return false;
         };
+        let (last_msn, last_part) = (position.segment_id, position.part_idx);
         msn < last_msn || (msn == last_msn && part.unwrap_or(0) <= last_part)
     }
 
-    fn blocking_request_is_too_far_ahead(&self, sid: u64, msn: usize, part: Option<usize>) -> bool {
-        let Some((last_msn, last_part)) = self.m3u8_cache.last_position(sid) else {
+    fn blocking_request_is_too_far_ahead(
+        &self,
+        handle: M3u8StreamHandle,
+        msn: usize,
+        part: Option<usize>,
+    ) -> bool {
+        let Some(position) = self.m3u8_cache.position_for_handle(handle) else {
             return false;
         };
+        let (last_msn, last_part) = (position.segment_id, position.part_idx);
         if msn > last_msn.saturating_add(2) {
             return true;
         }
         let Some(part) = part else {
             return false;
         };
-        let advance_part_limit = self.advance_part_limit(sid).unwrap_or(3);
+        let advance_part_limit = self.advance_part_limit(handle).unwrap_or(3);
         part > last_part.saturating_add(advance_part_limit)
     }
 
-    fn advance_part_limit(&self, sid: u64) -> Option<usize> {
-        let (playlist, _) = self.m3u8_cache.last(sid).ok()??;
+    fn advance_part_limit(&self, handle: M3u8StreamHandle) -> Option<usize> {
+        let (playlist, _) = self.m3u8_cache.last_for_handle(handle).ok()??;
         let playlist = Self::decompress_gzip_playlist_to_string(playlist).ok()?;
         let part_target = parse_part_target_seconds(&playlist)?;
         if part_target < 1.0 {
@@ -453,8 +579,8 @@ impl HlsHandler {
         }
     }
 
-    fn preload_hint_start(&self, sid: u64, segment_id: usize) -> Option<usize> {
-        let (playlist, _) = self.m3u8_cache.last(sid).ok()??;
+    fn preload_hint_start(&self, handle: M3u8StreamHandle, segment_id: usize) -> Option<usize> {
+        let (playlist, _) = self.m3u8_cache.last_for_handle(handle).ok()??;
         let playlist = Self::decompress_gzip_playlist_to_string(playlist).ok()?;
         let expected_uri = format!("s{segment_id}.mp4");
         playlist.lines().find_map(|line| {
@@ -473,18 +599,18 @@ impl HlsHandler {
 
     fn get_m3u8_snapshot(
         &self,
-        sid: u64,
+        handle: M3u8StreamHandle,
         msn: usize,
         part: usize,
         skip: bool,
     ) -> Option<(Bytes, u64)> {
         if skip {
-            match self.m3u8_cache.get_delta(sid, msn, part) {
+            match self.m3u8_cache.get_delta_for_handle(handle, msn, part) {
                 Ok(Some(delta)) => return Some(delta),
                 Ok(None) => {}
                 Err(error) => {
                     debug!(
-                        stream_id = sid,
+                        stream_id = handle.stream_id(),
                         msn,
                         part,
                         %error,
@@ -494,12 +620,12 @@ impl HlsHandler {
             }
         }
 
-        match self.m3u8_cache.get(sid, msn, part) {
+        match self.m3u8_cache.get_for_handle(handle, msn, part) {
             Ok(Some(d)) => Some(d),
             Ok(None) => None,
             Err(error) => {
                 debug!(
-                    stream_id = sid,
+                    stream_id = handle.stream_id(),
                     msn,
                     part,
                     %error,
@@ -512,12 +638,13 @@ impl HlsHandler {
 
     async fn get_m3u8_with_blocking(
         &self,
-        sid: u64,
+        handle: M3u8StreamHandle,
         msn: usize,
         part: Option<usize>,
         skip: bool,
     ) -> BlockingPlaylistReload {
-        if self.blocking_request_is_too_far_ahead(sid, msn, part) {
+        let sid = handle.stream_id();
+        if self.blocking_request_is_too_far_ahead(handle, msn, part) {
             debug!(
                 stream_id = sid,
                 msn,
@@ -528,7 +655,7 @@ impl HlsHandler {
             return BlockingPlaylistReload::Status(StatusCode::BAD_REQUEST);
         }
 
-        if self.blocking_request_is_behind_latest(sid, msn, part) {
+        if self.blocking_request_is_behind_latest(handle, msn, part) {
             debug!(
                 stream_id = sid,
                 msn,
@@ -537,72 +664,173 @@ impl HlsHandler {
                 "LL-HLS blocking playlist request is behind latest cache"
             );
             return self
-                .latest_m3u8(sid, skip)
+                .latest_m3u8(handle, skip)
                 .map(|(bytes, hash)| BlockingPlaylistReload::Found(bytes, hash))
                 .unwrap_or(BlockingPlaylistReload::Status(StatusCode::NOT_FOUND));
         }
 
+        let Some(notifier) = self.m3u8_cache.update_notifier_for_handle(handle) else {
+            return BlockingPlaylistReload::Status(StatusCode::NOT_FOUND);
+        };
         let requested_part = part.unwrap_or(0);
-        let result = timeout(BLOCKING_RELOAD_TIMEOUT, async {
-            loop {
-                if let Some((bytes, hash)) = self.get_m3u8_snapshot(sid, msn, requested_part, skip)
-                {
-                    return BlockingPlaylistReload::Found(bytes, hash);
-                }
-                if part.is_some() {
-                    if let Some(next_msn) = msn.checked_add(1) {
-                        if let Some((bytes, hash)) =
-                            self.get_m3u8_snapshot(sid, next_msn, 0, skip)
-                        {
-                            return BlockingPlaylistReload::Found(bytes, hash);
-                        }
-                    }
-                }
-                if self.blocking_request_is_behind_latest(sid, msn, part) {
-                    debug!(
-                        stream_id = sid,
-                        msn,
-                        part = part.unwrap_or(0),
-                        "LL-HLS blocking playlist request fell behind cache; serving latest playlist"
-                    );
-                    return self
-                        .latest_m3u8(sid, skip)
-                        .map(|(bytes, hash)| BlockingPlaylistReload::Found(bytes, hash))
-                        .unwrap_or(BlockingPlaylistReload::Status(StatusCode::NOT_FOUND));
-                }
-                sleep(BLOCKING_RELOAD_POLL_INTERVAL).await;
-            }
-        })
-        .await;
+        let deadline = Instant::now() + BLOCKING_RELOAD_TIMEOUT;
+        loop {
+            let notified = notifier.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
-        result.unwrap_or_else(|_| {
-            debug!(
-                stream_id = sid,
-                msn,
-                part = part.unwrap_or(0),
-                "LL-HLS blocking playlist request timed out"
-            );
-            BlockingPlaylistReload::Status(StatusCode::SERVICE_UNAVAILABLE)
-        })
+            if let Some((bytes, hash)) = self.get_m3u8_snapshot(handle, msn, requested_part, skip) {
+                return BlockingPlaylistReload::Found(bytes, hash);
+            }
+            if part.is_some()
+                && let Some(next_msn) = msn.checked_add(1)
+                && let Some((bytes, hash)) = self.get_m3u8_snapshot(handle, next_msn, 0, skip)
+            {
+                return BlockingPlaylistReload::Found(bytes, hash);
+            }
+            if self.blocking_request_is_behind_latest(handle, msn, part) {
+                debug!(
+                    stream_id = sid,
+                    msn,
+                    part = part.unwrap_or(0),
+                    "LL-HLS blocking playlist request fell behind cache; serving latest playlist"
+                );
+                return self
+                    .latest_m3u8(handle, skip)
+                    .map(|(bytes, hash)| BlockingPlaylistReload::Found(bytes, hash))
+                    .unwrap_or(BlockingPlaylistReload::Status(StatusCode::NOT_FOUND));
+            }
+            if self.m3u8_cache.resolve_stream(sid) != Some(handle) {
+                return BlockingPlaylistReload::Status(StatusCode::NOT_FOUND);
+            }
+            if timeout_at(deadline, notified).await.is_err() {
+                debug!(
+                    stream_id = sid,
+                    msn,
+                    part = part.unwrap_or(0),
+                    "LL-HLS blocking playlist request timed out"
+                );
+                return BlockingPlaylistReload::Status(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
     }
 
-    async fn get_segment(&self, sid: u64, segment_id: usize) -> Option<Bytes> {
-        let (start, end) = self.m3u8_cache.get_idxs(sid, segment_id).ok()??;
-        let stream_idx = self.resolve_chunk_stream_idx(sid).await?;
+    async fn read_segment(&self, playlist: M3u8StreamHandle, segment_id: usize) -> SegmentRead {
+        let Some((start, end)) = self
+            .m3u8_cache
+            .get_idxs_for_handle(playlist, segment_id)
+            .ok()
+            .flatten()
+        else {
+            return SegmentRead::NotFound;
+        };
+        let Some(stream) = self.resolve_chunk_stream(playlist.stream_id()) else {
+            return SegmentRead::NotFound;
+        };
         let mut bytes = BytesMut::new();
         for part_id in start..end {
-            let (part, _hash) = self.get_part(stream_idx as u64, part_id).await?;
+            let Some((part, _hash)) = stream.get(&self.chunk_cache, part_id).await else {
+                return if stream.is_current(&self.chunk_cache) {
+                    SegmentRead::Missing(stream, part_id)
+                } else {
+                    SegmentRead::NotFound
+                };
+            };
             bytes.extend_from_slice(&part);
         }
-        (!bytes.is_empty()).then(|| bytes.freeze())
+        if !stream.is_current(&self.chunk_cache)
+            || self.m3u8_cache.resolve_stream(playlist.stream_id()) != Some(playlist)
+        {
+            return SegmentRead::NotFound;
+        }
+        if bytes.is_empty() {
+            SegmentRead::NotFound
+        } else {
+            SegmentRead::Found(bytes.freeze())
+        }
     }
 
-    fn segment_is_advertised(&self, sid: u64, segment_id: usize) -> bool {
+    fn segment_is_advertised(&self, playlist: M3u8StreamHandle, segment_id: usize) -> bool {
         self.m3u8_cache
-            .get_idxs(sid, segment_id)
+            .get_idxs_for_handle(playlist, segment_id)
             .ok()
             .flatten()
             .is_some()
+    }
+
+    async fn wait_for_segment(
+        &self,
+        playlist: M3u8StreamHandle,
+        segment_id: usize,
+        minimum_length: Option<usize>,
+        allow_missing_range: bool,
+        wait: Duration,
+    ) -> SegmentResponse {
+        let Some(playlist_notifier) = self.m3u8_cache.update_notifier_for_handle(playlist) else {
+            return SegmentResponse::Status(StatusCode::NOT_FOUND);
+        };
+        let deadline = Instant::now() + wait;
+
+        loop {
+            let playlist_update = playlist_notifier.notified();
+            tokio::pin!(playlist_update);
+            playlist_update.as_mut().enable();
+
+            match self.read_segment(playlist, segment_id).await {
+                SegmentRead::Found(bytes)
+                    if minimum_length.is_none_or(|minimum| bytes.len() > minimum) =>
+                {
+                    return SegmentResponse::Found(bytes);
+                }
+                SegmentRead::Found(_) => {}
+                SegmentRead::Missing(stream, part_id) => {
+                    if let Some(part_notifier) =
+                        stream.exact_part_notifier(&self.chunk_cache, part_id)
+                    {
+                        let part_update = part_notifier.notified();
+                        tokio::pin!(part_update);
+                        part_update.as_mut().enable();
+                        if stream.get(&self.chunk_cache, part_id).await.is_some() {
+                            continue;
+                        }
+                        if !stream.is_current(&self.chunk_cache) {
+                            return SegmentResponse::Status(StatusCode::NOT_FOUND);
+                        }
+                        let woke = tokio::select! {
+                            result = timeout_at(deadline, playlist_update) => result.is_ok(),
+                            result = timeout_at(deadline, part_update) => result.is_ok(),
+                        };
+                        if woke {
+                            continue;
+                        }
+                        return SegmentResponse::Status(StatusCode::SERVICE_UNAVAILABLE);
+                    }
+
+                    let woke = tokio::select! {
+                        result = timeout_at(deadline, playlist_update) => result.is_ok(),
+                        result = timeout_at(deadline, sleep(BLOCKING_RELOAD_POLL_INTERVAL)) => {
+                            result.is_ok()
+                        }
+                    };
+                    if woke {
+                        continue;
+                    }
+                    return SegmentResponse::Status(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                SegmentRead::NotFound if !allow_missing_range => {
+                    return SegmentResponse::Status(StatusCode::NOT_FOUND);
+                }
+                SegmentRead::NotFound => {
+                    if self.m3u8_cache.resolve_stream(playlist.stream_id()) != Some(playlist) {
+                        return SegmentResponse::Status(StatusCode::NOT_FOUND);
+                    }
+                }
+            }
+
+            if timeout_at(deadline, playlist_update).await.is_err() {
+                return SegmentResponse::Status(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
     }
 
     async fn get_segment_for_request(
@@ -611,19 +839,26 @@ impl HlsHandler {
         sid: u64,
         segment_id: usize,
     ) -> SegmentResponse {
+        let Some(playlist) = self.m3u8_cache.resolve_stream(sid) else {
+            return SegmentResponse::Status(StatusCode::NOT_FOUND);
+        };
         let byte_range = Self::request_byte_range(req);
         let blocking_start = byte_range.and_then(|range| {
-            let hint_start = self.preload_hint_start(sid, segment_id)?;
+            let hint_start = self.preload_hint_start(playlist, segment_id)?;
             let overlaps_hint =
                 range.start >= hint_start || range.end.is_none_or(|end| end >= hint_start);
             overlaps_hint.then_some(range.start.max(hint_start))
         });
 
         let Some(blocking_start) = blocking_start else {
-            if let Some(bytes) = self.get_segment(sid, segment_id).await {
-                return SegmentResponse::Found(bytes);
+            match self.read_segment(playlist, segment_id).await {
+                SegmentRead::Found(bytes) => return SegmentResponse::Found(bytes),
+                SegmentRead::NotFound => {
+                    return SegmentResponse::Status(StatusCode::NOT_FOUND);
+                }
+                SegmentRead::Missing(_, _) => {}
             }
-            if !self.segment_is_advertised(sid, segment_id) {
+            if !self.segment_is_advertised(playlist, segment_id) {
                 return SegmentResponse::Status(StatusCode::NOT_FOUND);
             }
 
@@ -632,23 +867,25 @@ impl HlsHandler {
                 segment_id, "LL-HLS advertised segment request is waiting for complete part bytes"
             );
 
-            let result = timeout(SEGMENT_AVAILABILITY_TIMEOUT, async {
-                loop {
-                    if let Some(bytes) = self.get_segment(sid, segment_id).await {
-                        return SegmentResponse::Found(bytes);
-                    }
-                    sleep(BLOCKING_RELOAD_POLL_INTERVAL).await;
-                }
-            })
-            .await;
-
-            return result.unwrap_or_else(|_| {
+            let result = self
+                .wait_for_segment(
+                    playlist,
+                    segment_id,
+                    None,
+                    false,
+                    SEGMENT_AVAILABILITY_TIMEOUT,
+                )
+                .await;
+            if matches!(
+                result,
+                SegmentResponse::Status(StatusCode::SERVICE_UNAVAILABLE)
+            ) {
                 debug!(
                     stream_id = sid,
                     segment_id, "LL-HLS advertised segment request timed out"
                 );
-                SegmentResponse::Status(StatusCode::SERVICE_UNAVAILABLE)
-            });
+            }
+            return result;
         };
 
         debug!(
@@ -659,19 +896,19 @@ impl HlsHandler {
             "LL-HLS segment preload range request is waiting for complete part bytes"
         );
 
-        let result = timeout(BLOCKING_RELOAD_TIMEOUT, async {
-            loop {
-                if let Some(bytes) = self.get_segment(sid, segment_id).await {
-                    if bytes.len() > blocking_start {
-                        return SegmentResponse::Found(bytes);
-                    }
-                }
-                sleep(BLOCKING_RELOAD_POLL_INTERVAL).await;
-            }
-        })
-        .await;
-
-        result.unwrap_or_else(|_| {
+        let result = self
+            .wait_for_segment(
+                playlist,
+                segment_id,
+                Some(blocking_start),
+                true,
+                BLOCKING_RELOAD_TIMEOUT,
+            )
+            .await;
+        if matches!(
+            result,
+            SegmentResponse::Status(StatusCode::SERVICE_UNAVAILABLE)
+        ) {
             debug!(
                 stream_id = sid,
                 segment_id,
@@ -679,12 +916,8 @@ impl HlsHandler {
                 blocking_start,
                 "LL-HLS segment preload range request timed out"
             );
-            SegmentResponse::Status(StatusCode::SERVICE_UNAVAILABLE)
-        })
-    }
-
-    async fn get_part(&self, idx: u64, part: usize) -> Option<(Bytes, u64)> {
-        self.chunk_cache.get(idx as usize, part).await
+        }
+        result
     }
 }
 #[async_trait]
@@ -695,7 +928,7 @@ impl RequestHandler for HlsHandler {
         parts: Vec<&str>,
         query: Option<&str>,
     ) -> HandlerResult<HandlerResponse> {
-        if req.method() != &Method::GET && req.method() != &Method::HEAD {
+        if req.method() != Method::GET && req.method() != Method::HEAD {
             return Ok(HandlerResponse {
                 status: StatusCode::METHOD_NOT_ALLOWED,
                 ..Default::default()
@@ -773,15 +1006,14 @@ impl RequestHandler for HlsHandler {
                     }
                 } else if file.starts_with('p') {
                     if let Some(id) = Self::extract_id(file) {
-                        if let Some(idx) = self.resolve_chunk_stream_idx(sid).await {
-                            if let Some(d) = self.get_part(idx as u64, id).await {
+                        if let Some(stream) = self.resolve_chunk_stream(sid) {
+                            if let Some(d) = stream.get(&self.chunk_cache, id).await {
                                 Ok(HandlerResponse {
                                     status: StatusCode::OK,
                                     body: Some(d.0),
                                     content_type: Self::detect_content_type(file).map(Into::into),
                                     headers: vec![Self::priority_header(MEDIA_PRIORITY)],
                                     etag: Some(d.1),
-                                    ..Default::default()
                                 })
                             } else {
                                 Ok(HandlerResponse {
@@ -851,6 +1083,18 @@ mod tests {
                 .eq_ignore_ascii_case(name)
                 .then_some(value.as_ref())
         })
+    }
+
+    #[test]
+    fn media_id_parser_accepts_only_canonical_names() {
+        assert_eq!(HlsHandler::extract_id("p12.mp4"), Some(12));
+        assert_eq!(HlsHandler::extract_id("s3.ts"), Some(3));
+        assert_eq!(HlsHandler::extract_id("p0.ts"), Some(0));
+        assert_eq!(HlsHandler::extract_id("x12.mp4"), None);
+        assert_eq!(HlsHandler::extract_id("p.mp4"), None);
+        assert_eq!(HlsHandler::extract_id("p12.json"), None);
+        assert_eq!(HlsHandler::extract_id("p12x.mp4"), None);
+        assert_eq!(HlsHandler::extract_id("p184467440737095516160.mp4"), None);
     }
 
     fn decompress_body(response: &HandlerResponse) -> String {
@@ -1329,17 +1573,17 @@ mod tests {
         let options = Options::default();
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let m3u8_cache = Arc::new(M3u8Cache::new(options));
-        let stream_idx = chunk_cache.add_stream_id(1).await;
+        let stream_handle = chunk_cache.resolve_or_create_stream(1).await;
         chunk_cache
-            .add(stream_idx, 1, Bytes::from_static(b"part-one"))
+            .add_for_handle(stream_handle, 1, Bytes::from_static(b"part-one"))
             .await
             .unwrap();
         chunk_cache
-            .add(stream_idx, 2, Bytes::from_static(b"part-two"))
+            .add_for_handle(stream_handle, 2, Bytes::from_static(b"part-two"))
             .await
             .unwrap();
         chunk_cache
-            .add(stream_idx, 3, Bytes::from_static(b"next-segment"))
+            .add_for_handle(stream_handle, 3, Bytes::from_static(b"next-segment"))
             .await
             .unwrap();
         m3u8_cache
@@ -1376,13 +1620,13 @@ mod tests {
         let options = Options::default();
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let m3u8_cache = Arc::new(M3u8Cache::new(options));
-        let stream_idx = chunk_cache.add_stream_id(1).await;
+        let stream_handle = chunk_cache.resolve_or_create_stream(1).await;
         chunk_cache
-            .add(stream_idx, 1, Bytes::from_static(b"part-one"))
+            .add_for_handle(stream_handle, 1, Bytes::from_static(b"part-one"))
             .await
             .unwrap();
         chunk_cache
-            .add(stream_idx, 2, Bytes::from_static(b"part-two"))
+            .add_for_handle(stream_handle, 2, Bytes::from_static(b"part-two"))
             .await
             .unwrap();
         m3u8_cache
@@ -1417,7 +1661,7 @@ mod tests {
         };
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let m3u8_cache = Arc::new(M3u8Cache::new(options));
-        let stream_idx = chunk_cache.add_stream_id(1).await;
+        let stream_handle = chunk_cache.resolve_or_create_stream(1).await;
         let mut manifest = M3u8Manifest::new(options);
         let mut expected_segment = BytesMut::new();
 
@@ -1432,7 +1676,10 @@ mod tests {
                 expected_segment.extend_from_slice(&payload);
             }
 
-            chunk_cache.add(stream_idx, part, payload).await.unwrap();
+            chunk_cache
+                .add_for_handle(stream_handle, part, payload)
+                .await
+                .unwrap();
             m3u8_cache.add(1, segment_id, seq, idx, playlist).unwrap();
         }
 
@@ -1571,7 +1818,7 @@ mod tests {
         let options = Options::default();
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let m3u8_cache = Arc::new(M3u8Cache::new(options));
-        let stream_idx = chunk_cache.add_stream_id(1).await;
+        let stream_handle = chunk_cache.resolve_or_create_stream(1).await;
         let mut manifest = M3u8Manifest::new(options);
         let (first_playlist, first_segment, first_seq, first_idx, _) =
             manifest.add_part_with_byte_len(100, true, 8);
@@ -1579,7 +1826,7 @@ mod tests {
             manifest.add_part_with_byte_len(100, false, 8);
 
         chunk_cache
-            .add(stream_idx, 1, Bytes::from_static(b"part-one"))
+            .add_for_handle(stream_handle, 1, Bytes::from_static(b"part-one"))
             .await
             .unwrap();
         m3u8_cache
@@ -1599,7 +1846,7 @@ mod tests {
         let publish_fut = async move {
             sleep(Duration::from_millis(10)).await;
             writer_chunk_cache
-                .add(stream_idx, 2, Bytes::from_static(b"part-two"))
+                .add_for_handle(stream_handle, 2, Bytes::from_static(b"part-two"))
                 .await
                 .unwrap();
         };
@@ -1617,7 +1864,7 @@ mod tests {
         let options = Options::default();
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let m3u8_cache = Arc::new(M3u8Cache::new(options));
-        let stream_idx = chunk_cache.add_stream_id(1).await;
+        let stream_handle = chunk_cache.resolve_or_create_stream(1).await;
         let mut manifest = M3u8Manifest::new(options);
         let (first_playlist, first_segment, first_seq, first_idx, _) =
             manifest.add_part_with_byte_len(100, true, 8);
@@ -1625,7 +1872,7 @@ mod tests {
             manifest.add_part_with_byte_len(100, false, 8);
 
         chunk_cache
-            .add(stream_idx, 1, Bytes::from_static(b"part-one"))
+            .add_for_handle(stream_handle, 1, Bytes::from_static(b"part-one"))
             .await
             .unwrap();
         m3u8_cache
@@ -1647,7 +1894,7 @@ mod tests {
         let publish_fut = async move {
             sleep(Duration::from_millis(10)).await;
             writer_chunk_cache
-                .add(stream_idx, 2, Bytes::from_static(b"part-two"))
+                .add_for_handle(stream_handle, 2, Bytes::from_static(b"part-two"))
                 .await
                 .unwrap();
             writer_m3u8_cache
@@ -1668,7 +1915,7 @@ mod tests {
         let options = Options::default();
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let m3u8_cache = Arc::new(M3u8Cache::new(options));
-        let stream_idx = chunk_cache.add_stream_id(1).await;
+        let stream_handle = chunk_cache.resolve_or_create_stream(1).await;
         let mut manifest = M3u8Manifest::new(options);
         let (first_playlist, first_segment, first_seq, first_idx, _) =
             manifest.add_part_with_byte_len(100, true, 8);
@@ -1676,7 +1923,7 @@ mod tests {
             manifest.add_part_with_byte_len(100, false, 8);
 
         chunk_cache
-            .add(stream_idx, 1, Bytes::from_static(b"part-one"))
+            .add_for_handle(stream_handle, 1, Bytes::from_static(b"part-one"))
             .await
             .unwrap();
         m3u8_cache
@@ -1698,7 +1945,7 @@ mod tests {
         let publish_fut = async move {
             sleep(Duration::from_millis(10)).await;
             writer_chunk_cache
-                .add(stream_idx, 2, Bytes::from_static(b"part-two"))
+                .add_for_handle(stream_handle, 2, Bytes::from_static(b"part-two"))
                 .await
                 .unwrap();
             writer_m3u8_cache

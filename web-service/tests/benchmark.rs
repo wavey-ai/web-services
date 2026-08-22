@@ -23,7 +23,6 @@ use web_service::{
 type BenchResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const DEFAULT_REQUESTS_PER_WORKER: usize = 200;
-const DEFAULT_RESPONSE: &[u8] = b"hello from bench";
 const DEFAULT_RESPONSE_BYTES: usize = 1024 * 1024; // 1MB
 
 struct HelloHandler {
@@ -273,9 +272,6 @@ impl ConnectionScenario {
 }
 
 fn build_payload(response_bytes: usize) -> Bytes {
-    if response_bytes == DEFAULT_RESPONSE_BYTES {
-        return Bytes::from_static(DEFAULT_RESPONSE);
-    }
     Bytes::from(vec![b'a'; response_bytes])
 }
 
@@ -283,6 +279,7 @@ struct BenchStats {
     label: String,
     rps: f64,
     avg_ms: f64,
+    mib_per_sec: f64,
 }
 
 fn print_summary(stats: &[BenchStats]) {
@@ -301,8 +298,8 @@ fn print_summary(stats: &[BenchStats]) {
     println!("benchmark summary (higher req/s is better):");
     for stat in &ordered {
         println!(
-            "{:>8.2} req/s | {:>6.2} ms avg | {}",
-            stat.rps, stat.avg_ms, stat.label
+            "{:>8.2} req/s | {:>8.2} MiB/s | {:>6.2} ms observed avg | {}",
+            stat.rps, stat.mib_per_sec, stat.avg_ms, stat.label
         );
     }
 
@@ -399,7 +396,9 @@ async fn run_reqwest_benchmark(
         let requests = config.requests_per_worker;
         tasks.push(tokio::spawn(async move {
             let mut completed = 0usize;
+            let mut total_latency = Duration::ZERO;
             for _ in 0..requests {
+                let request_start = Instant::now();
                 let request = if close_header {
                     client.get(&url).header(CONNECTION, "close")
                 } else {
@@ -410,42 +409,46 @@ async fn run_reqwest_benchmark(
                 let version = resp.version();
                 let _ = resp.bytes().await?;
                 if status != StatusCode::OK {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("unexpected status {status}"),
-                    )
-                    .into());
+                    return Err(io::Error::other(format!("unexpected status {status}")).into());
                 }
                 if version != expected_version {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("unexpected http version {version:?}"),
-                    )
-                    .into());
+                    return Err(
+                        io::Error::other(format!("unexpected http version {version:?}")).into(),
+                    );
                 }
                 completed += 1;
+                total_latency += request_start.elapsed();
             }
-            Ok::<usize, Box<dyn std::error::Error + Send + Sync>>(completed)
+            Ok::<(usize, Duration), Box<dyn std::error::Error + Send + Sync>>((
+                completed,
+                total_latency,
+            ))
         }));
     }
 
     let mut completed = 0usize;
+    let mut total_latency = Duration::ZERO;
     for task in tasks {
-        completed += task.await??;
+        let (task_completed, task_latency) = task.await??;
+        completed += task_completed;
+        total_latency += task_latency;
     }
     let elapsed = start.elapsed();
 
     let rps = completed as f64 / elapsed.as_secs_f64();
-    let avg_ms = (elapsed.as_secs_f64() * 1000.0) / completed as f64;
+    let avg_ms = (total_latency.as_secs_f64() * 1000.0) / completed as f64;
+    let mib_per_sec =
+        (completed * config.response_bytes) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
     println!(
-        "{label} benchmark complete: completed={}, elapsed={:?}, req/s={:.2}, avg_ms={:.2}",
-        completed, elapsed, rps, avg_ms
+        "{label} benchmark complete: completed={}, elapsed={:?}, req/s={:.2}, MiB/s={:.2}, observed_avg_ms={:.2}",
+        completed, elapsed, rps, mib_per_sec, avg_ms
     );
 
     Ok(BenchStats {
         label: label.to_string(),
         rps,
         avg_ms,
+        mib_per_sec,
     })
 }
 
@@ -512,8 +515,7 @@ where
         .lock()
         .await;
 
-    let port =
-        pick_unused_port().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "pick port"))?;
+    let port = pick_unused_port().ok_or_else(|| io::Error::other("pick port"))?;
     let handle = start_server(cert_b64, key_b64, port, payload).await?;
     handle.ready_rx.await?;
     wait_for_port(port).await;

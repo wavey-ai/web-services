@@ -340,13 +340,13 @@ mod tests {
 
     #[test]
     fn classifies_srt_peer_close_error() {
-        let error = io::Error::new(io::ErrorKind::Other, "srt_recv error: 2001 (errno = 0)");
+        let error = io::Error::other("srt_recv error: 2001 (errno = 0)");
         assert!(is_srt_peer_closed_error(&error));
     }
 
     #[test]
     fn leaves_other_srt_errors_as_errors() {
-        let error = io::Error::new(io::ErrorKind::Other, "srt_recv error: 1001 (errno = 0)");
+        let error = io::Error::other("srt_recv error: 1001 (errno = 0)");
         assert!(!is_srt_peer_closed_error(&error));
     }
 }

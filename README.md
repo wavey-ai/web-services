@@ -2,6 +2,8 @@
 
 `web-services` is the Rust workspace for Wavey's transport, proxy, and low-latency delivery services. It combines a reusable multi-protocol server foundation with cache-backed streaming crates and the `upload-response` request/response pipeline.
 
+See [the design and scalability review](./DISCUSSION.md) for current measurements, resolved defects, production gates, and implementation recommendations.
+
 The `web-service` crate owns protocol plumbing only. Raw TCP helpers expose
 generic `[u32_be length][payload]` frame reads/writes. Callers decide whether a
 frame is mesh JSON, media access-unit bytes, or another application payload.
@@ -93,16 +95,16 @@ cargo build --workspace
 cargo test --workspace
 
 # Run the web-service benchmark harness
-cargo test -p web-service --release --test benchmark -- --benchmark
+cargo test -p av-web-service --release --test benchmark -- --benchmark
 
 # Run upload-response tests and print benchmark output
-cargo test -p upload-response --release -- --nocapture
+cargo test -p av-upload-response --release -- --nocapture
 
 # Run the OBS RIST -> LL-HLS browser playback example
 cargo run -p obs-rist-llhls -- --rist-bind 0.0.0.0:7000 --http-port 9444
 ```
 
-For local TLS-based tests, the repo also includes certificates under [`tls/local.wavey.ai`](./tls/local.wavey.ai/).
+Automated tests generate short-lived loopback certificates. Local development material remains under [`tls/local.wavey.ai`](./tls/local.wavey.ai/).
 
 ## upload-response
 
@@ -134,6 +136,8 @@ The shared-memory `ChunkCache` and slot-based streaming architecture are inspire
 Some protocols require optional crate features such as `srt`, `rist`, `rist-pure`, `webrtc`, or `udp-fec`. The default feature set only enables `tcp`.
 
 The `rist` feature keeps the existing librist/C-wrapper backend. The `rist-pure` feature adds `PureRistIngest`, backed by the pure Rust `rist-core` and `rist-mio` crates from [`wavey-ai/rist-rs`](https://github.com/wavey-ai/rist-rs). Pure RIST byte-stream delivery suppresses duplicate arrivals and holds packets behind a sequence gap until retransmission restores wire order. The reorder queue is bounded and fails closed instead of concatenating bytes across an unresolved gap.
+
+Each RIST source address has a separate ordered request. Queue overflow aborts all active requests because the dropped packet owner is not retained.
 
 ### Architecture
 
@@ -205,6 +209,10 @@ This is the intended `v1` control plane for Kubernetes pod splits. CPU ingress
 and transcode pods own the client connection and cache. GPU workers read request
 slots and write response slots through internal H2. A future high-throughput
 data plane can use raw TCP/TLS with the same semantics and `HPKS` framing.
+
+The router does not authenticate these internal routes. Keep them on a private listener until the control plane implements worker authentication.
+
+Response claims are cooperative in this revision. The write routes do not yet prove that the caller owns the active claim.
 
 ### Stream Format
 
@@ -524,23 +532,23 @@ The shared-memory [`ChunkCache`](https://github.com/wavey-ai/playlists) scales t
 
 ```bash
 # Run all upload-response tests
-cargo test -p upload-response
+cargo test -p av-upload-response
 
 # Run all protocol benchmarks and print output
-cargo test -p upload-response --release --features "srt,rist,rist-pure,webrtc,tcp,udp-fec" --test proto_benchmark -- --nocapture --test-threads=1
+cargo test -p av-upload-response --release --features "srt,rist,rist-pure,webrtc,tcp,udp-fec" --test proto_benchmark -- --nocapture --test-threads=1
 
 # Specific worker/cache benchmarks
-cargo test -p upload-response --release test_slot_size_benchmark -- --nocapture
-cargo test -p upload-response --release test_gigabyte_upload_benchmark -- --nocapture
+cargo test -p av-upload-response --release test_slot_size_benchmark -- --nocapture
+cargo test -p av-upload-response --release test_gigabyte_upload_benchmark -- --nocapture
 
 # Protocol comparison benchmark
-cargo test -p upload-response --release --features "srt,rist,rist-pure,webrtc,tcp,udp-fec" --test proto_benchmark test_protocol_comparison -- --nocapture --test-threads=1
+cargo test -p av-upload-response --release --features "srt,rist,rist-pure,webrtc,tcp,udp-fec" --test proto_benchmark test_protocol_comparison -- --nocapture --test-threads=1
 
 # UDP+FEC benchmark
-cargo test -p upload-response --release --features "srt,rist,rist-pure,webrtc,tcp,udp-fec" --test proto_benchmark test_udp_fec_benchmark -- --nocapture
+cargo test -p av-upload-response --release --features "srt,rist,rist-pure,webrtc,tcp,udp-fec" --test proto_benchmark test_udp_fec_benchmark -- --nocapture
 
 # Compile the pure Rust RIST backend
-cargo check -p upload-response --features rist-pure
+cargo check -p av-upload-response --features rist-pure
 ```
 
 ### Dependencies

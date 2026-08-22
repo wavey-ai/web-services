@@ -1,10 +1,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Method, Request, StatusCode};
-use playlists::chunk_cache::ChunkCache as Cache;
-use regex::Regex;
+use playlists::chunk_cache::{ChunkCache as Cache, StreamHandle};
 use std::sync::Arc;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, Instant, timeout_at};
 use web_service::{
     HandlerResponse, HandlerResult, RequestHandler, Router, ServerError, StreamWriter,
     StreamingHandler, WebSocketHandler, WebTransportHandler,
@@ -32,6 +31,12 @@ impl ChunkRouter {
     }
     fn parse_path(path: &str) -> Vec<&str> {
         path.split('/').filter(|s| !s.is_empty()).collect()
+    }
+}
+
+impl Default for ChunkRouter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -89,25 +94,42 @@ impl ChunkHandler {
         }
     }
     fn extract_id(s: &str) -> Option<usize> {
-        Regex::new(r"(s|p)(\d+)(\.json)$")
-            .unwrap()
-            .captures(s)
-            .and_then(|c| c.get(2))
-            .and_then(|m| m.as_str().parse().ok())
+        let bytes = s.as_bytes();
+        if !matches!(bytes.first(), Some(b's' | b'p')) {
+            return None;
+        }
+        let numeric = s[1..].strip_suffix(".json")?;
+        if numeric.is_empty() || !numeric.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        numeric.parse().ok()
     }
-    async fn get_part_with_blocking(&self, idx: u64, part: usize) -> Option<(Bytes, u64)> {
-        let to = Duration::from_secs(3);
-        let iv = Duration::from_millis(3);
-        timeout(to, async {
-            loop {
-                if let Some(d) = self.cache.get(idx as usize, part).await {
-                    return Some(d);
-                }
-                sleep(iv).await;
+    async fn get_part_with_blocking(
+        &self,
+        handle: StreamHandle,
+        part: usize,
+    ) -> Option<(Bytes, u64)> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(data) = self.cache.get_for_handle(handle, part).await {
+                return Some(data);
             }
-        })
-        .await
-        .ok()?
+            if self.cache.resolve_stream(handle.stream_id()) != Some(handle) {
+                return None;
+            }
+
+            let notifier = self.cache.exact_part_waiter(handle.stream_id(), part)?;
+            let update = notifier.notified();
+            tokio::pin!(update);
+            update.as_mut().enable();
+            if let Some(data) = self.cache.get_for_handle(handle, part).await {
+                return Some(data);
+            }
+            if self.cache.resolve_stream(handle.stream_id()) != Some(handle) {
+                return None;
+            }
+            timeout_at(deadline, update).await.ok()?;
+        }
     }
 }
 #[async_trait]
@@ -118,7 +140,7 @@ impl RequestHandler for ChunkHandler {
         parts: Vec<&str>,
         _query: Option<&str>,
     ) -> HandlerResult<HandlerResponse> {
-        if req.method() != &Method::GET && req.method() != &Method::HEAD {
+        if req.method() != Method::GET && req.method() != Method::HEAD {
             return Ok(HandlerResponse {
                 status: StatusCode::METHOD_NOT_ALLOWED,
                 ..Default::default()
@@ -137,8 +159,8 @@ impl RequestHandler for ChunkHandler {
                     .map_err(|_| ServerError::Config("Invalid stream ID".into()))?;
                 if file.starts_with('p') {
                     if let Some(id) = Self::extract_id(file) {
-                        if let Some(idx) = self.cache.get_stream_idx(sid).await {
-                            let data = self.get_part_with_blocking(idx as u64, id).await;
+                        if let Some(handle) = self.cache.resolve_stream(sid) {
+                            let data = self.get_part_with_blocking(handle, id).await;
                             if let Some(d) = data {
                                 Ok(HandlerResponse {
                                     status: StatusCode::OK,
@@ -180,5 +202,25 @@ impl RequestHandler for ChunkHandler {
     }
     fn can_handle(&self, _path: &str) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChunkHandler;
+
+    #[test]
+    fn chunk_id_parser_accepts_only_canonical_names() {
+        assert_eq!(ChunkHandler::extract_id("p12.json"), Some(12));
+        assert_eq!(ChunkHandler::extract_id("s3.json"), Some(3));
+        assert_eq!(ChunkHandler::extract_id("p0.json"), Some(0));
+        assert_eq!(ChunkHandler::extract_id("x12.json"), None);
+        assert_eq!(ChunkHandler::extract_id("p.json"), None);
+        assert_eq!(ChunkHandler::extract_id("p12.mp4"), None);
+        assert_eq!(ChunkHandler::extract_id("p12x.json"), None);
+        assert_eq!(
+            ChunkHandler::extract_id("p184467440737095516160.json"),
+            None
+        );
     }
 }

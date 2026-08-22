@@ -21,7 +21,6 @@ flate2 = "1.0.28"
 xmpegts = "0.2.4"
 async-trait = "0.1.88"
 http = "1.4.1"
-regex = "1.11.1"
 h3 = "0.0.8"
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"

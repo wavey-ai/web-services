@@ -1,7 +1,7 @@
 use crate::{
     config::ServerConfig,
     error::{ServerError, ServerResult},
-    traits::{RawStream, RawTcpHandler},
+    traits::{RawStream, RawTcpHandler, StartupSender},
 };
 use bytes::Bytes;
 use std::io;
@@ -9,8 +9,10 @@ use std::{net::SocketAddr, sync::Arc};
 use tls_helpers::tls_acceptor_from_base64;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
-use tracing::{error, info};
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
+use tokio::time::{timeout, Duration};
+use tracing::{debug, error, info};
 
 type DynStream = Box<dyn RawStream>;
 
@@ -91,29 +93,62 @@ impl RawTcpServer {
         Self { config, handler }
     }
 
-    pub async fn start(&self, mut shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
+    pub async fn start(&self, shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
+        self.run(shutdown_rx, None).await
+    }
+
+    pub(crate) async fn start_with_ready(
+        &self,
+        shutdown_rx: watch::Receiver<()>,
+        startup_tx: StartupSender,
+    ) -> ServerResult<()> {
+        self.run(shutdown_rx, Some(startup_tx)).await
+    }
+
+    async fn run(
+        &self,
+        mut shutdown_rx: watch::Receiver<()>,
+        startup_tx: Option<StartupSender>,
+    ) -> ServerResult<()> {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.raw_tcp_port));
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(crate::error::ServerError::Io)?;
+        let startup: ServerResult<_> = async {
+            let listener = TcpListener::bind(addr).await.map_err(ServerError::Io)?;
+            let tls_acceptor = if self.config.raw_tcp_tls {
+                Some(
+                    tls_acceptor_from_base64(
+                        &self.config.cert_pem_base64,
+                        &self.config.privkey_pem_base64,
+                        true,
+                        false,
+                    )
+                    .map_err(|e| ServerError::Tls(e.to_string()))?,
+                )
+            } else {
+                None
+            };
+            Ok((listener, tls_acceptor))
+        }
+        .await;
+        let (listener, tls_acceptor) = match startup {
+            Ok(startup) => startup,
+            Err(error) => {
+                if let Some(startup_tx) = startup_tx {
+                    let _ = startup_tx.send(Err(error.to_string()));
+                }
+                return Err(error);
+            }
+        };
+        if let Some(startup_tx) = startup_tx {
+            let _ = startup_tx.send(Ok(()));
+        }
         info!(
             "Raw TCP server listening at {} (tls={})",
             addr, self.config.raw_tcp_tls
         );
 
-        let tls_acceptor = if self.config.raw_tcp_tls {
-            Some(
-                tls_acceptor_from_base64(
-                    &self.config.cert_pem_base64,
-                    &self.config.privkey_pem_base64,
-                    true,
-                    false,
-                )
-                .map_err(|e| crate::error::ServerError::Tls(e.to_string()))?,
-            )
-        } else {
-            None
-        };
+        let connection_limit = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
+        let handshake_timeout = Duration::from_millis(self.config.handshake_timeout_ms.max(1));
+        let mut connection_tasks = JoinSet::new();
 
         loop {
             tokio::select! {
@@ -121,18 +156,32 @@ impl RawTcpServer {
                     info!("Raw TCP server shutting down");
                     break;
                 }
+                Some(result) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                    if let Err(error) = result {
+                        error!(%error, "Raw TCP connection task failed");
+                    }
+                }
                 accept_res = listener.accept() => {
                     match accept_res {
-                        Ok((stream, _peer)) => {
+                        Ok((stream, peer)) => {
+                            let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
+                                debug!(%peer, "Raw TCP connection limit reached");
+                                continue;
+                            };
                             let handler = Arc::clone(&self.handler);
                             let tls_acceptor = tls_acceptor.clone();
                             let is_tls = self.config.raw_tcp_tls;
-                            tokio::spawn(async move {
+                            connection_tasks.spawn(async move {
+                                let _connection_permit = connection_permit;
                                 let boxed_stream: DynStream = if let Some(acceptor) = tls_acceptor {
-                                    match acceptor.accept(stream).await {
-                                        Ok(tls_stream) => Box::new(tls_stream),
-                                        Err(e) => {
+                                    match timeout(handshake_timeout, acceptor.accept(stream)).await {
+                                        Ok(Ok(tls_stream)) => Box::new(tls_stream),
+                                        Ok(Err(e)) => {
                                             error!("TLS accept failed: {}", e);
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            debug!(%peer, "Raw TCP TLS handshake timed out");
                                             return;
                                         }
                                     }
@@ -147,11 +196,14 @@ impl RawTcpServer {
                         }
                         Err(e) => {
                             error!("Raw TCP accept failed: {}", e);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                     }
                 }
             }
         }
+
+        connection_tasks.shutdown().await;
 
         Ok(())
     }

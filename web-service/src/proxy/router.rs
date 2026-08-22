@@ -126,7 +126,7 @@ impl ProxyRouter {
         let (status, body) = response_rx
             .await
             .map_err(|_| ServerError::Config("Response channel closed".into()))?
-            .map_err(|e| ServerError::Config(e))?;
+            .map_err(ServerError::Config)?;
 
         Ok(HandlerResponse {
             status,

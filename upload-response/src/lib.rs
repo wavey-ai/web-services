@@ -14,7 +14,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{
+    oneshot, Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore,
+};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -25,7 +27,7 @@ use web_service::{
 };
 
 mod watcher;
-pub use watcher::ResponseWatcher;
+pub use watcher::{ResponseWatcher, ResponseWatcherHandle};
 
 mod bridge;
 pub use bridge::{
@@ -58,7 +60,10 @@ pub use rist::{AllowAllRist, RistAuth, RistIngest, RistProfile};
 #[cfg(feature = "rist-pure")]
 mod pure_rist;
 #[cfg(feature = "rist-pure")]
-pub use pure_rist::{AllowAllPureRist, PureRistAuth, PureRistIngest, PureRistProfile};
+pub use pure_rist::{
+    AllowAllPureRist, PureRistAuth, PureRistIngest, PureRistIngestMetrics, PureRistIngestStats,
+    PureRistProfile,
+};
 
 #[cfg(feature = "webrtc")]
 mod webrtc;
@@ -83,6 +88,12 @@ pub use udp_fec::{
 /// End-of-stream marker - empty slot
 const END_MARKER: &[u8] = b"";
 const REQUEST_CONTROL_MAGIC: &[u8; 8] = b"URCTRL1\0";
+const MAX_INTERNAL_BODY_BYTES: usize = 64 * 1024;
+const MAX_READER_ID_BYTES: usize = 128;
+const MAX_READERS_PER_STREAM: usize = 256;
+const MAX_STAGE_NAME_BYTES: usize = 64;
+const MAX_STAGE_LANES: usize = 16;
+const MAX_WORKER_HEARTBEATS: usize = 4_096;
 
 /// Control message embedded in a request stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +159,7 @@ pub struct UploadResponseConfig {
 impl UploadResponseConfig {
     /// Slot capacity in bytes
     pub fn slot_bytes(&self) -> usize {
-        self.slot_size_kb * 1024
+        self.slot_size_kb.saturating_mul(1024)
     }
 }
 
@@ -166,12 +177,13 @@ impl Default for UploadResponseConfig {
 }
 
 fn chunk_cache_options(config: &UploadResponseConfig) -> Options {
-    let mut options = Options::default();
-    options.num_playlists = config.num_streams;
-    options.max_segments = 1;
-    options.max_parts_per_segment = config.slots_per_stream;
-    options.buffer_size_kb = config.slot_size_kb;
-    options
+    Options {
+        num_playlists: config.num_streams,
+        max_segments: 1,
+        max_parts_per_segment: config.slots_per_stream,
+        buffer_size_kb: config.slot_size_kb,
+        ..Options::default()
+    }
 }
 
 /// Response type sent through oneshot channels
@@ -349,6 +361,12 @@ impl Drop for UploadStream {
                 drop(permit);
             });
         } else {
+            match tokio::runtime::Builder::new_current_thread().build() {
+                Ok(runtime) => runtime.block_on(service.close_stream(stream_id)),
+                Err(error) => {
+                    error!(stream_id, %error, "failed to create stream cleanup runtime");
+                }
+            }
             drop(permit);
         }
     }
@@ -369,6 +387,7 @@ pub struct UploadResponseService {
     stream_to_slot: StdRwLock<HashMap<u64, usize>>,
     free_slots: StdMutex<Vec<usize>>,
     slot_stream_ids: Vec<AtomicU64>,
+    slot_locks: Vec<Arc<Mutex<()>>>,
     response_channels: Arc<RwLock<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     /// Per-stream worker count: how many workers are currently reading/processing
     stream_worker_counts: Vec<AtomicU64>,
@@ -382,6 +401,8 @@ pub struct UploadResponseService {
     response_reader_notifies: Vec<Arc<Notify>>,
     /// Per-stream response claim: None = unclaimed, Some(worker_id) = exclusive write access
     response_claims: Arc<RwLock<Vec<Option<String>>>>,
+    response_dirty: Vec<AtomicBool>,
+    response_updates: Arc<Notify>,
     /// Worker heartbeat/capacity registry keyed by worker id.
     workers: Arc<RwLock<HashMap<String, WorkerHeartbeat>>>,
     config: UploadResponseConfig,
@@ -389,7 +410,10 @@ pub struct UploadResponseService {
 
 impl UploadResponseService {
     /// Create a new upload-response service with the given configuration
-    pub fn new(config: UploadResponseConfig) -> Self {
+    pub fn new(mut config: UploadResponseConfig) -> Self {
+        config.num_streams = config.num_streams.max(1);
+        config.slot_size_kb = config.slot_size_kb.max(1);
+        config.slots_per_stream = config.slots_per_stream.max(1);
         let options = chunk_cache_options(&config);
         let request_cache = Arc::new(ChunkCache::new(options));
         let response_cache = Arc::new(ChunkCache::new(chunk_cache_options(&config)));
@@ -423,6 +447,9 @@ impl UploadResponseService {
             stream_to_slot: StdRwLock::new(HashMap::new()),
             free_slots: StdMutex::new(free_slots),
             slot_stream_ids: (0..config.num_streams).map(|_| AtomicU64::new(0)).collect(),
+            slot_locks: (0..config.num_streams)
+                .map(|_| Arc::new(Mutex::new(())))
+                .collect(),
             response_channels: Arc::new(RwLock::new(HashMap::new())),
             stream_worker_counts,
             request_started,
@@ -433,6 +460,10 @@ impl UploadResponseService {
             response_reader_positions: new_reader_positions(config.num_streams),
             response_reader_notifies: new_reader_notifies(config.num_streams),
             response_claims: Arc::new(RwLock::new(response_claims)),
+            response_dirty: (0..config.num_streams)
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+            response_updates: Arc::new(Notify::new()),
             workers: Arc::new(RwLock::new(HashMap::new())),
             config,
         }
@@ -455,8 +486,54 @@ impl UploadResponseService {
             .and_then(|slots| slots.get(&stream_id).copied())
     }
 
+    fn is_current_slot(&self, stream_id: u64, stream_idx: usize) -> bool {
+        self.slot_stream_ids
+            .get(stream_idx)
+            .is_some_and(|current| current.load(Ordering::Acquire) == stream_id)
+            && self.stream_idx(stream_id) == Some(stream_idx)
+    }
+
+    fn notify_response_update(&self, stream_idx: usize) {
+        if let Some(dirty) = self.response_dirty.get(stream_idx) {
+            dirty.store(true, Ordering::Release);
+            self.response_updates.notify_one();
+        }
+    }
+
+    pub(crate) fn take_response_dirty_slots(&self) -> Vec<usize> {
+        self.response_dirty
+            .iter()
+            .enumerate()
+            .filter_map(|(stream_idx, dirty)| {
+                dirty.swap(false, Ordering::AcqRel).then_some(stream_idx)
+            })
+            .collect()
+    }
+
+    async fn lock_stream_slot(
+        &self,
+        stream_id: u64,
+    ) -> Result<(usize, OwnedMutexGuard<()>), String> {
+        let stream_idx = self
+            .stream_idx(stream_id)
+            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        let slot_lock = self
+            .slot_locks
+            .get(stream_idx)
+            .cloned()
+            .ok_or_else(|| format!("invalid stream slot: {stream_idx}"))?;
+        let guard = slot_lock.lock_owned().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return Err(format!("stream closed: {stream_id}"));
+        }
+        Ok((stream_idx, guard))
+    }
+
     pub fn slot_stream_id(&self, stream_idx: usize) -> Option<u64> {
-        let stream_id = self.slot_stream_ids[stream_idx].load(Ordering::Acquire);
+        let stream_id = self
+            .slot_stream_ids
+            .get(stream_idx)?
+            .load(Ordering::Acquire);
         (stream_id != 0).then_some(stream_id)
     }
 
@@ -474,20 +551,39 @@ impl UploadResponseService {
             .collect()
     }
 
-    async fn get_or_create_stage_lane(&self, stage: &str) -> Arc<StageLane> {
+    fn valid_reader_id(reader_id: &str) -> bool {
+        !reader_id.is_empty() && reader_id.len() <= MAX_READER_ID_BYTES
+    }
+
+    fn valid_stage_name(stage: &str) -> bool {
+        !stage.is_empty()
+            && stage.len() <= MAX_STAGE_NAME_BYTES
+            && stage
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }
+
+    async fn get_or_create_stage_lane(&self, stage: &str) -> Result<Arc<StageLane>, String> {
+        if !Self::valid_stage_name(stage) {
+            return Err("invalid stage name".to_string());
+        }
         {
             let stages = self.stages.read().await;
             if let Some(lane) = stages.get(stage) {
-                return Arc::clone(lane);
+                return Ok(Arc::clone(lane));
             }
         }
 
         let mut stages = self.stages.write().await;
-        Arc::clone(
-            stages
-                .entry(stage.to_string())
-                .or_insert_with(|| Arc::new(StageLane::new(&self.config))),
-        )
+        if let Some(lane) = stages.get(stage) {
+            return Ok(Arc::clone(lane));
+        }
+        if stages.len() >= MAX_STAGE_LANES {
+            return Err(format!("stage lane limit reached: {MAX_STAGE_LANES}"));
+        }
+        let lane = Arc::new(StageLane::new(&self.config));
+        stages.insert(stage.to_string(), Arc::clone(&lane));
+        Ok(lane)
     }
 
     async fn get_stage_lane(&self, stage: &str) -> Option<Arc<StageLane>> {
@@ -551,6 +647,7 @@ impl UploadResponseService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn append_cache_with_backpressure(
         &self,
         stream_id: u64,
@@ -561,14 +658,24 @@ impl UploadResponseService {
         lane: &str,
         data: Bytes,
     ) -> Result<(), String> {
-        let next_slot = cache.last(stream_idx).unwrap_or(0) + 1;
+        let next_slot = cache
+            .last(stream_idx)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| format!("{lane} slot index overflow for stream {stream_id}"))?;
         let bytes = data.len();
         self.wait_for_reader_capacity(stream_id, stream_idx, next_slot, positions, notifies, lane)
             .await?;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return Err(format!("{lane} stream closed: {stream_id}"));
+        }
         cache
             .add(stream_idx, next_slot, data)
             .await
             .map_err(|e| e.to_string())?;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return Err(format!("{lane} stream closed: {stream_id}"));
+        }
         debug!(
             stream_id,
             stream_idx,
@@ -580,18 +687,30 @@ impl UploadResponseService {
         Ok(())
     }
 
-    async fn register_stream_reader(
+    async fn register_stream_reader_at(
         &self,
+        stream_idx: usize,
         stream_id: u64,
         worker_id: &str,
-    ) -> Option<(usize, bool)> {
-        let stream_idx = self.stream_idx(stream_id)?;
+    ) -> Option<bool> {
+        if !Self::valid_reader_id(worker_id) {
+            return None;
+        }
         let mut workers = self.stream_workers.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return None;
+        }
+        if !workers[stream_idx].contains(worker_id)
+            && workers[stream_idx].len() >= MAX_READERS_PER_STREAM
+        {
+            return None;
+        }
         let inserted = workers[stream_idx].insert(worker_id.to_string());
         if inserted {
-            self.stream_worker_counts[stream_idx].fetch_add(1, Ordering::SeqCst);
+            self.stream_worker_counts[stream_idx].fetch_add(1, Ordering::Relaxed);
         }
-        Some((stream_idx, inserted))
+        debug!(stream_id, worker_id, "Reader registered");
+        Some(inserted)
     }
 
     async fn register_lane_reader(
@@ -602,17 +721,23 @@ impl UploadResponseService {
         positions: &Arc<RwLock<Vec<HashMap<String, usize>>>>,
         notifies: &[Arc<Notify>],
         lane: &str,
-    ) {
+    ) -> bool {
         let mut positions = positions.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return false;
+        }
         positions[stream_idx]
             .entry(worker_id.to_string())
             .or_insert(0);
         debug!(stream_id, worker_id, lane, "Reader registered");
         notifies[stream_idx].notify_waiters();
+        true
     }
 
-    async fn mark_lane_reader_position(
+    #[allow(clippy::too_many_arguments)]
+    async fn mark_lane_reader_position_at(
         &self,
+        stream_idx: usize,
         stream_id: u64,
         worker_id: &str,
         slot_id: usize,
@@ -620,11 +745,11 @@ impl UploadResponseService {
         notifies: &[Arc<Notify>],
         lane: &str,
     ) -> bool {
-        let Some(stream_idx) = self.stream_idx(stream_id) else {
-            return false;
-        };
         let advanced = {
             let mut positions = positions.write().await;
+            if !self.is_current_slot(stream_id, stream_idx) {
+                return false;
+            }
             let Some(position) = positions[stream_idx].get_mut(worker_id) else {
                 return false;
             };
@@ -650,23 +775,31 @@ impl UploadResponseService {
     }
 
     pub async fn active_streams(&self) -> Vec<ActiveStreamInfo> {
-        let claims = self.response_claims.read().await;
-        let stage_names = self.stage_names().await;
+        let claims = self.response_claims.read().await.clone();
+        let stage_lanes: Vec<(String, Arc<StageLane>)> = {
+            let stages = self.stages.read().await;
+            stages
+                .iter()
+                .map(|(name, lane)| (name.clone(), Arc::clone(lane)))
+                .collect()
+        };
         let mut active = Vec::new();
 
         for slot in self.active_stream_slots() {
             let mut stages = BTreeMap::new();
-            for stage_name in &stage_names {
-                if let Some(lane) = self.get_stage_lane(stage_name).await {
-                    let owner = {
-                        let stage_claims = lane.claims.read().await;
-                        stage_claims[slot.stream_idx].clone()
-                    };
-                    let last = lane.last(slot.stream_idx);
-                    if last > 0 || owner.is_some() {
-                        stages.insert(stage_name.clone(), StageState { last, owner });
-                    }
+            for (stage_name, lane) in &stage_lanes {
+                let owner = {
+                    let stage_claims = lane.claims.read().await;
+                    stage_claims[slot.stream_idx].clone()
+                };
+                let last = lane.last(slot.stream_idx);
+                if last > 0 || owner.is_some() {
+                    stages.insert(stage_name.clone(), StageState { last, owner });
                 }
+            }
+
+            if !self.is_current_slot(slot.stream_id, slot.stream_idx) {
+                continue;
             }
 
             active.push(ActiveStreamInfo {
@@ -715,6 +848,35 @@ impl UploadResponseService {
             let mut claims = self.response_claims.write().await;
             claims[stream_idx] = None;
         }
+        self.notify_response_update(stream_idx);
+    }
+
+    async fn notify_slot_waiters(&self, stream_idx: usize) {
+        if let Some(notify) = self.request_reader_notifies.get(stream_idx) {
+            notify.notify_waiters();
+        }
+        if let Some(notify) = self.response_reader_notifies.get(stream_idx) {
+            notify.notify_waiters();
+        }
+        self.notify_response_update(stream_idx);
+        let lanes: Vec<_> = {
+            let stages = self.stages.read().await;
+            stages.values().cloned().collect()
+        };
+        for lane in lanes {
+            if let Some(notify) = lane.reader_notifies.get(stream_idx) {
+                notify.notify_waiters();
+            }
+        }
+    }
+
+    fn allocate_stream_id(&self) -> u64 {
+        loop {
+            let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
+            if stream_id != 0 && self.stream_idx(stream_id).is_none() {
+                return stream_id;
+            }
+        }
     }
 
     pub async fn close_stream(&self, stream_id: u64) {
@@ -730,7 +892,10 @@ impl UploadResponseService {
         };
 
         self.slot_stream_ids[stream_idx].store(0, Ordering::Release);
+        self.notify_slot_waiters(stream_idx).await;
+        let slot_guard = Arc::clone(&self.slot_locks[stream_idx]).lock_owned().await;
         self.clear_slot_state(stream_idx).await;
+        drop(slot_guard);
         self.drop_response_channel(stream_id).await;
         self.release_slot(stream_idx);
         debug!(stream_id, stream_idx, "Stream closed");
@@ -744,21 +909,43 @@ impl UploadResponseService {
             .await
             .map_err(|_| "streams closed".to_string())?;
 
+        self.open_stream_with_permit(permit).await
+    }
+
+    /// Open a stream without waiting for another stream to release capacity.
+    pub async fn try_open_stream(self: &Arc<Self>) -> Result<UploadStream, String> {
+        let permit = self
+            .slot_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "no stream capacity available".to_string())?;
+
+        self.open_stream_with_permit(permit).await
+    }
+
+    async fn open_stream_with_permit(
+        self: &Arc<Self>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<UploadStream, String> {
         let stream_idx = self
             .allocate_slot()
             .ok_or_else(|| "no free slot available".to_string())?;
-        let stream_id = self.next_stream_id.fetch_add(1, Ordering::SeqCst);
+        let slot_guard = Arc::clone(&self.slot_locks[stream_idx]).lock_owned().await;
+        let stream_id = self.allocate_stream_id();
 
         self.clear_slot_state(stream_idx).await;
 
-        {
-            let mut stream_to_slot = self
-                .stream_to_slot
-                .write()
-                .map_err(|_| "stream slot registry poisoned".to_string())?;
+        let registry_result = self.stream_to_slot.write().map(|mut stream_to_slot| {
             stream_to_slot.insert(stream_id, stream_idx);
+        });
+        if registry_result.is_err() {
+            drop(slot_guard);
+            self.release_slot(stream_idx);
+            drop(permit);
+            return Err("stream slot registry poisoned".to_string());
         }
         self.slot_stream_ids[stream_idx].store(stream_id, Ordering::Release);
+        drop(slot_guard);
 
         debug!(stream_id, stream_idx, "Stream opened");
 
@@ -778,9 +965,11 @@ impl UploadResponseService {
     /// Returns `true` if this worker was newly registered.
     /// Returns `false` if this worker was already registered on this stream.
     pub async fn register_reader(&self, stream_id: u64, worker_id: &str) -> bool {
-        self.register_stream_reader(stream_id, worker_id)
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        self.register_stream_reader_at(stream_idx, stream_id, worker_id)
             .await
-            .map(|(_, inserted)| inserted)
             .unwrap_or(false)
     }
 
@@ -789,19 +978,28 @@ impl UploadResponseService {
     /// Request readers drive backpressure for request body producers. Slot `1`
     /// remains protected until the worker marks it consumed.
     pub async fn register_request_reader(&self, stream_id: u64, worker_id: &str) -> bool {
-        let Some((stream_idx, inserted)) = self.register_stream_reader(stream_id, worker_id).await
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        let Some(inserted) = self
+            .register_stream_reader_at(stream_idx, stream_id, worker_id)
+            .await
         else {
             return false;
         };
-        self.register_lane_reader(
-            stream_id,
-            stream_idx,
-            worker_id,
-            &self.request_reader_positions,
-            &self.request_reader_notifies,
-            "request",
-        )
-        .await;
+        if !self
+            .register_lane_reader(
+                stream_id,
+                stream_idx,
+                worker_id,
+                &self.request_reader_positions,
+                &self.request_reader_notifies,
+                "request",
+            )
+            .await
+        {
+            return false;
+        }
         inserted
     }
 
@@ -812,20 +1010,31 @@ impl UploadResponseService {
         stage: &str,
         worker_id: &str,
     ) -> bool {
-        let Some((stream_idx, inserted)) = self.register_stream_reader(stream_id, worker_id).await
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        let Ok(lane) = self.get_or_create_stage_lane(stage).await else {
+            return false;
+        };
+        let Some(inserted) = self
+            .register_stream_reader_at(stream_idx, stream_id, worker_id)
+            .await
         else {
             return false;
         };
-        let lane = self.get_or_create_stage_lane(stage).await;
-        self.register_lane_reader(
-            stream_id,
-            stream_idx,
-            worker_id,
-            &lane.reader_positions,
-            &lane.reader_notifies,
-            stage,
-        )
-        .await;
+        if !self
+            .register_lane_reader(
+                stream_id,
+                stream_idx,
+                worker_id,
+                &lane.reader_positions,
+                &lane.reader_notifies,
+                stage,
+            )
+            .await
+        {
+            return false;
+        }
         inserted
     }
 
@@ -836,7 +1045,11 @@ impl UploadResponseService {
         worker_id: &str,
         slot_id: usize,
     ) -> bool {
-        self.mark_lane_reader_position(
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        self.mark_lane_reader_position_at(
+            stream_idx,
             stream_id,
             worker_id,
             slot_id,
@@ -855,10 +1068,14 @@ impl UploadResponseService {
         worker_id: &str,
         slot_id: usize,
     ) -> bool {
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
         let Some(lane) = self.get_stage_lane(stage).await else {
             return false;
         };
-        self.mark_lane_reader_position(
+        self.mark_lane_reader_position_at(
+            stream_idx,
             stream_id,
             worker_id,
             slot_id,
@@ -873,11 +1090,19 @@ impl UploadResponseService {
     ///
     /// Response producers retain every unread slot for every registered reader.
     pub async fn register_response_reader(&self, stream_id: u64, reader_id: &str) -> bool {
+        if !Self::valid_reader_id(reader_id) {
+            return false;
+        }
         let Some(stream_idx) = self.stream_idx(stream_id) else {
             return false;
         };
         let mut positions = self.response_reader_positions.write().await;
-        let inserted = if positions[stream_idx].contains_key(reader_id) {
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return false;
+        }
+        let inserted = if positions[stream_idx].contains_key(reader_id)
+            || positions[stream_idx].len() >= MAX_READERS_PER_STREAM
+        {
             false
         } else {
             positions[stream_idx].insert(reader_id.to_string(), 0);
@@ -895,7 +1120,11 @@ impl UploadResponseService {
         reader_id: &str,
         slot_id: usize,
     ) -> bool {
-        self.mark_lane_reader_position(
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            return false;
+        };
+        self.mark_lane_reader_position_at(
+            stream_idx,
             stream_id,
             reader_id,
             slot_id,
@@ -912,6 +1141,9 @@ impl UploadResponseService {
             return false;
         };
         let mut positions = self.response_reader_positions.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return false;
+        }
         let removed = positions[stream_idx].remove(reader_id).is_some();
         drop(positions);
         self.response_reader_notifies[stream_idx].notify_waiters();
@@ -927,7 +1159,9 @@ impl UploadResponseService {
             return false;
         };
         let positions = self.response_reader_positions.read().await;
-        positions[stream_idx].contains_key(reader_id)
+        let registered = positions[stream_idx].contains_key(reader_id);
+        drop(positions);
+        registered && self.is_current_slot(stream_id, stream_idx)
     }
 
     /// Unregister a reader worker from a stream.
@@ -939,14 +1173,20 @@ impl UploadResponseService {
             return false;
         };
         let mut workers = self.stream_workers.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return false;
+        }
         let removed = workers[stream_idx].remove(worker_id);
         if removed {
-            self.stream_worker_counts[stream_idx].fetch_sub(1, Ordering::SeqCst);
+            self.stream_worker_counts[stream_idx].fetch_sub(1, Ordering::Relaxed);
             debug!(stream_id, worker_id, "Reader unregistered");
         }
+        drop(workers);
         {
             let mut positions = self.request_reader_positions.write().await;
-            positions[stream_idx].remove(worker_id);
+            if self.is_current_slot(stream_id, stream_idx) {
+                positions[stream_idx].remove(worker_id);
+            }
         }
         self.request_reader_notifies[stream_idx].notify_waiters();
         {
@@ -955,7 +1195,9 @@ impl UploadResponseService {
             drop(stages);
             for lane in lanes {
                 let mut positions = lane.reader_positions.write().await;
-                positions[stream_idx].remove(worker_id);
+                if self.is_current_slot(stream_id, stream_idx) {
+                    positions[stream_idx].remove(worker_id);
+                }
                 lane.reader_notifies[stream_idx].notify_waiters();
             }
         }
@@ -965,7 +1207,8 @@ impl UploadResponseService {
     /// Get the number of readers currently processing a stream (lock-free).
     pub fn reader_count(&self, stream_id: u64) -> u64 {
         self.stream_idx(stream_id)
-            .map(|stream_idx| self.stream_worker_counts[stream_idx].load(Ordering::SeqCst))
+            .filter(|stream_idx| self.is_current_slot(stream_id, *stream_idx))
+            .map(|stream_idx| self.stream_worker_counts[stream_idx].load(Ordering::Relaxed))
             .unwrap_or(0)
     }
 
@@ -980,7 +1223,9 @@ impl UploadResponseService {
             return false;
         };
         let workers = self.stream_workers.read().await;
-        workers[stream_idx].contains(worker_id)
+        let registered = workers[stream_idx].contains(worker_id);
+        drop(workers);
+        registered && self.is_current_slot(stream_id, stream_idx)
     }
 
     /// Get all reader worker IDs currently processing a stream.
@@ -989,7 +1234,13 @@ impl UploadResponseService {
             return Vec::new();
         };
         let workers = self.stream_workers.read().await;
-        workers[stream_idx].iter().cloned().collect()
+        let readers = workers[stream_idx].iter().cloned().collect();
+        drop(workers);
+        if self.is_current_slot(stream_id, stream_idx) {
+            readers
+        } else {
+            Vec::new()
+        }
     }
 
     /// Clear all readers from a stream (for cleanup/recovery).
@@ -998,10 +1249,16 @@ impl UploadResponseService {
             return;
         };
         let mut workers = self.stream_workers.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return;
+        }
         workers[stream_idx].clear();
+        drop(workers);
         {
             let mut positions = self.request_reader_positions.write().await;
-            positions[stream_idx].clear();
+            if self.is_current_slot(stream_id, stream_idx) {
+                positions[stream_idx].clear();
+            }
         }
         self.request_reader_notifies[stream_idx].notify_waiters();
         {
@@ -1010,11 +1267,13 @@ impl UploadResponseService {
             drop(stages);
             for lane in lanes {
                 let mut positions = lane.reader_positions.write().await;
-                positions[stream_idx].clear();
+                if self.is_current_slot(stream_id, stream_idx) {
+                    positions[stream_idx].clear();
+                }
                 lane.reader_notifies[stream_idx].notify_waiters();
             }
         }
-        self.stream_worker_counts[stream_idx].store(0, Ordering::SeqCst);
+        self.stream_worker_counts[stream_idx].store(0, Ordering::Relaxed);
         debug!(stream_id, "All readers cleared");
     }
 
@@ -1022,11 +1281,19 @@ impl UploadResponseService {
 
     /// Try to claim exclusive access to a named stage on a stream.
     pub async fn try_claim_stage(&self, stream_id: u64, stage: &str, worker_id: &str) -> bool {
+        if !Self::valid_reader_id(worker_id) {
+            return false;
+        }
         let Some(stream_idx) = self.stream_idx(stream_id) else {
             return false;
         };
-        let lane = self.get_or_create_stage_lane(stage).await;
+        let Ok(lane) = self.get_or_create_stage_lane(stage).await else {
+            return false;
+        };
         let mut claims = lane.claims.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return false;
+        }
         if claims[stream_idx].is_none() {
             claims[stream_idx] = Some(worker_id.to_string());
             debug!(stream_id, stage, worker_id, "Stage claimed");
@@ -1045,6 +1312,9 @@ impl UploadResponseService {
             return false;
         };
         let mut claims = lane.claims.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return false;
+        }
         if claims[stream_idx].as_deref() == Some(worker_id) {
             claims[stream_idx] = None;
             debug!(stream_id, stage, worker_id, "Stage released");
@@ -1063,6 +1333,9 @@ impl UploadResponseService {
             return;
         };
         let mut claims = lane.claims.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return;
+        }
         claims[stream_idx] = None;
         debug!(stream_id, stage, "Stage force-released");
     }
@@ -1072,7 +1345,11 @@ impl UploadResponseService {
         let stream_idx = self.stream_idx(stream_id)?;
         let lane = self.get_stage_lane(stage).await?;
         let claims = lane.claims.read().await;
-        claims[stream_idx].clone()
+        let owner = claims[stream_idx].clone();
+        drop(claims);
+        self.is_current_slot(stream_id, stream_idx)
+            .then_some(owner)
+            .flatten()
     }
 
     /// Check if a stage is claimed by anyone.
@@ -1084,7 +1361,9 @@ impl UploadResponseService {
             return false;
         };
         let claims = lane.claims.read().await;
-        claims[stream_idx].is_some()
+        let claimed = claims[stream_idx].is_some();
+        drop(claims);
+        claimed && self.is_current_slot(stream_id, stream_idx)
     }
 
     /// Try to claim exclusive write access to a stream's response.
@@ -1093,10 +1372,16 @@ impl UploadResponseService {
     /// Returns `true` if the claim succeeded (response was unclaimed).
     /// Returns `false` if another worker already claimed this response.
     pub async fn try_claim_response(&self, stream_id: u64, worker_id: &str) -> bool {
+        if !Self::valid_reader_id(worker_id) {
+            return false;
+        }
         let Some(stream_idx) = self.stream_idx(stream_id) else {
             return false;
         };
         let mut claims = self.response_claims.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return false;
+        }
         if claims[stream_idx].is_none() {
             claims[stream_idx] = Some(worker_id.to_string());
             debug!(stream_id, worker_id, "Response claimed");
@@ -1115,6 +1400,9 @@ impl UploadResponseService {
             return false;
         };
         let mut claims = self.response_claims.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return false;
+        }
         if claims[stream_idx].as_deref() == Some(worker_id) {
             claims[stream_idx] = None;
             debug!(stream_id, worker_id, "Response released");
@@ -1130,6 +1418,9 @@ impl UploadResponseService {
             return;
         };
         let mut claims = self.response_claims.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return;
+        }
         claims[stream_idx] = None;
         debug!(stream_id, "Response force-released");
     }
@@ -1138,7 +1429,11 @@ impl UploadResponseService {
     pub async fn response_owner(&self, stream_id: u64) -> Option<String> {
         let stream_idx = self.stream_idx(stream_id)?;
         let claims = self.response_claims.read().await;
-        claims[stream_idx].clone()
+        let owner = claims[stream_idx].clone();
+        drop(claims);
+        self.is_current_slot(stream_id, stream_idx)
+            .then_some(owner)
+            .flatten()
     }
 
     /// Check if the response is claimed by a specific worker.
@@ -1147,7 +1442,9 @@ impl UploadResponseService {
             return false;
         };
         let claims = self.response_claims.read().await;
-        claims[stream_idx].as_deref() == Some(worker_id)
+        let claimed = claims[stream_idx].as_deref() == Some(worker_id);
+        drop(claims);
+        claimed && self.is_current_slot(stream_id, stream_idx)
     }
 
     /// Check if the response is currently claimed by anyone.
@@ -1156,7 +1453,9 @@ impl UploadResponseService {
             return false;
         };
         let claims = self.response_claims.read().await;
-        claims[stream_idx].is_some()
+        let claimed = claims[stream_idx].is_some();
+        drop(claims);
+        claimed && self.is_current_slot(stream_id, stream_idx)
     }
 
     fn prune_stale_workers_locked(
@@ -1179,7 +1478,19 @@ impl UploadResponseService {
             available_slots: update.available_slots.min(update.max_inflight),
             updated_at_ms: now_unix_ms(),
         };
+        if !Self::valid_reader_id(worker_id) || !Self::valid_stage_name(&heartbeat.stage) {
+            return heartbeat;
+        }
         let mut workers = self.workers.write().await;
+        if !workers.contains_key(worker_id) && workers.len() >= MAX_WORKER_HEARTBEATS {
+            if let Some(oldest) = workers
+                .iter()
+                .min_by_key(|(_, worker)| worker.updated_at_ms)
+                .map(|(worker_id, _)| worker_id.clone())
+            {
+                workers.remove(&oldest);
+            }
+        }
         workers.insert(worker_id.to_string(), heartbeat.clone());
         heartbeat
     }
@@ -1204,9 +1515,15 @@ impl UploadResponseService {
         let workers = self.list_workers(ttl_ms).await;
         WorkerCapacitySummary {
             workers: workers.len(),
-            total_max_inflight: workers.iter().map(|worker| worker.max_inflight).sum(),
-            total_inflight: workers.iter().map(|worker| worker.inflight).sum(),
-            total_available_slots: workers.iter().map(|worker| worker.available_slots).sum(),
+            total_max_inflight: workers.iter().fold(0usize, |total, worker| {
+                total.saturating_add(worker.max_inflight)
+            }),
+            total_inflight: workers.iter().fold(0usize, |total, worker| {
+                total.saturating_add(worker.inflight)
+            }),
+            total_available_slots: workers.iter().fold(0usize, |total, worker| {
+                total.saturating_add(worker.available_slots)
+            }),
         }
     }
 
@@ -1216,14 +1533,27 @@ impl UploadResponseService {
     }
 
     /// Get a reference to a named stage cache for external consumers.
-    pub async fn stage_cache(&self, stage: &str) -> Arc<ChunkCache> {
-        let lane = self.get_or_create_stage_lane(stage).await;
-        Arc::clone(&lane.cache)
+    pub async fn stage_cache(&self, stage: &str) -> Result<Arc<ChunkCache>, String> {
+        let lane = self.get_or_create_stage_lane(stage).await?;
+        Ok(Arc::clone(&lane.cache))
     }
 
     /// Get a reference to the response cache for external consumers
     pub fn response_cache(&self) -> Arc<ChunkCache> {
         Arc::clone(&self.response_cache)
+    }
+
+    /// Return a notification source for any response-lane lifecycle or write.
+    pub fn response_updates(&self) -> Arc<Notify> {
+        Arc::clone(&self.response_updates)
+    }
+
+    /// Return the fixed-lane response notification source for one active stream.
+    pub fn response_update_notifier(&self, stream_id: u64) -> Option<Arc<Notify>> {
+        let stream_idx = self.stream_idx(stream_id)?;
+        let notifier = self.response_cache.update_notifier(stream_idx)?;
+        self.is_current_slot(stream_id, stream_idx)
+            .then_some(notifier)
     }
 
     /// Get the configuration
@@ -1247,12 +1577,12 @@ impl UploadResponseService {
 
     /// Get the next sequential stream ID
     pub fn next_id(&self) -> u64 {
-        self.next_stream_id.fetch_add(1, Ordering::SeqCst)
+        self.allocate_stream_id()
     }
 
     /// Peek at the next stream ID that will be assigned (without incrementing)
     pub fn peek_next_id(&self) -> u64 {
-        self.next_stream_id.load(Ordering::SeqCst)
+        self.next_stream_id.load(Ordering::Relaxed).max(1)
     }
 
     /// Write HPKS headers frame to slot 1 of request stream
@@ -1261,15 +1591,21 @@ impl UploadResponseService {
         stream_id: u64,
         headers: StreamHeaders,
     ) -> Result<(), String> {
-        let stream_idx = self
-            .stream_idx(stream_id)
-            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        if self.request_started[stream_idx].load(Ordering::Acquire) {
+            return Err(format!(
+                "request headers already written for stream: {stream_id}"
+            ));
+        }
         let encoded = encode_frame(&StreamFrame::Headers(headers));
         self.request_cache
             .add(stream_idx, 1, Bytes::from(encoded))
             .await
             .map_err(|e| e.to_string())?;
-        self.request_started[stream_idx].store(true, Ordering::SeqCst);
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return Err(format!("request stream closed: {stream_id}"));
+        }
+        self.request_started[stream_idx].store(true, Ordering::Release);
         debug!(
             stream_id,
             stream_idx,
@@ -1285,10 +1621,8 @@ impl UploadResponseService {
         if data.is_empty() {
             return Err("request body chunks cannot be empty".to_string());
         }
-        let stream_idx = self
-            .stream_idx(stream_id)
-            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
-        if !self.request_started[stream_idx].load(Ordering::SeqCst) {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        if !self.request_started[stream_idx].load(Ordering::Acquire) {
             return Err(format!(
                 "request headers not written for stream: {stream_id}"
             ));
@@ -1311,10 +1645,8 @@ impl UploadResponseService {
         stream_id: u64,
         control: RequestControl,
     ) -> Result<(), String> {
-        let stream_idx = self
-            .stream_idx(stream_id)
-            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
-        if !self.request_started[stream_idx].load(Ordering::SeqCst) {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        if !self.request_started[stream_idx].load(Ordering::Acquire) {
             return Err(format!(
                 "request headers not written for stream: {stream_id}"
             ));
@@ -1333,10 +1665,8 @@ impl UploadResponseService {
 
     /// Write end marker to request stream
     pub async fn end_request(&self, stream_id: u64) -> Result<(), String> {
-        let stream_idx = self
-            .stream_idx(stream_id)
-            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
-        if !self.request_started[stream_idx].load(Ordering::SeqCst) {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        if !self.request_started[stream_idx].load(Ordering::Acquire) {
             return Err(format!(
                 "request headers not written for stream: {stream_id}"
             ));
@@ -1363,15 +1693,21 @@ impl UploadResponseService {
         if head.is_empty() {
             return Err("stage head cannot be empty".to_string());
         }
-        let stream_idx = self
-            .stream_idx(stream_id)
-            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
-        let lane = self.get_or_create_stage_lane(stage).await;
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        let lane = self.get_or_create_stage_lane(stage).await?;
+        if lane.started[stream_idx].load(Ordering::Acquire) {
+            return Err(format!(
+                "stage head already written for stream: {stream_id}"
+            ));
+        }
         lane.cache
             .add(stream_idx, 1, head)
             .await
             .map_err(|e| e.to_string())?;
-        lane.started[stream_idx].store(true, Ordering::SeqCst);
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return Err(format!("stage stream closed: {stream_id}"));
+        }
+        lane.started[stream_idx].store(true, Ordering::Release);
         Ok(())
     }
 
@@ -1385,11 +1721,9 @@ impl UploadResponseService {
         if data.is_empty() {
             return Err("stage body chunks cannot be empty".to_string());
         }
-        let stream_idx = self
-            .stream_idx(stream_id)
-            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
-        let lane = self.get_or_create_stage_lane(stage).await;
-        if !lane.started[stream_idx].load(Ordering::SeqCst) {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        let lane = self.get_or_create_stage_lane(stage).await?;
+        if !lane.started[stream_idx].load(Ordering::Acquire) {
             return Err(format!("stage head not written for stream: {stream_id}"));
         }
         self.append_cache_with_backpressure(
@@ -1411,11 +1745,9 @@ impl UploadResponseService {
         stage: &str,
         control: RequestControl,
     ) -> Result<(), String> {
-        let stream_idx = self
-            .stream_idx(stream_id)
-            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
-        let lane = self.get_or_create_stage_lane(stage).await;
-        if !lane.started[stream_idx].load(Ordering::SeqCst) {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        let lane = self.get_or_create_stage_lane(stage).await?;
+        if !lane.started[stream_idx].load(Ordering::Acquire) {
             return Err(format!("stage head not written for stream: {stream_id}"));
         }
         self.append_cache_with_backpressure(
@@ -1432,11 +1764,9 @@ impl UploadResponseService {
 
     /// Write end marker to a named stage stream.
     pub async fn end_stage(&self, stream_id: u64, stage: &str) -> Result<(), String> {
-        let stream_idx = self
-            .stream_idx(stream_id)
-            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
-        let lane = self.get_or_create_stage_lane(stage).await;
-        if !lane.started[stream_idx].load(Ordering::SeqCst) {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        let lane = self.get_or_create_stage_lane(stage).await?;
+        if !lane.started[stream_idx].load(Ordering::Acquire) {
             return Err(format!("stage head not written for stream: {stream_id}"));
         }
         self.append_cache_with_backpressure(
@@ -1457,15 +1787,22 @@ impl UploadResponseService {
         stream_id: u64,
         headers: StreamHeaders,
     ) -> Result<(), String> {
-        let stream_idx = self
-            .stream_idx(stream_id)
-            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        if self.response_started[stream_idx].load(Ordering::Acquire) {
+            return Err(format!(
+                "response headers already written for stream: {stream_id}"
+            ));
+        }
         let encoded = encode_frame(&StreamFrame::Headers(headers));
         self.response_cache
             .add(stream_idx, 1, Bytes::from(encoded))
             .await
             .map_err(|e| e.to_string())?;
-        self.response_started[stream_idx].store(true, Ordering::SeqCst);
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return Err(format!("response stream closed: {stream_id}"));
+        }
+        self.response_started[stream_idx].store(true, Ordering::Release);
+        self.notify_response_update(stream_idx);
         Ok(())
     }
 
@@ -1474,10 +1811,8 @@ impl UploadResponseService {
         if data.is_empty() {
             return Err("response body chunks cannot be empty".to_string());
         }
-        let stream_idx = self
-            .stream_idx(stream_id)
-            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
-        if !self.response_started[stream_idx].load(Ordering::SeqCst) {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        if !self.response_started[stream_idx].load(Ordering::Acquire) {
             return Err(format!(
                 "response headers not written for stream: {stream_id}"
             ));
@@ -1491,15 +1826,15 @@ impl UploadResponseService {
             "response",
             data,
         )
-        .await
+        .await?;
+        self.notify_response_update(stream_idx);
+        Ok(())
     }
 
     /// Write end marker to response stream
     pub async fn end_response(&self, stream_id: u64) -> Result<(), String> {
-        let stream_idx = self
-            .stream_idx(stream_id)
-            .ok_or_else(|| format!("unknown stream: {stream_id}"))?;
-        if !self.response_started[stream_idx].load(Ordering::SeqCst) {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        if !self.response_started[stream_idx].load(Ordering::Acquire) {
             return Err(format!(
                 "response headers not written for stream: {stream_id}"
             ));
@@ -1513,7 +1848,9 @@ impl UploadResponseService {
             "response",
             Bytes::from_static(END_MARKER),
         )
-        .await
+        .await?;
+        self.notify_response_update(stream_idx);
+        Ok(())
     }
 
     pub async fn write_handler_response(
@@ -1551,16 +1888,20 @@ impl UploadResponseService {
     /// Get last slot index for a request stream
     pub fn request_last(&self, stream_id: u64) -> Option<usize> {
         let stream_idx = self.stream_idx(stream_id)?;
-        if !self.request_started[stream_idx].load(Ordering::SeqCst) {
-            return Some(0);
-        }
-        self.request_cache.last(stream_idx)
+        let last = if self.request_started[stream_idx].load(Ordering::Acquire) {
+            self.request_cache.last(stream_idx)
+        } else {
+            Some(0)
+        };
+        self.is_current_slot(stream_id, stream_idx)
+            .then_some(last)
+            .flatten()
     }
 
     /// Get raw bytes from request stream slot
     pub async fn request_get(&self, stream_id: u64, slot_id: usize) -> Option<Bytes> {
         let stream_idx = self.stream_idx(stream_id)?;
-        if !self.request_started[stream_idx].load(Ordering::SeqCst) {
+        if !self.request_started[stream_idx].load(Ordering::Acquire) {
             debug!(
                 stream_id,
                 stream_idx,
@@ -1580,6 +1921,9 @@ impl UploadResponseService {
             );
             return None;
         };
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return None;
+        }
         debug!(
             stream_id,
             stream_idx,
@@ -1595,27 +1939,35 @@ impl UploadResponseService {
     /// Get last slot index for a response stream
     pub fn response_last(&self, stream_id: u64) -> Option<usize> {
         let stream_idx = self.stream_idx(stream_id)?;
-        if !self.response_started[stream_idx].load(Ordering::SeqCst) {
-            return Some(0);
-        }
-        self.response_cache.last(stream_idx)
+        let last = if self.response_started[stream_idx].load(Ordering::Acquire) {
+            self.response_cache.last(stream_idx)
+        } else {
+            Some(0)
+        };
+        self.is_current_slot(stream_id, stream_idx)
+            .then_some(last)
+            .flatten()
     }
 
     /// Get last slot index for a named stage stream.
     pub async fn stage_last(&self, stream_id: u64, stage: &str) -> Option<usize> {
         let stream_idx = self.stream_idx(stream_id)?;
         let lane = self.get_stage_lane(stage).await?;
-        if !lane.started[stream_idx].load(Ordering::SeqCst) {
-            return Some(0);
-        }
-        lane.cache.last(stream_idx)
+        let last = if lane.started[stream_idx].load(Ordering::Acquire) {
+            lane.cache.last(stream_idx)
+        } else {
+            Some(0)
+        };
+        self.is_current_slot(stream_id, stream_idx)
+            .then_some(last)
+            .flatten()
     }
 
     /// Get raw bytes from a named stage stream slot.
     pub async fn stage_get(&self, stream_id: u64, stage: &str, slot_id: usize) -> Option<Bytes> {
         let stream_idx = self.stream_idx(stream_id)?;
         let lane = self.get_stage_lane(stage).await?;
-        if !lane.started[stream_idx].load(Ordering::SeqCst) {
+        if !lane.started[stream_idx].load(Ordering::Acquire) {
             debug!(
                 stream_id,
                 stream_idx,
@@ -1635,6 +1987,9 @@ impl UploadResponseService {
             );
             return None;
         };
+        if !self.is_current_slot(stream_id, stream_idx) {
+            return None;
+        }
         debug!(
             stream_id,
             stream_idx,
@@ -1650,11 +2005,11 @@ impl UploadResponseService {
     /// Get raw bytes from response stream slot
     pub async fn response_get(&self, stream_id: u64, slot_id: usize) -> Option<Bytes> {
         let stream_idx = self.stream_idx(stream_id)?;
-        if !self.response_started[stream_idx].load(Ordering::SeqCst) {
+        if !self.response_started[stream_idx].load(Ordering::Acquire) {
             return None;
         }
         let (bytes, _hash) = self.response_cache.get(stream_idx, slot_id).await?;
-        Some(bytes)
+        self.is_current_slot(stream_id, stream_idx).then_some(bytes)
     }
 
     /// Check if slot is the end marker (empty)
@@ -1665,12 +2020,29 @@ impl UploadResponseService {
     /// Register a response channel for a given stream ID
     pub async fn register_response(&self, stream_id: u64) -> oneshot::Receiver<ResponseResult> {
         let (tx, rx) = oneshot::channel();
+        let Some(stream_idx) = self.stream_idx(stream_id) else {
+            let _ = tx.send(Err(format!("unknown stream: {stream_id}")));
+            return rx;
+        };
         let mut channels = self.response_channels.write().await;
+        if !self.is_current_slot(stream_id, stream_idx) {
+            drop(channels);
+            let _ = tx.send(Err(format!("stream closed: {stream_id}")));
+            return rx;
+        }
+        if channels.contains_key(&stream_id) {
+            drop(channels);
+            let _ = tx.send(Err(format!(
+                "response channel already registered for stream: {stream_id}"
+            )));
+            return rx;
+        }
         channels.insert(stream_id, tx);
         drop(channels);
         let _ = self
             .register_response_reader(stream_id, RESPONSE_WATCHER_READER_ID)
             .await;
+        self.notify_response_update(stream_idx);
         debug!(stream_id, "Registered response channel");
         rx
     }
@@ -1773,7 +2145,10 @@ impl UploadResponseRouter {
         }
     }
 
-    async fn collect_body(mut body: Option<BodyStream>) -> Result<Bytes, ServerError> {
+    async fn collect_body(
+        mut body: Option<BodyStream>,
+        max_bytes: usize,
+    ) -> Result<Bytes, ServerError> {
         let Some(ref mut body_stream) = body else {
             return Ok(Bytes::new());
         };
@@ -1781,6 +2156,18 @@ impl UploadResponseRouter {
         let mut collected = Vec::new();
         while let Some(chunk) = body_stream.next().await {
             let chunk = chunk?;
+            let next_len = collected
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(|| ServerError::Config("request body size overflow".to_string()))?;
+            if next_len > max_bytes {
+                return Err(ServerError::Config(format!(
+                    "request body exceeds {max_bytes} bytes"
+                )));
+            }
+            collected
+                .try_reserve(chunk.len())
+                .map_err(|_| ServerError::Config("request body allocation failed".to_string()))?;
             collected.extend_from_slice(&chunk);
         }
 
@@ -1860,8 +2247,16 @@ impl UploadResponseRouter {
                 &self.service.worker_capacity_summary(None).await,
             )),
             ("PUT", ["_upload_response", "workers", worker_id, "heartbeat"]) => {
-                let body = Self::collect_body(body).await?;
+                let body = Self::collect_body(body, MAX_INTERNAL_BODY_BYTES).await?;
                 let update = Self::parse_json_body::<WorkerHeartbeatUpdate>(body)?;
+                if !UploadResponseService::valid_reader_id(worker_id)
+                    || !UploadResponseService::valid_stage_name(&update.stage)
+                {
+                    return Ok(Self::text_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid worker id or stage",
+                    ));
+                }
                 let worker = self
                     .service
                     .upsert_worker_heartbeat(worker_id, update)
@@ -2189,7 +2584,7 @@ impl UploadResponseRouter {
                         "stream not found",
                     ));
                 }
-                let body = Self::collect_body(body).await?;
+                let body = Self::collect_body(body, self.service.config().slot_bytes()).await?;
                 self.service
                     .write_stage_head(stream_id, stage, body)
                     .await
@@ -2204,7 +2599,7 @@ impl UploadResponseRouter {
                         "stream not found",
                     ));
                 }
-                let body = Self::collect_body(body).await?;
+                let body = Self::collect_body(body, self.service.config().slot_bytes()).await?;
                 self.service
                     .append_stage_body(stream_id, stage, body)
                     .await
@@ -2219,7 +2614,7 @@ impl UploadResponseRouter {
                         "stream not found",
                     ));
                 }
-                let body = Self::collect_body(body).await?;
+                let body = Self::collect_body(body, REQUEST_CONTROL_MAGIC.len() + 1).await?;
                 let control = decode_request_control(&body).ok_or_else(|| {
                     ServerError::Config("expected encoded stage control marker".to_string())
                 })?;
@@ -2251,7 +2646,7 @@ impl UploadResponseRouter {
                         "stream not found",
                     ));
                 }
-                let body = Self::collect_body(body).await?;
+                let body = Self::collect_body(body, self.service.config().slot_bytes()).await?;
                 let frame = decode_frame(&body)
                     .map_err(|e| ServerError::Config(format!("invalid HPKS headers frame: {e}")))?;
                 match frame {
@@ -2282,7 +2677,7 @@ impl UploadResponseRouter {
                         "stream not found",
                     ));
                 }
-                let body = Self::collect_body(body).await?;
+                let body = Self::collect_body(body, self.service.config().slot_bytes()).await?;
                 self.service
                     .append_response_body(stream_id, body)
                     .await
@@ -2362,11 +2757,17 @@ impl UploadResponseRouter {
         req: Request<()>,
         mut body: Option<BodyStream>,
     ) -> HandlerResult<HandlerResponse> {
-        let stream = self
-            .service
-            .open_stream()
-            .await
-            .map_err(ServerError::Config)?;
+        let stream = match self.service.try_open_stream().await {
+            Ok(stream) => stream,
+            Err(error) => {
+                debug!(%error, "upload-response admission capacity is full");
+                return Ok(HandlerResponse {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    headers: vec![("retry-after".into(), "1".into())],
+                    ..Default::default()
+                });
+            }
+        };
         let stream_id = stream.stream_id();
         let rx = self.service.register_response(stream_id).await;
         debug!(stream_id, uri = %req.uri(), "Streaming request");
@@ -2495,7 +2896,7 @@ impl WebSocketHandler for UploadResponseWsHandler {
     ) -> HandlerResult<()> {
         let upload_stream = self
             .service
-            .open_stream()
+            .try_open_stream()
             .await
             .map_err(ServerError::Config)?;
         let stream_id = upload_stream.stream_id();
@@ -2520,11 +2921,11 @@ impl WebSocketHandler for UploadResponseWsHandler {
                         }
                         if data.len() <= slot_bytes {
                             self.service
-                                .append_request_body(stream_id, Bytes::from(data))
+                                .append_request_body(stream_id, data)
                                 .await
                                 .map_err(ServerError::Config)?;
                         } else {
-                            let mut remaining = Bytes::from(data);
+                            let mut remaining = data;
                             while !remaining.is_empty() {
                                 let take = remaining.len().min(slot_bytes);
                                 let chunk = remaining.split_to(take);
@@ -2726,6 +3127,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_rejects_immediately_when_stream_capacity_is_full() {
+        let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 1,
+            ..Default::default()
+        }));
+        let _active = service.open_stream().await.unwrap();
+        let router = UploadResponseRouter::new(service);
+        let request = Request::builder().uri("/upload").body(()).unwrap();
+
+        let response = timeout(Duration::from_millis(50), router.route(request))
+            .await
+            .expect("full admission waited instead of rejecting")
+            .unwrap();
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers, vec![("retry-after".into(), "1".into())]);
+    }
+
+    #[tokio::test]
     async fn test_stream_format() {
         let config = UploadResponseConfig::default();
         let service = Arc::new(UploadResponseService::new(config));
@@ -2776,6 +3195,126 @@ mod tests {
         assert!(UploadResponseService::is_end_marker(&slot4));
 
         upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_request_appends_publish_distinct_slots() {
+        let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 64,
+            ..Default::default()
+        }));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+        service
+            .write_request_headers(
+                stream_id,
+                StreamHeaders::Request(StreamRequestHeaders {
+                    stream_id,
+                    version: http_pack::HttpVersion::Http11,
+                    method: b"POST".to_vec(),
+                    scheme: None,
+                    authority: None,
+                    path: b"/concurrent".to_vec(),
+                    headers: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut appends = Vec::new();
+        for value in 0u8..32 {
+            let service = Arc::clone(&service);
+            appends.push(tokio::spawn(async move {
+                service
+                    .append_request_body(stream_id, Bytes::copy_from_slice(&[value]))
+                    .await
+            }));
+        }
+        for append in appends {
+            append.await.unwrap().unwrap();
+        }
+
+        let mut values = std::collections::HashSet::new();
+        for slot_id in 2..=33 {
+            let bytes = service.request_get(stream_id, slot_id).await.unwrap();
+            assert!(values.insert(bytes[0]));
+        }
+        assert_eq!(values.len(), 32);
+        upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn blocked_writer_cannot_cross_slot_reuse() {
+        let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 2,
+            response_timeout_ms: 1_000,
+            ..Default::default()
+        }));
+        let first_stream = service.open_stream().await.unwrap();
+        let first_id = first_stream.stream_id();
+        service
+            .write_request_headers(
+                first_id,
+                StreamHeaders::Request(StreamRequestHeaders {
+                    stream_id: first_id,
+                    version: http_pack::HttpVersion::Http11,
+                    method: b"POST".to_vec(),
+                    scheme: None,
+                    authority: None,
+                    path: b"/old".to_vec(),
+                    headers: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        service
+            .append_request_body(first_id, Bytes::from_static(b"retained"))
+            .await
+            .unwrap();
+
+        let old_service = Arc::clone(&service);
+        let blocked = tokio::spawn(async move {
+            old_service
+                .append_request_body(first_id, Bytes::from_static(b"must-not-cross"))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!blocked.is_finished());
+
+        first_stream.close().await;
+        let error = blocked.await.unwrap().unwrap_err();
+        assert!(error.contains("stream closed"));
+
+        let replacement = service.open_stream().await.unwrap();
+        assert_ne!(replacement.stream_id(), first_id);
+        assert_eq!(service.request_last(replacement.stream_id()), Some(0));
+        assert!(service
+            .request_get(replacement.stream_id(), 2)
+            .await
+            .is_none());
+        replacement.close().await;
+    }
+
+    #[test]
+    fn drop_without_a_runtime_releases_the_stream_slot() {
+        let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 1,
+            ..Default::default()
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let stream = runtime.block_on(service.open_stream()).unwrap();
+        drop(runtime);
+        drop(stream);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let replacement = runtime.block_on(service.open_stream()).unwrap();
+        runtime.block_on(replacement.close());
     }
 
     #[tokio::test]
@@ -3449,7 +3988,8 @@ mod tests {
         let config = UploadResponseConfig::default();
         let service = Arc::new(UploadResponseService::new(config));
 
-        let stream_id = service.next_id();
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
         let rx = service.register_response(stream_id).await;
 
         service
@@ -3466,6 +4006,7 @@ mod tests {
         let cached = rx.await.unwrap().unwrap();
         assert_eq!(cached.status, StatusCode::OK);
         assert_eq!(cached.body, Bytes::from("ok"));
+        upload_stream.close().await;
     }
 
     #[tokio::test]

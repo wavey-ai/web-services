@@ -2,8 +2,11 @@ use bytes::Bytes;
 use http::StatusCode;
 use http_pack::stream::{decode_frame, StreamFrame, StreamHeaders, StreamResponseHeaders};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use std::task::{Context, Poll};
+use tokio::task::{JoinError, JoinHandle};
 use tracing::{debug, trace};
 
 use crate::{CachedResponse, UploadResponseService, END_MARKER, RESPONSE_WATCHER_READER_ID};
@@ -12,7 +15,35 @@ use crate::{CachedResponse, UploadResponseService, END_MARKER, RESPONSE_WATCHER_
 /// to waiting clients via oneshot channels.
 pub struct ResponseWatcher {
     service: Arc<UploadResponseService>,
-    poll_interval_ms: u64,
+}
+
+/// Owns one response watcher task and stops it when the handle is dropped.
+pub struct ResponseWatcherHandle {
+    task: JoinHandle<()>,
+}
+
+impl ResponseWatcherHandle {
+    pub fn abort(&self) {
+        self.task.abort();
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+}
+
+impl Future for ResponseWatcherHandle {
+    type Output = Result<(), JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.task).poll(context)
+    }
+}
+
+impl Drop for ResponseWatcherHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// State for tracking a response stream being assembled
@@ -20,14 +51,18 @@ struct ResponseAssembly {
     status: Option<u16>,
     headers: Vec<(String, String)>,
     body_chunks: Vec<Bytes>,
+    body_bytes: usize,
+    max_body_bytes: usize,
 }
 
 impl ResponseAssembly {
-    fn new() -> Self {
+    fn new(max_body_bytes: usize) -> Self {
         Self {
             status: None,
             headers: Vec::new(),
             body_chunks: Vec::new(),
+            body_bytes: 0,
+            max_body_bytes,
         }
     }
 
@@ -45,15 +80,31 @@ impl ResponseAssembly {
             .collect();
     }
 
-    fn add_body(&mut self, data: Bytes) {
+    fn add_body(&mut self, data: Bytes) -> Result<(), String> {
+        let body_bytes = self
+            .body_bytes
+            .checked_add(data.len())
+            .ok_or_else(|| "response body size overflow".to_string())?;
+        if body_bytes > self.max_body_bytes {
+            return Err(format!(
+                "response body exceeds {} bytes",
+                self.max_body_bytes
+            ));
+        }
+        self.body_bytes = body_bytes;
         self.body_chunks.push(data);
+        Ok(())
     }
 
     fn finalize(self) -> Result<CachedResponse, String> {
         let status = self.status.ok_or("missing status")?;
         let status = StatusCode::from_u16(status).map_err(|e| e.to_string())?;
 
-        let total_len: usize = self.body_chunks.iter().map(|c| c.len()).sum();
+        let total_len = self.body_chunks.iter().try_fold(0usize, |total, chunk| {
+            total
+                .checked_add(chunk.len())
+                .ok_or("response body too large")
+        })?;
         let mut body = Vec::with_capacity(total_len);
         for chunk in self.body_chunks {
             body.extend_from_slice(&chunk);
@@ -70,29 +121,31 @@ impl ResponseAssembly {
 impl ResponseWatcher {
     /// Create a new response watcher
     pub fn new(service: Arc<UploadResponseService>) -> Self {
-        Self {
-            service,
-            poll_interval_ms: 1,
-        }
+        Self { service }
     }
 
-    /// Set the poll interval in milliseconds
-    pub fn with_poll_interval_ms(mut self, ms: u64) -> Self {
-        self.poll_interval_ms = ms;
+    /// Retain source compatibility with the former polling watcher.
+    pub fn with_poll_interval_ms(self, _ms: u64) -> Self {
         self
     }
 
     /// Start the watcher loop in a background task
-    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+    pub fn spawn(self) -> ResponseWatcherHandle {
+        let task = tokio::spawn(async move {
             self.watch_loop().await;
-        })
+        });
+        ResponseWatcherHandle { task }
     }
 
-    /// Main watch loop - polls all response streams for new slots
+    /// Process all response streams after each cache update.
     async fn watch_loop(self) {
-        let mut poll_interval = interval(Duration::from_millis(self.poll_interval_ms));
+        let updates = self.service.response_updates();
         let num_streams = self.service.config().num_streams;
+        let max_body_bytes = self
+            .service
+            .config()
+            .slot_bytes()
+            .saturating_mul(self.service.config().slots_per_stream);
 
         // Track the stream currently assigned to each slot and the last slot seen for it.
         let mut stream_ids: Vec<u64> = vec![0; num_streams];
@@ -100,9 +153,17 @@ impl ResponseWatcher {
         let mut assemblies: HashMap<u64, ResponseAssembly> = HashMap::new();
 
         loop {
-            poll_interval.tick().await;
+            let notified = updates.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
-            for stream_idx in 0..num_streams {
+            let dirty_slots = self.service.take_response_dirty_slots();
+            if dirty_slots.is_empty() {
+                notified.await;
+                continue;
+            }
+
+            for stream_idx in dirty_slots {
                 let stream_id = self.service.slot_stream_id(stream_idx).unwrap_or(0);
                 let previous_stream_id = stream_ids[stream_idx];
 
@@ -146,12 +207,32 @@ impl ResponseWatcher {
                         break;
                     };
                     if slot_id == 1 {
-                        if let Ok(frame) = decode_frame(&bytes) {
-                            if let StreamFrame::Headers(StreamHeaders::Response(resp)) = frame {
+                        match decode_frame(&bytes) {
+                            Ok(StreamFrame::Headers(StreamHeaders::Response(resp)))
+                                if resp.stream_id == stream_id =>
+                            {
                                 trace!(stream_id, status = resp.status, "Response headers");
-                                let mut assembly = ResponseAssembly::new();
+                                let mut assembly = ResponseAssembly::new(max_body_bytes);
                                 assembly.set_headers(resp);
                                 assemblies.insert(stream_id, assembly);
+                            }
+                            Ok(_) => {
+                                self.deliver_response(
+                                    stream_id,
+                                    Err("slot 1 was not matching response headers".to_string()),
+                                )
+                                .await;
+                                processed_last = slot_id;
+                                break;
+                            }
+                            Err(error) => {
+                                self.deliver_response(
+                                    stream_id,
+                                    Err(format!("invalid response headers: {error}")),
+                                )
+                                .await;
+                                processed_last = slot_id;
+                                break;
                             }
                         }
                     } else if bytes.as_ref() == END_MARKER {
@@ -163,7 +244,12 @@ impl ResponseWatcher {
                     } else {
                         trace!(stream_id, len = bytes.len(), "Response body chunk");
                         if let Some(assembly) = assemblies.get_mut(&stream_id) {
-                            assembly.add_body(bytes);
+                            if let Err(error) = assembly.add_body(bytes) {
+                                assemblies.remove(&stream_id);
+                                self.deliver_response(stream_id, Err(error)).await;
+                                processed_last = slot_id;
+                                break;
+                            }
                         }
                     }
                     let _ = self
@@ -179,6 +265,8 @@ impl ResponseWatcher {
 
                 last_seen[stream_idx] = processed_last;
             }
+
+            notified.await;
         }
     }
 
@@ -230,12 +318,17 @@ mod tests {
         for slot_id in 1..=3 {
             if let Some(bytes) = service.response_get(stream_id, slot_id).await {
                 if slot_id == 1 {
-                    if let Ok(frame) = decode_frame(&bytes) {
-                        if let StreamFrame::Headers(StreamHeaders::Response(resp)) = frame {
-                            let mut assembly = ResponseAssembly::new();
-                            assembly.set_headers(resp);
-                            assemblies.insert(stream_id, assembly);
-                        }
+                    if let Ok(StreamFrame::Headers(StreamHeaders::Response(resp))) =
+                        decode_frame(&bytes)
+                    {
+                        let mut assembly = ResponseAssembly::new(
+                            service
+                                .config()
+                                .slot_bytes()
+                                .saturating_mul(service.config().slots_per_stream),
+                        );
+                        assembly.set_headers(resp);
+                        assemblies.insert(stream_id, assembly);
                     }
                 } else if bytes.as_ref() == END_MARKER {
                     if let Some(assembly) = assemblies.remove(&stream_id) {
@@ -244,7 +337,7 @@ mod tests {
                     }
                 } else {
                     if let Some(assembly) = assemblies.get_mut(&stream_id) {
-                        assembly.add_body(bytes);
+                        assembly.add_body(bytes).unwrap();
                     }
                 }
             }
@@ -256,5 +349,17 @@ mod tests {
         assert_eq!(cached.body, Bytes::from("hello"));
 
         upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn watcher_handle_can_abort_the_background_task() {
+        let service = Arc::new(crate::UploadResponseService::new(
+            UploadResponseConfig::default(),
+        ));
+        let handle = ResponseWatcher::new(service).spawn();
+
+        handle.abort();
+        let error = handle.await.expect_err("aborted watcher must not complete");
+        assert!(error.is_cancelled());
     }
 }

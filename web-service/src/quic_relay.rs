@@ -156,7 +156,7 @@ impl BackendConnectionPool {
             .semaphore
             .acquire()
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "semaphore closed"))?;
+            .map_err(|_| std::io::Error::other("semaphore closed"))?;
 
         let mut stream = TcpStream::connect(self.backend_addr).await?;
         stream.set_nodelay(true)?;
@@ -377,12 +377,12 @@ impl QuicRelayWorker {
         connection: &mut quinn::Connection,
         last_seen: &mut [usize],
     ) -> anyhow::Result<()> {
-        for slot in 0..self.slots {
+        for (slot, last_seen_slot) in last_seen.iter_mut().enumerate().take(self.slots) {
             if slot % self.pool_size != self.id {
                 continue;
             }
             let last = self.buffers.request_last(slot);
-            let seen = last_seen[slot];
+            let seen = *last_seen_slot;
             if last <= seen {
                 continue;
             }
@@ -401,7 +401,7 @@ impl QuicRelayWorker {
                 let data = match self.buffers.request_get(slot, id).await {
                     Some(data) => data,
                     None => {
-                        last_seen[slot] = last;
+                        *last_seen_slot = last;
                         break;
                     }
                 };
@@ -418,7 +418,7 @@ impl QuicRelayWorker {
 
             // Finish the stream
             send.finish()?;
-            last_seen[slot] = last;
+            *last_seen_slot = last;
         }
         Ok(())
     }

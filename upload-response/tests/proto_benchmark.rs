@@ -892,7 +892,7 @@ async fn start_srt_loss_proxy_with_delay(
                 + 1;
             let should_drop = drop_every_client_packet > 0
                 && received > warmup_client_packets
-                && (received - warmup_client_packets) % drop_every_client_packet == 0;
+                && (received - warmup_client_packets).is_multiple_of(drop_every_client_packet);
             if should_drop {
                 task_stats
                     .client_to_server_dropped
@@ -3545,15 +3545,10 @@ async fn run_udp_fec_loss_test(service: Arc<UploadResponseService>, port: u16) -
     let proxy_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         let mut count = 0u64;
-        loop {
-            match fwd_sock.recv_from(&mut buf).await {
-                Ok((n, _)) => {
-                    count += 1;
-                    if drop_every == 0 || count % drop_every != 0 {
-                        let _ = fwd_sock.send_to(&buf[..n], fwd_target).await;
-                    }
-                }
-                Err(_) => break,
+        while let Ok((n, _)) = fwd_sock.recv_from(&mut buf).await {
+            count += 1;
+            if drop_every == 0 || !count.is_multiple_of(drop_every) {
+                let _ = fwd_sock.send_to(&buf[..n], fwd_target).await;
             }
         }
     });

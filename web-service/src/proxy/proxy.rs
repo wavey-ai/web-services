@@ -142,7 +142,7 @@ async fn proxy_http_hyper(
         }
     };
 
-    upstream_span.record("status", &field::display(response.status()));
+    upstream_span.record("status", field::display(response.status()));
     debug!(
         backend_status = %response.status(),
         "proxy http upstream response"
@@ -304,15 +304,13 @@ pub async fn proxy_websocket(
         Ok(lease) => lease,
         Err(AcquireError::NoAvailable) => {
             debug!("proxy websocket: no backends available");
-            return Err(ServerError::Handler(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(ServerError::Handler(Box::new(std::io::Error::other(
                 "no websocket backends available",
             ))));
         }
         Err(AcquireError::QueueFull) => {
             debug!("proxy websocket: backend queue full");
-            return Err(ServerError::Handler(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(ServerError::Handler(Box::new(std::io::Error::other(
                 "websocket backend queue full",
             ))));
         }
@@ -322,12 +320,8 @@ pub async fn proxy_websocket(
         backend_url = %lease.backend().url,
         "proxy websocket selected backend"
     );
-    let backend_url = compose_backend_url(&lease.backend().url, req.uri()).map_err(|err| {
-        ServerError::Handler(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            err,
-        )))
-    })?;
+    let backend_url = compose_backend_url(&lease.backend().url, req.uri())
+        .map_err(|err| ServerError::Handler(Box::new(std::io::Error::other(err))))?;
 
     let mut ws_request = http::Request::builder()
         .method(http::Method::GET)

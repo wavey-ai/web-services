@@ -68,7 +68,7 @@ impl<A: WebRtcAuth> WebRtcIngest<A> {
 
         let room = signaling_url
             .split('/')
-            .last()
+            .next_back()
             .unwrap_or("default")
             .to_string();
 

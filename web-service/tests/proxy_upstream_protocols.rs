@@ -134,13 +134,13 @@ async fn start_proxy(
         queue_slot_kb: 200,
         quic_relay: None,
     };
-    let ingress = ProxyIngress::from_config(config)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    let ingress =
+        ProxyIngress::from_config(config).map_err(|err| io::Error::other(err.to_string()))?;
     let state = ingress.state();
     let handle = ingress
         .start()
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        .map_err(|err| io::Error::other(err.to_string()))?;
     let web_service::ServerHandle {
         shutdown_tx,
         ready_rx,
@@ -148,7 +148,7 @@ async fn start_proxy(
     } = handle;
     ready_rx
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        .map_err(|err| io::Error::other(err.to_string()))?;
     wait_for_port(port).await;
 
     Ok(ProxyHandle {

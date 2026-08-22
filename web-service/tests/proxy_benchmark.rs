@@ -93,6 +93,7 @@ struct BenchStats {
     completed: usize,
     rps: f64,
     avg_ms: f64,
+    mib_per_sec: f64,
 }
 
 struct BenchConfig {
@@ -301,25 +302,18 @@ async fn send_reqwest_with_retry(
         };
         if status != StatusCode::OK {
             let body_text = String::from_utf8_lossy(&body);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("unexpected status {status}: {body_text}"),
-            )
-            .into());
+            return Err(
+                io::Error::other(format!("unexpected status {status}: {body_text}")).into(),
+            );
         }
         if version != reqwest::Version::HTTP_11 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("unexpected http version {version:?}"),
-            )
-            .into());
+            return Err(io::Error::other(format!("unexpected http version {version:?}")).into());
         }
         if body.as_ref() != expected_hash.as_bytes() {
             let body_text = String::from_utf8_lossy(&body);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("unexpected hash {body_text} expected {expected_hash}"),
-            )
+            return Err(io::Error::other(format!(
+                "unexpected hash {body_text} expected {expected_hash}"
+            ))
             .into());
         }
         return Ok(());
@@ -359,12 +353,12 @@ async fn start_backend(
         .enable_websocket(false)
         .with_router(router)
         .build()
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        .map_err(|err| io::Error::other(err.to_string()))?;
 
     let handle = server
         .start()
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        .map_err(|err| io::Error::other(err.to_string()))?;
     let web_service::ServerHandle {
         shutdown_tx,
         ready_rx,
@@ -372,7 +366,7 @@ async fn start_backend(
     } = handle;
     ready_rx
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        .map_err(|err| io::Error::other(err.to_string()))?;
 
     wait_for_port(port).await;
 
@@ -417,13 +411,13 @@ async fn start_proxy(
         queue_slot_kb: 200,
         quic_relay: None,
     };
-    let ingress = ProxyIngress::from_config(config)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    let ingress =
+        ProxyIngress::from_config(config).map_err(|err| io::Error::other(err.to_string()))?;
     let state = ingress.state();
     let handle = ingress
         .start()
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        .map_err(|err| io::Error::other(err.to_string()))?;
     let web_service::ServerHandle {
         shutdown_tx,
         ready_rx,
@@ -431,7 +425,7 @@ async fn start_proxy(
     } = handle;
     ready_rx
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        .map_err(|err| io::Error::other(err.to_string()))?;
     wait_for_port(port).await;
 
     Ok(ProxyHandle {
@@ -489,10 +483,10 @@ async fn run_reqwest_benchmark(
         let client = client.clone();
         let url = url.clone();
         let payload_bytes = config.payload_bytes;
-        let total_requests = total_requests;
         let next_request = Arc::clone(&next_request);
         tasks.push(tokio::spawn(async move {
             let mut completed = 0usize;
+            let mut total_latency = Duration::ZERO;
             loop {
                 let idx = next_request.fetch_add(1, Ordering::SeqCst);
                 if idx >= total_requests {
@@ -500,24 +494,34 @@ async fn run_reqwest_benchmark(
                 }
                 let payload = make_payload(idx as u64, payload_bytes);
                 let expected_hash = hash_hex(&payload);
+                let request_start = Instant::now();
                 send_reqwest_with_retry(&client, &url, payload, &expected_hash).await?;
                 completed += 1;
+                total_latency += request_start.elapsed();
             }
-            Ok::<usize, Box<dyn std::error::Error + Send + Sync>>(completed)
+            Ok::<(usize, Duration), Box<dyn std::error::Error + Send + Sync>>((
+                completed,
+                total_latency,
+            ))
         }));
     }
 
     let mut completed = 0usize;
+    let mut total_latency = Duration::ZERO;
     for task in tasks {
-        completed += task.await??;
+        let (task_completed, task_latency) = task.await??;
+        completed += task_completed;
+        total_latency += task_latency;
     }
     let elapsed = start.elapsed();
 
     let rps = completed as f64 / elapsed.as_secs_f64();
-    let avg_ms = (elapsed.as_secs_f64() * 1000.0) / completed as f64;
+    let avg_ms = (total_latency.as_secs_f64() * 1000.0) / completed as f64;
+    let mib_per_sec =
+        (completed * config.payload_bytes) as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
     println!(
-        "{label} benchmark complete: completed={}, elapsed={:?}, req/s={:.2}, avg_ms={:.2}",
-        completed, elapsed, rps, avg_ms
+        "{label} benchmark complete: completed={}, elapsed={:?}, req/s={:.2}, MiB/s={:.2}, observed_avg_ms={:.2}",
+        completed, elapsed, rps, mib_per_sec, avg_ms
     );
 
     Ok(BenchStats {
@@ -525,6 +529,7 @@ async fn run_reqwest_benchmark(
         completed,
         rps,
         avg_ms,
+        mib_per_sec,
     })
 }
 
@@ -544,7 +549,7 @@ async fn run_proxy_benchmark(
             .state
             .add_backend(backend_url, Some(1))
             .await
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+            .map_err(io::Error::other)?;
     }
 
     let cert_pem = from_base64_raw(cert_b64)?;
@@ -601,9 +606,10 @@ async fn run_benchmarks(
     println!("proxy benchmark summary (higher req/s is better):");
     for stat in stats {
         println!(
-            "{label}: req/s={rps:.2}, avg_ms={avg_ms:.2}, completed={completed}",
+            "{label}: req/s={rps:.2}, MiB/s={mib_per_sec:.2}, observed_avg_ms={avg_ms:.2}, completed={completed}",
             label = stat.label,
             rps = stat.rps,
+            mib_per_sec = stat.mib_per_sec,
             avg_ms = stat.avg_ms,
             completed = stat.completed
         );

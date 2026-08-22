@@ -4,7 +4,7 @@ use crate::{
     http_range::apply_byte_range,
     traits::{
         response_header_name, response_header_value, BodyStream, HandlerResponse, Router,
-        StreamWriter,
+        StartupSender, StreamWriter,
     },
 };
 use bytes::Bytes;
@@ -23,12 +23,16 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tls_helpers::tls_acceptor_from_base64;
 use tokio::net::{TcpListener, TcpSocket};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
+use tokio::task::JoinSet;
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{
     tungstenite::{handshake::derive_accept_key, protocol::Role},
     WebSocketStream,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
+
+const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
 
 pub struct Http2Server {
     config: ServerConfig,
@@ -86,19 +90,52 @@ impl Http2Server {
         Self { config, router }
     }
 
-    pub async fn start(&self, mut shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
-        let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.config.port);
-        let tls_acceptor = tls_acceptor_from_base64(
-            &self.config.cert_pem_base64,
-            &self.config.privkey_pem_base64,
-            true,
-            true,
-        )
-        .map_err(|e| ServerError::Tls(e.to_string()))?;
+    pub async fn start(&self, shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
+        self.run(shutdown_rx, None).await
+    }
 
-        let listener = bind_tcp_listener(addr)?;
+    pub(crate) async fn start_with_ready(
+        &self,
+        shutdown_rx: watch::Receiver<()>,
+        startup_tx: StartupSender,
+    ) -> ServerResult<()> {
+        self.run(shutdown_rx, Some(startup_tx)).await
+    }
+
+    async fn run(
+        &self,
+        mut shutdown_rx: watch::Receiver<()>,
+        startup_tx: Option<StartupSender>,
+    ) -> ServerResult<()> {
+        let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.config.port);
+        let startup: ServerResult<_> = (|| {
+            let tls_acceptor = tls_acceptor_from_base64(
+                &self.config.cert_pem_base64,
+                &self.config.privkey_pem_base64,
+                true,
+                true,
+            )
+            .map_err(|e| ServerError::Tls(e.to_string()))?;
+            let listener = bind_tcp_listener(addr)?;
+            Ok((tls_acceptor, listener))
+        })();
+        let (tls_acceptor, listener) = match startup {
+            Ok(startup) => startup,
+            Err(error) => {
+                if let Some(startup_tx) = startup_tx {
+                    let _ = startup_tx.send(Err(error.to_string()));
+                }
+                return Err(error);
+            }
+        };
+        if let Some(startup_tx) = startup_tx {
+            let _ = startup_tx.send(Ok(()));
+        }
         info!("HTTP/1.1+HTTP/2 server listening at {}", addr);
         let enable_websocket = self.config.enable_websocket;
+        let connection_limit = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
+        let handshake_timeout = Duration::from_millis(self.config.handshake_timeout_ms.max(1));
+        let mut connection_tasks = JoinSet::new();
 
         loop {
             tokio::select! {
@@ -106,15 +143,29 @@ impl Http2Server {
                     info!("HTTP/1.1+HTTP/2 server shutting down");
                     break;
                 }
+                Some(result) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                    if let Err(error) = result {
+                        error!(%error, "HTTP connection task failed");
+                    }
+                }
                 accept_res = listener.accept() => {
                     match accept_res {
-                        Ok((stream, _peer)) => {
+                        Ok((stream, peer)) => {
+                            let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
+                                debug!(%peer, "HTTP connection limit reached");
+                                continue;
+                            };
                             let tls_acceptor = tls_acceptor.clone();
                             let router = Arc::clone(&self.router);
-                            tokio::spawn(async move {
-                                let tls_stream = match tls_acceptor.accept(stream).await {
-                                    Ok(s) => s,
-                                    Err(e) => {
+                            connection_tasks.spawn(async move {
+                                let _connection_permit = connection_permit;
+                                let tls_stream = match timeout(handshake_timeout, tls_acceptor.accept(stream)).await {
+                                    Ok(Ok(stream)) => stream,
+                                    Err(_) => {
+                                        debug!(%peer, "TLS handshake timed out");
+                                        return;
+                                    }
+                                    Ok(Err(e)) => {
                                         error!("TLS handshake failed: {}", e);
                                         return;
                                     }
@@ -141,7 +192,8 @@ impl Http2Server {
                                 });
 
                                 if matches!(alpn, Some(proto) if proto == b"h2") {
-                                    let builder = http2::Builder::new(TokioExecutor::new());
+                                    let mut builder = http2::Builder::new(TokioExecutor::new());
+                                    builder.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
                                     if let Err(e) = builder
                                         .serve_connection(TokioIo::new(tls_stream), service)
                                         .await
@@ -165,11 +217,14 @@ impl Http2Server {
                         }
                         Err(e) => {
                             error!("Accept failed: {}", e);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                     }
                 }
             }
         }
+
+        connection_tasks.shutdown().await;
 
         Ok(())
     }
@@ -195,10 +250,10 @@ async fn handle_h2_request(
         if let Some(key) = req.headers().get("sec-websocket-key") {
             let has_handler = router.websocket_handler(req.uri().path()).is_some();
             if !has_handler {
-                return Ok(Response::builder()
+                return Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(Full::new(Bytes::new()).boxed())
-                    .map_err(|e| H2Error::Router(ServerError::Http(e)))?);
+                    .map_err(|e| H2Error::Router(ServerError::Http(e)));
             }
 
             let accept_key = derive_accept_key(key.as_bytes());
@@ -314,10 +369,7 @@ fn incoming_body_stream(body: Incoming) -> BodyStream {
     Box::pin(unfold(body, |mut b: Incoming| async move {
         match b.frame().await {
             Some(Ok(frame)) => {
-                let data = frame
-                    .into_data()
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::new());
+                let data = frame.into_data().unwrap_or_default();
                 Some((Ok(data), b))
             }
             Some(Err(e)) => Some((Err(ServerError::Handler(Box::new(e))), b)),
@@ -376,8 +428,7 @@ async fn await_h2_stream_response(
 fn build_buffered_response(
     handler_response: HandlerResponse,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
-    let mut response =
-        Response::new(Full::from(handler_response.body.unwrap_or_else(Bytes::new)).boxed());
+    let mut response = Response::new(Full::from(handler_response.body.unwrap_or_default()).boxed());
     *response.status_mut() = handler_response.status;
 
     if let Some(ct) = handler_response.content_type {

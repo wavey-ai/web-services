@@ -10,7 +10,7 @@ use http_pack::stream::{
 };
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tokio::time::{interval, timeout, Duration};
+use tokio::time::{timeout, Duration};
 use web_service::{BodyStream, HandlerResponse, HandlerResult, ServerError, StreamWriter};
 
 const STREAMING_RESPONSE_READER_ID: &str = "__streaming_response";
@@ -186,14 +186,24 @@ impl CachedIngress {
                 "response stream is not available".into(),
             ));
         }
+        let Some(updates) = self.service.response_update_notifier(stream_id) else {
+            let _ = self
+                .service
+                .unregister_response_reader(stream_id, STREAMING_RESPONSE_READER_ID)
+                .await;
+            return Err(ServerError::Config(
+                "response stream is not available".into(),
+            ));
+        };
         let timeout_duration = Duration::from_millis(self.config.response_timeout_ms);
         let result = match timeout(timeout_duration, async {
-            let mut poll = interval(Duration::from_millis(self.config.watch_poll_ms.max(1)));
             let mut last_slot = 0usize;
             let mut headers_sent = false;
 
             loop {
-                poll.tick().await;
+                let notified = updates.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
 
                 if !headers_sent {
                     if let Some(headers) = self.service.get_response_headers(stream_id).await {
@@ -211,12 +221,19 @@ impl CachedIngress {
                             )
                             .await;
                     } else {
+                        if self.service.response_last(stream_id).is_none() {
+                            return Err(ServerError::Config("response stream closed".into()));
+                        }
+                        notified.await;
                         continue;
                     }
                 }
 
-                let current_last = self.service.response_last(stream_id).unwrap_or(0);
+                let Some(current_last) = self.service.response_last(stream_id) else {
+                    return Err(ServerError::Config("response stream closed".into()));
+                };
                 if current_last <= last_slot {
+                    notified.await;
                     continue;
                 }
 
@@ -252,6 +269,10 @@ impl CachedIngress {
                 }
 
                 last_slot = processed_last;
+                if last_slot < current_last {
+                    continue;
+                }
+                notified.await;
             }
         })
         .await

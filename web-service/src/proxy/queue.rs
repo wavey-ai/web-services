@@ -7,8 +7,11 @@ use playlists::chunk_cache::ChunkCache;
 use playlists::Options;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{oneshot, Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::debug;
+
+type ProxyResponse = Result<(StatusCode, Bytes), String>;
+type ResponseChannels = Arc<RwLock<HashMap<u64, oneshot::Sender<ProxyResponse>>>>;
 
 /// Queue manager using ChunkCache for request/response buffering
 pub struct ProxyQueue {
@@ -23,8 +26,7 @@ pub struct ProxyQueue {
     max_slot_bytes: usize,
     max_body_chunk_bytes: usize,
     /// Map stream_id to response channel
-    response_channels:
-        Arc<RwLock<HashMap<u64, oneshot::Sender<Result<(StatusCode, Bytes), String>>>>>,
+    response_channels: ResponseChannels,
 }
 
 impl ProxyQueue {
@@ -44,11 +46,13 @@ impl ProxyQueue {
         let max_slots = max_requests.saturating_mul(slots_per_request).max(1);
 
         // Configure ring buffer options
-        let mut options = Options::default();
-        options.num_playlists = 2; // One for requests, one for responses
-        options.max_segments = 1;
-        options.max_parts_per_segment = max_slots;
-        options.buffer_size_kb = slot_kb;
+        let options = Options {
+            num_playlists: 2, // One for requests, one for responses
+            max_segments: 1,
+            max_parts_per_segment: max_slots,
+            buffer_size_kb: slot_kb,
+            ..Options::default()
+        };
 
         let request_queue = Arc::new(ChunkCache::new(options));
         let response_queue = Arc::new(ChunkCache::new(options));
@@ -94,6 +98,26 @@ impl ProxyQueue {
         self.request_queue
             .last(self.request_stream_idx)
             .unwrap_or(0)
+    }
+
+    pub fn request_updates(&self) -> Arc<Notify> {
+        self.request_queue
+            .update_notifier(self.request_stream_idx)
+            .expect("the fixed request lane is configured")
+    }
+
+    pub fn request_oldest_retained(&self) -> usize {
+        let last = self.request_last();
+        if last == 0 {
+            return 1;
+        }
+        let capacity = self
+            .request_queue
+            .options
+            .max_segments
+            .saturating_mul(self.request_queue.options.max_parts_per_segment)
+            .max(1);
+        last.saturating_sub(capacity.saturating_sub(1)).max(1)
     }
 
     pub async fn request_get(&self, queue_id: usize) -> Option<Bytes> {

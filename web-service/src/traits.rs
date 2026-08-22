@@ -12,6 +12,9 @@ use tokio_tungstenite::WebSocketStream;
 /// Result type for handlers
 pub type HandlerResult<T> = Result<T, ServerError>;
 
+/// Reports whether one transport completed its listener setup.
+pub(crate) type StartupSender = tokio::sync::oneshot::Sender<Result<(), String>>;
+
 /// Response type that handlers return
 #[derive(Debug)]
 pub struct HandlerResponse {

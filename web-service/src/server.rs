@@ -10,6 +10,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch};
+use tokio::task::JoinSet;
 
 pub struct H2H3Server {
     config: ServerConfig,
@@ -30,21 +31,23 @@ impl Server for H2H3Server {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (finished_tx, finished_rx) = oneshot::channel();
 
-        let mut tasks = vec![];
+        let mut tasks = JoinSet::new();
+        let mut startups = Vec::new();
 
         // Start Raw TCP server if enabled
         if self.config.enable_raw_tcp {
             if let Some(handler) = &self.raw_tcp_handler {
                 let raw_server = RawTcpServer::new(self.config.clone(), Arc::clone(handler));
                 let shutdown_rx = shutdown_rx.clone();
+                let (startup_tx, startup_rx) = oneshot::channel();
 
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = raw_server.start(shutdown_rx).await {
-                        tracing::error!("Raw TCP server error: {}", e);
-                    }
+                tasks.spawn(async move {
+                    (
+                        "Raw TCP",
+                        raw_server.start_with_ready(shutdown_rx, startup_tx).await,
+                    )
                 });
-
-                tasks.push(handle);
+                startups.push(("Raw TCP", startup_rx));
             } else {
                 tracing::warn!("Raw TCP enabled but no handler configured");
             }
@@ -54,28 +57,32 @@ impl Server for H2H3Server {
         if self.config.enable_h2 {
             let h2_server = Http2Server::new(self.config.clone(), Arc::clone(&self.router));
             let shutdown_rx = shutdown_rx.clone();
+            let (startup_tx, startup_rx) = oneshot::channel();
 
-            let handle = tokio::spawn(async move {
-                if let Err(e) = h2_server.start(shutdown_rx).await {
-                    tracing::error!("HTTP/2 server error: {}", e);
-                }
+            tasks.spawn(async move {
+                (
+                    "HTTP/1.1+HTTP/2",
+                    h2_server.start_with_ready(shutdown_rx, startup_tx).await,
+                )
             });
-
-            tasks.push(handle);
+            startups.push(("HTTP/1.1+HTTP/2", startup_rx));
         }
 
         // Start HTTP/3 server if enabled
         if self.config.enable_h3 {
             let shutdown_rx = shutdown_rx.clone();
+            let (startup_tx, startup_rx) = oneshot::channel();
 
-            let handle = match self.config.h3_backend {
+            match self.config.h3_backend {
                 H3Backend::Quinn => {
                     let h3_server = Http3Server::new(self.config.clone(), Arc::clone(&self.router));
-                    tokio::spawn(async move {
-                        if let Err(e) = h3_server.start(shutdown_rx).await {
-                            tracing::error!(backend = "quinn", "HTTP/3 server error: {}", e);
-                        }
-                    })
+                    tasks.spawn(async move {
+                        (
+                            "HTTP/3 (quinn)",
+                            h3_server.start_with_ready(shutdown_rx, startup_tx).await,
+                        )
+                    });
+                    startups.push(("HTTP/3 (quinn)", startup_rx));
                 }
                 #[cfg(feature = "h3-tokio-quiche")]
                 H3Backend::TokioQuiche => {
@@ -83,21 +90,52 @@ impl Server for H2H3Server {
                         self.config.clone(),
                         Arc::clone(&self.router),
                     );
-                    tokio::spawn(async move {
-                        if let Err(e) = h3_server.start(shutdown_rx).await {
-                            tracing::error!(backend = "tokio-quiche", "HTTP/3 server error: {}", e);
-                        }
-                    })
+                    tasks.spawn(async move {
+                        (
+                            "HTTP/3 (tokio-quiche)",
+                            h3_server.start_with_ready(shutdown_rx, startup_tx).await,
+                        )
+                    });
+                    startups.push(("HTTP/3 (tokio-quiche)", startup_rx));
                 }
-            };
-
-            tasks.push(handle);
+            }
         }
 
-        // Wait for all servers to finish
+        for (transport, startup_rx) in startups {
+            let startup_error = match startup_rx.await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(_) => Some("startup task stopped before it reported readiness".into()),
+            };
+            if let Some(error) = startup_error {
+                let _ = shutdown_tx.send(());
+                tasks.shutdown().await;
+                return Err(ServerError::Config(format!(
+                    "{transport} failed to start: {error}"
+                )));
+            }
+        }
+
+        // Stop every transport if one transport exits.
+        let supervisor_shutdown = shutdown_tx.clone();
         tokio::spawn(async move {
-            for task in tasks {
-                let _ = task.await;
+            let mut stop_sent = false;
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok((transport, Ok(()))) => {
+                        tracing::info!(transport, "server transport stopped");
+                    }
+                    Ok((transport, Err(error))) => {
+                        tracing::error!(transport, %error, "server transport failed");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "server transport task failed");
+                    }
+                }
+                if !stop_sent {
+                    let _ = supervisor_shutdown.send(());
+                    stop_sent = true;
+                }
             }
             let _ = finished_tx.send(());
         });
@@ -228,6 +266,16 @@ impl ServerBuilder for H2H3ServerBuilder {
 impl H2H3ServerBuilder {
     pub fn with_h3_backend(mut self, backend: H3Backend) -> Self {
         self.config.h3_backend = backend;
+        self
+    }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.config.max_connections = max_connections.max(1);
+        self
+    }
+
+    pub fn with_handshake_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.config.handshake_timeout_ms = timeout_ms.max(1);
         self
     }
 }

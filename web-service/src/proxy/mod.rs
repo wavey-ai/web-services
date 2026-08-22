@@ -8,6 +8,7 @@ mod h3_pool;
 mod id;
 pub mod ingress;
 pub mod pool;
+#[allow(clippy::module_inception)]
 pub mod proxy;
 pub mod queue;
 pub mod router;
