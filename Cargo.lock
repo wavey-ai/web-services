@@ -513,6 +513,7 @@ dependencies = [
  "tokio-quiche",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tokio-util 0.7.19",
  "tracing",
  "tracing-subscriber",
  "url",

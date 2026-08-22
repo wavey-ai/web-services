@@ -28,6 +28,8 @@ pub struct ServerConfig {
     pub raw_tcp_tls: bool,
     /// Maximum active connections for each enabled transport.
     pub max_connections: usize,
+    /// Maximum active request or upgraded-session handlers across all transports.
+    pub max_in_flight_requests: usize,
     /// Maximum TLS or QUIC handshake time.
     pub handshake_timeout_ms: u64,
 }
@@ -49,6 +51,7 @@ impl Default for ServerConfig {
             raw_tcp_port: 9000,
             raw_tcp_tls: false,
             max_connections: 4_096,
+            max_in_flight_requests: 4_096,
             handshake_timeout_ms: 10_000,
         }
     }

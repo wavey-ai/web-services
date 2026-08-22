@@ -344,3 +344,86 @@ async fn closing_quinn_connection_cancels_blocked_requests_promptly() {
     let _ = handle.shutdown_tx.send(());
     let _ = handle.finished_rx.await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quinn_global_limit_rejects_excess_requests() {
+    let tls = test_tls();
+    let port = unused_udp_port();
+    let active = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Notify::new());
+    let dropped = Arc::new(Notify::new());
+    let router = BlockingRouter {
+        active: Arc::clone(&active),
+        entered: Arc::clone(&entered),
+        dropped: Arc::clone(&dropped),
+    };
+    let server = H2H3Server::builder()
+        .with_tls(tls.certificate_base64, tls.private_key_base64)
+        .with_port(port)
+        .enable_h2(false)
+        .enable_h3(true)
+        .enable_websocket(false)
+        .enable_webtransport(false)
+        .with_max_in_flight_requests(1)
+        .with_router(Box::new(router))
+        .build()
+        .expect("build H3 server");
+    let handle = server.start().await.expect("start H3 server");
+    handle.ready_rx.await.expect("server ready");
+
+    let quinn_config = h3_quinn::quinn::ClientConfig::new(Arc::new(
+        h3_quinn::quinn::crypto::rustls::QuicClientConfig::try_from(client_config(
+            tls.certificate_der,
+        ))
+        .expect("QUIC client TLS"),
+    ));
+    let mut endpoint =
+        h3_quinn::quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .expect("client endpoint");
+    endpoint.set_default_client_config(quinn_config);
+    let connection = endpoint
+        .connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port)), "localhost")
+        .expect("begin connect")
+        .await
+        .expect("connect H3");
+    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
+        .await
+        .expect("start H3 client");
+    let driver_task = tokio::spawn(async move {
+        let _ = driver.wait_idle().await;
+    });
+
+    let request = || {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("https://localhost:{port}/part.mp4"))
+            .body(())
+            .expect("build request")
+    };
+    let mut held = sender
+        .send_request(request())
+        .await
+        .expect("send held request");
+    held.finish().await.expect("finish held request");
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("held route did not start");
+
+    let mut excess = sender
+        .send_request(request())
+        .await
+        .expect("send excess request");
+    excess.finish().await.expect("finish excess request");
+    let response = tokio::time::timeout(Duration::from_secs(2), excess.recv_response())
+        .await
+        .expect("overload response timed out")
+        .expect("receive overload response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert_eq!(active.load(Ordering::Acquire), 1);
+
+    connection.close(0_u32.into(), b"test complete");
+    driver_task.abort();
+    let _ = handle.shutdown_tx.send(());
+    let _ = handle.finished_rx.await;
+}

@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
 use tokio::{
-    sync::{watch, Mutex, Semaphore},
+    sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore},
     task::{JoinError, JoinSet},
     time::{timeout, Duration},
 };
@@ -33,6 +33,7 @@ const H3_MAX_IN_FLIGHT_REQUESTS: usize = 256;
 pub struct Http3Server {
     config: ServerConfig,
     router: Arc<dyn Router>,
+    request_limit: Arc<Semaphore>,
 }
 
 pub struct H3StreamWriter {
@@ -181,7 +182,24 @@ impl StreamWriter for H3SplitStreamWriter {
 
 impl Http3Server {
     pub fn new(config: ServerConfig, router: Arc<dyn Router>) -> Self {
-        Self { config, router }
+        let request_limit = Arc::new(Semaphore::new(config.max_in_flight_requests.max(1)));
+        Self {
+            config,
+            router,
+            request_limit,
+        }
+    }
+
+    pub(crate) fn new_with_request_limit(
+        config: ServerConfig,
+        router: Arc<dyn Router>,
+        request_limit: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            config,
+            router,
+            request_limit,
+        }
     }
 
     pub async fn start(&self, shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
@@ -260,6 +278,7 @@ impl Http3Server {
                         };
                         let router = Arc::clone(&router);
                         let config = self.config.clone();
+                        let request_limit = Arc::clone(&self.request_limit);
                         connection_tasks.spawn(async move {
                             let _connection_permit = connection_permit;
                             let conn = match timeout(handshake_timeout, new_conn).await {
@@ -277,7 +296,11 @@ impl Http3Server {
                             let builder = configure_h3_connection(h3::server::builder(), &h3_config);
                             match builder.build(h3_quinn::Connection::new(conn)).await {
                                 Ok(h3_conn) => {
-                                    if let Err(e) = handle_h3_connection(h3_conn, router).await {
+                                    if let Err(e) = handle_h3_connection(
+                                        h3_conn,
+                                        router,
+                                        request_limit,
+                                    ).await {
                                         tracing::error!("Failed to handle HTTP/3 connection: {}", e);
                                     }
                                 }
@@ -299,6 +322,7 @@ impl Http3Server {
 async fn handle_h3_connection(
     mut conn: Connection<h3_quinn::Connection, Bytes>,
     router: Arc<dyn Router>,
+    request_limit: Arc<Semaphore>,
 ) -> Result<(), H3Error> {
     let mut request_tasks = JoinSet::new();
     loop {
@@ -317,10 +341,15 @@ async fn handle_h3_connection(
                     };
                     let (req, stream) = resolved
                         .map_err(|e| H3Error::Transport(e.to_string()))?;
+                    let Ok(request_permit) = Arc::clone(&request_limit).try_acquire_owned() else {
+                        send_h3_empty_response(StatusCode::SERVICE_UNAVAILABLE, stream).await?;
+                        continue;
+                    };
                     let ext = req.extensions();
                     if req.method() == Method::CONNECT
                         && ext.get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT)
                     {
+                        let _request_permit = request_permit;
                         if let Some(handler) = router.webtransport_handler() {
                             let session = WebTransportSession::accept(req, stream, conn)
                                 .await
@@ -349,6 +378,7 @@ async fn handle_h3_connection(
                         has_body_stream_handler,
                         is_streaming,
                         has_body_handler,
+                        request_permit,
                     ));
                 }
                 Ok(None) => break,
@@ -389,6 +419,7 @@ async fn dispatch_h3_request(
     has_body_stream_handler: bool,
     is_streaming: bool,
     has_body_handler: bool,
+    _request_permit: OwnedSemaphorePermit,
 ) -> Result<(), H3Error> {
     if has_body_stream_handler {
         handle_h3_body_stream_request(req, stream, router).await
@@ -581,6 +612,12 @@ async fn send_h3_empty_response(
         .status(status)
         .body(())
         .map_err(H3Error::Header)?;
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(
+            HeaderName::from_static("retry-after"),
+            HeaderValue::from_static("1"),
+        );
+    }
     add_cors_response_headers(&mut response);
     stream
         .send_response(response)

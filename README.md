@@ -135,6 +135,10 @@ The shared-memory `ChunkCache` and slot-based streaming architecture are inspire
 
 Some protocols require optional crate features such as `srt`, `rist`, `rist-pure`, `webrtc`, or `udp-fec`. The default feature set only enables `tcp`.
 
+`H2H3ServerBuilder::with_max_in_flight_requests` sets one handler limit across HTTP/1.1, HTTP/2, HTTP/3, WebSocket, and raw TCP. The default is 4,096.
+
+Excess HTTP work receives `503` with `Retry-After: 1`. The server does not consume rejected request bodies, which preserves transport flow control.
+
 The `rist` feature keeps the existing librist/C-wrapper backend. The `rist-pure` feature adds `PureRistIngest`, backed by the pure Rust `rist-core` and `rist-mio` crates from [`wavey-ai/rist-rs`](https://github.com/wavey-ai/rist-rs). Pure RIST byte-stream delivery suppresses duplicate arrivals and holds packets behind a sequence gap until retransmission restores wire order. The reorder queue is bounded and fails closed instead of concatenating bytes across an unresolved gap.
 
 Each RIST source address has a separate ordered request. Queue overflow aborts all active requests because the dropped packet owner is not retained.

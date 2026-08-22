@@ -9,7 +9,7 @@ use crate::{
     traits::{HandlerResult, RawTcpHandler, Router, Server, ServerBuilder, ServerHandle},
 };
 use std::{net::IpAddr, sync::Arc};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
 
 pub struct H2H3Server {
@@ -33,11 +33,16 @@ impl Server for H2H3Server {
 
         let mut tasks = JoinSet::new();
         let mut startups = Vec::new();
+        let request_limit = Arc::new(Semaphore::new(self.config.max_in_flight_requests.max(1)));
 
         // Start Raw TCP server if enabled
         if self.config.enable_raw_tcp {
             if let Some(handler) = &self.raw_tcp_handler {
-                let raw_server = RawTcpServer::new(self.config.clone(), Arc::clone(handler));
+                let raw_server = RawTcpServer::new_with_request_limit(
+                    self.config.clone(),
+                    Arc::clone(handler),
+                    Arc::clone(&request_limit),
+                );
                 let shutdown_rx = shutdown_rx.clone();
                 let (startup_tx, startup_rx) = oneshot::channel();
 
@@ -55,7 +60,11 @@ impl Server for H2H3Server {
 
         // Start HTTP/2 server if enabled
         if self.config.enable_h2 {
-            let h2_server = Http2Server::new(self.config.clone(), Arc::clone(&self.router));
+            let h2_server = Http2Server::new_with_request_limit(
+                self.config.clone(),
+                Arc::clone(&self.router),
+                Arc::clone(&request_limit),
+            );
             let shutdown_rx = shutdown_rx.clone();
             let (startup_tx, startup_rx) = oneshot::channel();
 
@@ -75,7 +84,11 @@ impl Server for H2H3Server {
 
             match self.config.h3_backend {
                 H3Backend::Quinn => {
-                    let h3_server = Http3Server::new(self.config.clone(), Arc::clone(&self.router));
+                    let h3_server = Http3Server::new_with_request_limit(
+                        self.config.clone(),
+                        Arc::clone(&self.router),
+                        Arc::clone(&request_limit),
+                    );
                     tasks.spawn(async move {
                         (
                             "HTTP/3 (quinn)",
@@ -86,10 +99,12 @@ impl Server for H2H3Server {
                 }
                 #[cfg(feature = "h3-tokio-quiche")]
                 H3Backend::TokioQuiche => {
-                    let h3_server = crate::h3_tokio_quiche::TokioQuicheHttp3Server::new(
-                        self.config.clone(),
-                        Arc::clone(&self.router),
-                    );
+                    let h3_server =
+                        crate::h3_tokio_quiche::TokioQuicheHttp3Server::new_with_request_limit(
+                            self.config.clone(),
+                            Arc::clone(&self.router),
+                            Arc::clone(&request_limit),
+                        );
                     tasks.spawn(async move {
                         (
                             "HTTP/3 (tokio-quiche)",
@@ -299,6 +314,11 @@ impl H2H3ServerBuilder {
 
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.config.max_connections = max_connections.max(1);
+        self
+    }
+
+    pub fn with_max_in_flight_requests(mut self, max_requests: usize) -> Self {
+        self.config.max_in_flight_requests = max_requests.max(1);
         self
     }
 

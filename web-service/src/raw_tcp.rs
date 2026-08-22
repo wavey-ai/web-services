@@ -86,11 +86,29 @@ where
 pub struct RawTcpServer {
     config: ServerConfig,
     handler: Arc<dyn RawTcpHandler>,
+    request_limit: Arc<Semaphore>,
 }
 
 impl RawTcpServer {
     pub fn new(config: ServerConfig, handler: Arc<dyn RawTcpHandler>) -> Self {
-        Self { config, handler }
+        let request_limit = Arc::new(Semaphore::new(config.max_in_flight_requests.max(1)));
+        Self {
+            config,
+            handler,
+            request_limit,
+        }
+    }
+
+    pub(crate) fn new_with_request_limit(
+        config: ServerConfig,
+        handler: Arc<dyn RawTcpHandler>,
+        request_limit: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            config,
+            handler,
+            request_limit,
+        }
     }
 
     pub async fn start(&self, shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
@@ -168,11 +186,16 @@ impl RawTcpServer {
                                 debug!(%peer, "Raw TCP connection limit reached");
                                 continue;
                             };
+                            let Ok(request_permit) = Arc::clone(&self.request_limit).try_acquire_owned() else {
+                                debug!(%peer, "Global request limit reached for raw TCP connection");
+                                continue;
+                            };
                             let handler = Arc::clone(&self.handler);
                             let tls_acceptor = tls_acceptor.clone();
                             let is_tls = self.config.raw_tcp_tls;
                             connection_tasks.spawn(async move {
                                 let _connection_permit = connection_permit;
+                                let _request_permit = request_permit;
                                 let boxed_stream: DynStream = if let Some(acceptor) = tls_acceptor {
                                     match timeout(handshake_timeout, acceptor.accept(stream)).await {
                                         Ok(Ok(tls_stream)) => Box::new(tls_stream),

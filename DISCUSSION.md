@@ -284,13 +284,17 @@ These limits prevent unsafe trusted configurations. They do not convert an opera
 
 ### Bound all request and upgraded-session work
 
+Status: implemented.
+
 HTTP/2 now limits each connection to 256 streams. A global request limit is still necessary across all connections.
 
-Add a global request semaphore to each server transport. Reject excess buffered work with `503` and retain flow-control backpressure for streaming bodies.
+One semaphore now limits active handlers across every enabled server transport. The default limit is 4,096 and the builder exposes an override.
 
-Transfer the TCP connection permit to an upgraded WebSocket task. Track that task until shutdown instead of detaching it.
+HTTP overload receives `503` and `Retry-After: 1`. Rejected request bodies remain unread, so TCP and QUIC flow control limit sender buffering.
 
-Add tests for connection upgrades, global overload, client disconnects, and shutdown with active streams.
+WebSocket tasks own their TCP connection and request permits. A task tracker cancels upgraded and streaming handlers during disconnects or server shutdown.
+
+Integration tests cover HTTP/1.1 overload, HTTP/3 overload, connection upgrades, client disconnects, and shutdown with an active WebSocket.
 
 ### Remove lifecycle bypasses
 

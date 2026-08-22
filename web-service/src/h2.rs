@@ -24,11 +24,11 @@ use sha2::{Digest, Sha256};
 use std::{
     convert::Infallible,
     net::SocketAddr,
-    sync::{Arc, Once},
+    sync::{Arc, Mutex as StdMutex, Once},
 };
 use tls_helpers::{certs_from_base64, privkey_from_base64, tls_acceptor_from_base64};
 use tokio::net::{TcpListener, TcpSocket};
-use tokio::sync::{mpsc, oneshot, watch, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
@@ -36,6 +36,7 @@ use tokio_tungstenite::{
     tungstenite::{handshake::derive_accept_key, protocol::Role},
     WebSocketStream,
 };
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, error, info};
 
 const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
@@ -67,13 +68,26 @@ impl VerifiedClientCertificate {
 pub struct Http2Server {
     config: ServerConfig,
     router: Arc<dyn Router>,
+    request_limit: Arc<Semaphore>,
 }
 
 type H2ResponseBody = BoxBody<Bytes, Infallible>;
+type ConnectionPermitSlot = Arc<StdMutex<Option<OwnedSemaphorePermit>>>;
 
 struct H2StreamWriter {
     response_tx: Option<oneshot::Sender<Result<Response<()>, ServerError>>>,
     data_tx: Option<mpsc::Sender<Bytes>>,
+}
+
+struct H2StreamBodyState {
+    data_rx: mpsc::Receiver<Bytes>,
+    handler_cancellation: CancellationToken,
+}
+
+impl Drop for H2StreamBodyState {
+    fn drop(&mut self) {
+        self.handler_cancellation.cancel();
+    }
 }
 
 impl H2StreamWriter {
@@ -117,7 +131,24 @@ impl StreamWriter for H2StreamWriter {
 
 impl Http2Server {
     pub fn new(config: ServerConfig, router: Arc<dyn Router>) -> Self {
-        Self { config, router }
+        let request_limit = Arc::new(Semaphore::new(config.max_in_flight_requests.max(1)));
+        Self {
+            config,
+            router,
+            request_limit,
+        }
+    }
+
+    pub(crate) fn new_with_request_limit(
+        config: ServerConfig,
+        router: Arc<dyn Router>,
+        request_limit: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            config,
+            router,
+            request_limit,
+        }
     }
 
     pub async fn start(&self, shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
@@ -161,6 +192,8 @@ impl Http2Server {
         let connection_limit = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
         let handshake_timeout = Duration::from_millis(self.config.handshake_timeout_ms.max(1));
         let mut connection_tasks = JoinSet::new();
+        let detached_tasks = TaskTracker::new();
+        let detached_shutdown = CancellationToken::new();
 
         loop {
             tokio::select! {
@@ -182,8 +215,11 @@ impl Http2Server {
                             };
                             let tls_acceptor = tls_acceptor.clone();
                             let router = Arc::clone(&self.router);
+                            let request_limit = Arc::clone(&self.request_limit);
+                            let detached_tasks = detached_tasks.clone();
+                            let detached_shutdown = detached_shutdown.clone();
                             connection_tasks.spawn(async move {
-                                let _connection_permit = connection_permit;
+                                let connection_permit = Arc::new(StdMutex::new(Some(connection_permit)));
                                 let tls_stream = match timeout(handshake_timeout, tls_acceptor.accept(stream)).await {
                                     Ok(Ok(stream)) => stream,
                                     Err(_) => {
@@ -223,14 +259,25 @@ impl Http2Server {
 
                                 let service = service_fn(move |mut req: http::Request<Incoming>| {
                                     let router = Arc::clone(&router);
+                                    let request_limit = Arc::clone(&request_limit);
+                                    let connection_permit = Arc::clone(&connection_permit);
+                                    let detached_tasks = detached_tasks.clone();
+                                    let detached_shutdown = detached_shutdown.clone();
                                     if let Some(client_certificate) = client_certificate {
                                         req.extensions_mut().insert(client_certificate);
                                     }
                                     async move {
+                                        let Ok(request_permit) = request_limit.try_acquire_owned() else {
+                                            return Ok(overloaded_h2_response());
+                                        };
                                         match handle_h2_request(
                                             req,
                                             router,
                                             enable_websocket,
+                                            request_permit,
+                                            connection_permit,
+                                            detached_tasks,
+                                            detached_shutdown,
                                         )
                                         .await
                                         {
@@ -276,7 +323,10 @@ impl Http2Server {
             }
         }
 
+        detached_shutdown.cancel();
         connection_tasks.shutdown().await;
+        detached_tasks.close();
+        detached_tasks.wait().await;
 
         Ok(())
     }
@@ -334,6 +384,10 @@ async fn handle_h2_request(
     req: http::Request<Incoming>,
     router: Arc<dyn Router>,
     enable_websocket: bool,
+    request_permit: OwnedSemaphorePermit,
+    connection_permit: ConnectionPermitSlot,
+    detached_tasks: TaskTracker,
+    detached_shutdown: CancellationToken,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
     if enable_websocket && is_websocket_upgrade(&req) {
         if let Some(key) = req.headers().get("sec-websocket-key") {
@@ -353,8 +407,12 @@ async fn handle_h2_request(
             let headers = req.headers().clone();
             let upgrade_fut = upgrade::on(req);
             let router = Arc::clone(&router);
+            let websocket_connection_permit = connection_permit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
 
-            tokio::spawn(async move {
+            let websocket_task = async move {
                 match upgrade_fut.await {
                     Ok(upgraded) => {
                         tracing::info!("Accepted WebSocket upgrade for {}", uri);
@@ -396,7 +454,15 @@ async fn handle_h2_request(
                     }
                     Err(e) => error!("WebSocket upgrade failed: {}", e),
                 }
-            });
+            };
+            drop(detached_tasks.spawn(async move {
+                let _request_permit = request_permit;
+                let _connection_permit = websocket_connection_permit;
+                tokio::select! {
+                    _ = detached_shutdown.cancelled() => {}
+                    _ = websocket_task => {}
+                }
+            }));
 
             let response = Response::builder()
                 .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -424,12 +490,27 @@ async fn handle_h2_request(
     if router.has_body_stream_handler(parts.uri.path()) {
         let stream = incoming_body_stream(body);
         let req = http::Request::from_parts(parts, ());
-        return handle_h2_body_stream(req, stream, router).await;
+        return handle_h2_body_stream(
+            req,
+            stream,
+            router,
+            request_permit,
+            detached_tasks,
+            detached_shutdown,
+        )
+        .await;
     }
 
     if router.is_streaming(parts.uri.path()) {
         let req = http::Request::from_parts(parts, ());
-        return handle_h2_stream(req, router).await;
+        return handle_h2_stream(
+            req,
+            router,
+            request_permit,
+            detached_tasks,
+            detached_shutdown,
+        )
+        .await;
     }
 
     if router.has_body_handler(parts.uri.path()) {
@@ -470,37 +551,75 @@ fn incoming_body_stream(body: Incoming) -> BodyStream {
 async fn handle_h2_stream(
     req: http::Request<()>,
     router: Arc<dyn Router>,
+    request_permit: OwnedSemaphorePermit,
+    detached_tasks: TaskTracker,
+    detached_shutdown: CancellationToken,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
     let (response_tx, response_rx) = oneshot::channel();
     let (data_tx, data_rx) = mpsc::channel(32);
-    tokio::spawn(async move {
+    let handler_cancellation = CancellationToken::new();
+    let task_cancellation = handler_cancellation.clone();
+    drop(detached_tasks.spawn(async move {
+        let _request_permit = request_permit;
         let writer = H2StreamWriter::new(response_tx, data_tx);
-        if let Err(err) = router.route_stream(req, Box::new(writer)).await {
-            error!("streaming handler error: {}", err);
+        tokio::select! {
+            _ = detached_shutdown.cancelled() => {}
+            _ = task_cancellation.cancelled() => {}
+            result = router.route_stream(req, Box::new(writer)) => {
+                if let Err(err) = result {
+                    error!("streaming handler error: {}", err);
+                }
+            }
         }
-    });
-    await_h2_stream_response(response_rx, data_rx).await
+    }));
+    await_h2_stream_response(
+        response_rx,
+        H2StreamBodyState {
+            data_rx,
+            handler_cancellation,
+        },
+    )
+    .await
 }
 
 async fn handle_h2_body_stream(
     req: http::Request<()>,
     body: BodyStream,
     router: Arc<dyn Router>,
+    request_permit: OwnedSemaphorePermit,
+    detached_tasks: TaskTracker,
+    detached_shutdown: CancellationToken,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
     let (response_tx, response_rx) = oneshot::channel();
     let (data_tx, data_rx) = mpsc::channel(32);
-    tokio::spawn(async move {
+    let handler_cancellation = CancellationToken::new();
+    let task_cancellation = handler_cancellation.clone();
+    drop(detached_tasks.spawn(async move {
+        let _request_permit = request_permit;
         let writer = H2StreamWriter::new(response_tx, data_tx);
-        if let Err(err) = router.route_body_stream(req, body, Box::new(writer)).await {
-            error!("streaming body handler error: {}", err);
+        tokio::select! {
+            _ = detached_shutdown.cancelled() => {}
+            _ = task_cancellation.cancelled() => {}
+            result = router.route_body_stream(req, body, Box::new(writer)) => {
+                if let Err(err) = result {
+                    error!("streaming body handler error: {}", err);
+                }
+            }
         }
-    });
-    await_h2_stream_response(response_rx, data_rx).await
+    }));
+    await_h2_stream_response(
+        response_rx,
+        H2StreamBodyState {
+            data_rx,
+            handler_cancellation,
+        },
+    )
+    .await
 }
 
 async fn await_h2_stream_response(
     response_rx: oneshot::Receiver<Result<Response<()>, ServerError>>,
-    data_rx: mpsc::Receiver<Bytes>,
+    body_state: H2StreamBodyState,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
     let response = match response_rx.await {
         Ok(Ok(response)) => response,
@@ -511,7 +630,7 @@ async fn await_h2_stream_response(
             )));
         }
     };
-    build_streaming_response(response, data_rx)
+    build_streaming_response(response, body_state)
 }
 
 fn build_buffered_response(
@@ -543,15 +662,28 @@ fn build_buffered_response(
     Ok(response)
 }
 
+fn overloaded_h2_response() -> Response<H2ResponseBody> {
+    let mut response = Response::new(Full::from(Bytes::from_static(b"service overloaded")).boxed());
+    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    response.headers_mut().insert(
+        HeaderName::from_static("retry-after"),
+        HeaderValue::from_static("1"),
+    );
+    add_cors_headers(&mut response);
+    response
+}
+
 fn build_streaming_response(
     response_head: Response<()>,
-    data_rx: mpsc::Receiver<Bytes>,
+    body_state: H2StreamBodyState,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
     let (parts, ()) = response_head.into_parts();
-    let body_stream = unfold(data_rx, |mut rx| async move {
-        rx.recv()
+    let body_stream = unfold(body_state, |mut state| async move {
+        state
+            .data_rx
+            .recv()
             .await
-            .map(|chunk| (Ok::<Frame<Bytes>, Infallible>(Frame::data(chunk)), rx))
+            .map(|chunk| (Ok::<Frame<Bytes>, Infallible>(Frame::data(chunk)), state))
     });
     let mut response = Response::from_parts(parts, StreamBody::new(body_stream).boxed());
     add_cors_headers(&mut response);

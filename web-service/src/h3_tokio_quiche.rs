@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http::{
     header::{HOST, RANGE},
-    HeaderName, HeaderValue, Method, Request, Response, Uri,
+    HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
 };
 use std::{
     fs,
@@ -24,7 +24,7 @@ use std::{
 use tempfile::TempDir;
 use tokio::{
     net::UdpSocket,
-    sync::{watch, Semaphore},
+    sync::{watch, OwnedSemaphorePermit, Semaphore},
     task::{JoinError, JoinSet},
 };
 use tokio_quiche::{
@@ -50,11 +50,29 @@ const QPACK_BLOCKED_STREAMS: u64 = 16;
 pub struct TokioQuicheHttp3Server {
     config: ServerConfig,
     router: Arc<dyn Router>,
+    request_limit: Arc<Semaphore>,
 }
 
 impl TokioQuicheHttp3Server {
     pub fn new(config: ServerConfig, router: Arc<dyn Router>) -> Self {
-        Self { config, router }
+        let request_limit = Arc::new(Semaphore::new(config.max_in_flight_requests.max(1)));
+        Self {
+            config,
+            router,
+            request_limit,
+        }
+    }
+
+    pub(crate) fn new_with_request_limit(
+        config: ServerConfig,
+        router: Arc<dyn Router>,
+        request_limit: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            config,
+            router,
+            request_limit,
+        }
     }
 
     pub async fn start(&self, shutdown_rx: watch::Receiver<()>) -> ServerResult<()> {
@@ -152,12 +170,14 @@ impl TokioQuicheHttp3Server {
                             };
                             let (driver, mut controller) = ServerH3Driver::new(h3_settings);
                             let router = Arc::clone(&self.router);
+                            let request_limit = Arc::clone(&self.request_limit);
                             connection_tasks.spawn(async move {
                                 let _connection_permit = connection_permit;
                                 let _connection = connection.start(driver);
                                 if let Err(error) = serve_connection(
                                     controller.event_receiver_mut(),
                                     router,
+                                    request_limit,
                                 ).await {
                                     tracing::debug!(backend = "tokio-quiche", %error, "H3 connection ended");
                                 }
@@ -251,13 +271,25 @@ fn set_private_permissions(_path: &Path) -> ServerResult<()> {
 async fn serve_connection(
     events: &mut ServerEventStream,
     router: Arc<dyn Router>,
+    request_limit: Arc<Semaphore>,
 ) -> Result<(), H3Error> {
     let mut request_tasks = JoinSet::new();
     loop {
         tokio::select! {
             event = events.recv(), if request_tasks.len() < MAX_CONCURRENT_STREAMS as usize => match event {
                 Some(ServerH3Event::Headers { incoming_headers, .. }) => {
-                    request_tasks.spawn(handle_request(incoming_headers, Arc::clone(&router)));
+                    match Arc::clone(&request_limit).try_acquire_owned() {
+                        Ok(request_permit) => {
+                            request_tasks.spawn(handle_request(
+                                incoming_headers,
+                                Arc::clone(&router),
+                                request_permit,
+                            ));
+                        }
+                        Err(_) => {
+                            send_overload_response(incoming_headers).await?;
+                        }
+                    }
                 }
                 Some(ServerH3Event::Core(H3Event::ConnectionError(error))) => {
                     return Err(H3Error::Transport(error.to_string()));
@@ -300,9 +332,24 @@ fn log_request_task_result(result: Result<Result<(), H3Error>, JoinError>) {
     }
 }
 
+async fn send_overload_response(incoming: IncomingH3Headers) -> Result<(), H3Error> {
+    send_handler_response(
+        HandlerResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: Some(Bytes::from_static(b"service overloaded")),
+            headers: vec![("retry-after".into(), "1".into())],
+            ..HandlerResponse::default()
+        },
+        incoming.send,
+        false,
+    )
+    .await
+}
+
 async fn handle_request(
     incoming: IncomingH3Headers,
     router: Arc<dyn Router>,
+    _request_permit: OwnedSemaphorePermit,
 ) -> Result<(), H3Error> {
     let IncomingH3Headers {
         headers,
