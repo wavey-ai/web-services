@@ -197,6 +197,33 @@ Each request and response stream uses a simple slot-based format:
 - Body slots are raw bytes and can be read zero-copy from the cache.
 - An empty slot signals stream completion.
 
+### Archive origin
+
+`ArchiveStore` supplies a durable HTTP origin for DAW archive objects. The disk
+directory is the authority. `ChunkCache` keeps 64 recent objects as a shared hot
+window.
+
+The store uses an append-only NDJSON index. It reconstructs missing index items
+from valid `.iarc` files after a restart. It ignores partial and invalid object
+files during recovery.
+
+`ArchiveHttpRouter` supplies an incremental manifest and immutable chunk reads:
+
+```text
+GET /v1/archives/{archive_id}/manifest?after={sequence}&limit={count}&wait={seconds}
+GET /v1/archives/{archive_id}/chunks/{sequence}
+```
+
+The router requires a bearer capability. It stores only the SHA-256 digest of
+that capability. Applications must not put the capability in DNS-SD records.
+
+The manifest supports a blocking wait of up to 25 seconds. Chunk responses use
+the object SHA-256 value as the `ETag`. The shared HTTP server applies byte
+ranges after the router validates `If-Range`.
+
+Disk fallback uses immutable memory maps. An old object remains available after
+the hot ring evicts it. Reader speed does not control capture or retention.
+
 ### UDP+FEC Payload Format
 
 UDP+FEC, enabled by the `udp-fec` feature, uses the extracted [`raptorq-datagram-fec`](https://github.com/wavey-ai/raptor-fec) crate for [RaptorQ](https://www.rfc-editor.org/rfc/rfc6330) forward error correction over plain UDP. Each datagram carries the current 16-byte sequenced wire header followed by a serialized RaptorQ `EncodingPacket`.
