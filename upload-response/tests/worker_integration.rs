@@ -8,10 +8,16 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{interval, Duration};
 use upload_response::{
-    ResponseWatcher, TailSlot, UploadResponseConfig, UploadResponseRouter, UploadResponseService,
+    ResponseWatcher, TailSlot, UploadResponseConfig, UploadResponseControlRouter,
+    UploadResponseRouter, UploadResponseService, RESPONSE_CAPABILITY_HEADER,
+    RESPONSE_SEQUENCE_HEADER,
 };
-use web_service::Router;
+use web_service::{Router, VerifiedClientCertificate};
 use xxhash_rust::xxh64::xxh64;
+
+fn verified_test_client() -> VerifiedClientCertificate {
+    VerifiedClientCertificate::from_sha256_fingerprint([0x5a; 32])
+}
 
 /// Simulates a worker that:
 /// 1. Tails request streams for new data
@@ -757,6 +763,27 @@ async fn test_router_concurrent_requests() {
 }
 
 #[tokio::test]
+async fn test_public_router_hides_internal_cache_api() {
+    let service = Arc::new(UploadResponseService::new(UploadResponseConfig::default()));
+    let public_router = UploadResponseRouter::new(service.clone());
+    let control_router = UploadResponseControlRouter::new(service);
+    let internal_request = || {
+        Request::builder()
+            .method("GET")
+            .uri("/_upload_response/streams")
+            .body(())
+            .unwrap()
+    };
+
+    let hidden = public_router.route(internal_request()).await.unwrap();
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    assert!(!public_router.has_body_handler("/_upload_response/streams"));
+
+    let unauthenticated = control_router.route(internal_request()).await.unwrap();
+    assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn test_internal_cache_api_lists_and_reads_active_stream() {
     let config = UploadResponseConfig {
         num_streams: 2,
@@ -765,7 +792,7 @@ async fn test_internal_cache_api_lists_and_reads_active_stream() {
         response_timeout_ms: 5000,
     };
     let service = Arc::new(UploadResponseService::new(config));
-    let router = UploadResponseRouter::new(service.clone());
+    let router = UploadResponseControlRouter::new(service.clone());
 
     let upload_stream = service.open_stream().await.unwrap();
     let stream_id = upload_stream.stream_id();
@@ -794,6 +821,7 @@ async fn test_internal_cache_api_lists_and_reads_active_stream() {
             Request::builder()
                 .method("GET")
                 .uri("/_upload_response/streams")
+                .extension(verified_test_client())
                 .body(())
                 .unwrap(),
         )
@@ -809,6 +837,7 @@ async fn test_internal_cache_api_lists_and_reads_active_stream() {
                 .uri(format!(
                     "/_upload_response/streams/{stream_id}/request/last"
                 ))
+                .extension(verified_test_client())
                 .body(())
                 .unwrap(),
         )
@@ -824,6 +853,7 @@ async fn test_internal_cache_api_lists_and_reads_active_stream() {
                 .uri(format!(
                     "/_upload_response/streams/{stream_id}/request/slots/2"
                 ))
+                .extension(verified_test_client())
                 .body(())
                 .unwrap(),
         )
@@ -848,7 +878,7 @@ async fn test_internal_cache_api_writes_response() {
         response_timeout_ms: 5000,
     };
     let service = Arc::new(UploadResponseService::new(config));
-    let router = UploadResponseRouter::new(service.clone());
+    let router = UploadResponseControlRouter::new(service.clone());
     let watcher = ResponseWatcher::new(service.clone()).with_poll_interval_ms(1);
     let _watcher_handle = watcher.spawn();
 
@@ -871,6 +901,27 @@ async fn test_internal_cache_api_writes_response() {
         .unwrap();
     service.end_request(stream_id).await.unwrap();
 
+    let claim = router
+        .route(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/_upload_response/streams/{stream_id}/response/claim/worker-1"
+                ))
+                .extension(verified_test_client())
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claim.status, StatusCode::OK);
+    let capability = claim
+        .headers
+        .iter()
+        .find(|(name, _)| name == RESPONSE_CAPABILITY_HEADER)
+        .map(|(_, value)| value.to_string())
+        .expect("claim capability");
+
     let response_headers = StreamHeaders::Response(StreamResponseHeaders {
         stream_id,
         version: http_pack::HttpVersion::Http11,
@@ -886,6 +937,9 @@ async fn test_internal_cache_api_writes_response() {
                 .uri(format!(
                     "/_upload_response/streams/{stream_id}/response/headers"
                 ))
+                .header(RESPONSE_CAPABILITY_HEADER, &capability)
+                .header(RESPONSE_SEQUENCE_HEADER, "1")
+                .extension(verified_test_client())
                 .body(())
                 .unwrap(),
             Box::pin(stream::iter(vec![Ok(Bytes::from(encoded_headers))])),
@@ -901,6 +955,9 @@ async fn test_internal_cache_api_writes_response() {
                 .uri(format!(
                     "/_upload_response/streams/{stream_id}/response/body"
                 ))
+                .header(RESPONSE_CAPABILITY_HEADER, &capability)
+                .header(RESPONSE_SEQUENCE_HEADER, "2")
+                .extension(verified_test_client())
                 .body(())
                 .unwrap(),
             Box::pin(stream::iter(vec![Ok(Bytes::from_static(b"remote-ok"))])),
@@ -916,6 +973,9 @@ async fn test_internal_cache_api_writes_response() {
                 .uri(format!(
                     "/_upload_response/streams/{stream_id}/response/end"
                 ))
+                .header(RESPONSE_CAPABILITY_HEADER, &capability)
+                .header(RESPONSE_SEQUENCE_HEADER, "3")
+                .extension(verified_test_client())
                 .body(())
                 .unwrap(),
         )

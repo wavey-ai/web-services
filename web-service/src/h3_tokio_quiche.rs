@@ -17,7 +17,7 @@ use http::{
 };
 use std::{
     fs,
-    net::{Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -83,7 +83,7 @@ impl TokioQuicheHttp3Server {
             }
 
             let tls_files = MaterializedTls::new(&self.config)?;
-            let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.config.port);
+            let addr = SocketAddr::new(self.config.bind_addr, self.config.port);
             let socket = UdpSocket::bind(addr).await?;
 
             let quic = quic_settings(

@@ -1,22 +1,36 @@
 use crate::{
     encode_request_control, request_from_headers_slot, RequestControl, StageState,
-    WorkerCapacitySummary, WorkerHeartbeat, WorkerHeartbeatUpdate,
+    WorkerCapacitySummary, WorkerHeartbeat, WorkerHeartbeatUpdate, RESPONSE_CAPABILITY_HEADER,
+    RESPONSE_SEQUENCE_HEADER,
 };
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use http::{header::CONTENT_TYPE, Request};
 use http_pack::stream::{encode_frame, StreamFrame, StreamHeaders};
-use reqwest::{Client, StatusCode};
-use std::collections::{BTreeMap, BTreeSet};
+use reqwest::{Certificate, Client, ClientBuilder, Identity, StatusCode};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::lookup_host;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 use web_service::HandlerResponse;
+
+type RemoteResponseClaimKey = (String, u64);
+type RemoteResponseClaims =
+    Arc<RwLock<HashMap<RemoteResponseClaimKey, Arc<Mutex<RemoteResponseClaim>>>>>;
 
 #[derive(Clone)]
 pub struct RemoteIngressClient {
     client: Client,
     slot_bytes: usize,
+    response_claims: RemoteResponseClaims,
+}
+
+#[derive(Debug)]
+struct RemoteResponseClaim {
+    capability: String,
+    next_sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,8 +71,35 @@ pub enum RemoteStageSlot {
 
 impl RemoteIngressClient {
     pub fn new(slot_bytes: usize, insecure_tls: bool) -> Result<Self> {
-        let client = Client::builder()
-            .danger_accept_invalid_certs(insecure_tls)
+        Self::from_builder(
+            slot_bytes,
+            Client::builder().tls_danger_accept_invalid_certs(insecure_tls),
+        )
+    }
+
+    /// Create a client for a private mutual TLS control listener.
+    ///
+    /// `identity_pem` must contain the worker certificate and private key.
+    pub fn new_with_mtls_pem(
+        slot_bytes: usize,
+        server_ca_pem: &[u8],
+        identity_pem: &[u8],
+    ) -> Result<Self> {
+        let server_roots = Certificate::from_pem_bundle(server_ca_pem)
+            .map_err(|error| anyhow!("failed to parse control server CA: {error}"))?;
+        anyhow::ensure!(!server_roots.is_empty(), "control server CA is empty");
+        let identity = Identity::from_pem(identity_pem)
+            .map_err(|error| anyhow!("failed to parse worker TLS identity: {error}"))?;
+        Self::from_builder(
+            slot_bytes,
+            Client::builder()
+                .tls_certs_only(server_roots)
+                .identity(identity),
+        )
+    }
+
+    fn from_builder(slot_bytes: usize, builder: ClientBuilder) -> Result<Self> {
+        let client = builder
             .http2_adaptive_window(true)
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
@@ -67,11 +108,93 @@ impl RemoteIngressClient {
         Ok(Self {
             client,
             slot_bytes: slot_bytes.max(1),
+            response_claims: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
     pub fn slot_bytes(&self) -> usize {
         self.slot_bytes
+    }
+
+    fn response_claim_key(origin: &str, stream_id: u64) -> RemoteResponseClaimKey {
+        (origin.trim_end_matches('/').to_string(), stream_id)
+    }
+
+    async fn response_claim(
+        &self,
+        origin: &str,
+        stream_id: u64,
+    ) -> Result<Arc<Mutex<RemoteResponseClaim>>> {
+        self.response_claims
+            .read()
+            .await
+            .get(&Self::response_claim_key(origin, stream_id))
+            .cloned()
+            .ok_or_else(|| anyhow!("response capability not claimed for stream {stream_id}"))
+    }
+
+    async fn remove_response_claim_if_current(
+        &self,
+        key: &RemoteResponseClaimKey,
+        expected: &Arc<Mutex<RemoteResponseClaim>>,
+    ) {
+        let mut claims = self.response_claims.write().await;
+        if claims
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            claims.remove(key);
+        }
+    }
+
+    async fn send_response_write(
+        &self,
+        origin: &str,
+        stream_id: u64,
+        operation: &str,
+        body: Bytes,
+    ) -> Result<()> {
+        let claim_key = Self::response_claim_key(origin, stream_id);
+        let claim_handle = self.response_claim(origin, stream_id).await?;
+        let mut claim = claim_handle.lock().await;
+        let sequence = claim.next_sequence;
+        let response = self
+            .client
+            .put(format!(
+                "{origin}/_upload_response/streams/{stream_id}/response/{operation}"
+            ))
+            .header(RESPONSE_CAPABILITY_HEADER, &claim.capability)
+            .header(RESPONSE_SEQUENCE_HEADER, sequence)
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!("write response {operation} for stream {stream_id}: {error}")
+            })?;
+        let status = response.status();
+        let response_body = response.bytes().await.unwrap_or_default();
+        if !status.is_success() {
+            let terminal = matches!(
+                status,
+                StatusCode::UNAUTHORIZED
+                    | StatusCode::FORBIDDEN
+                    | StatusCode::NOT_FOUND
+                    | StatusCode::CONFLICT
+            );
+            drop(claim);
+            if terminal {
+                self.remove_response_claim_if_current(&claim_key, &claim_handle)
+                    .await;
+            }
+            return Err(anyhow!(
+                "write response {operation} for stream {stream_id} returned {status}: {}",
+                String::from_utf8_lossy(&response_body)
+            ));
+        }
+        claim.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("response sequence exhausted for stream {stream_id}"))?;
+        Ok(())
     }
 
     pub async fn list_streams(&self, origin: &str) -> Result<Vec<RemoteStreamInfo>> {
@@ -492,8 +615,32 @@ impl RemoteIngressClient {
             .await
             .map_err(|error| anyhow!("failed to claim response for {stream_id}: {error}"))?;
         match response.status() {
-            StatusCode::OK | StatusCode::CREATED => Ok(true),
-            StatusCode::CONFLICT | StatusCode::NOT_FOUND => Ok(false),
+            StatusCode::OK | StatusCode::CREATED => {
+                let capability = response
+                    .headers()
+                    .get(RESPONSE_CAPABILITY_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("claim response omitted capability for stream {stream_id}")
+                    })?
+                    .to_string();
+                self.response_claims.write().await.insert(
+                    Self::response_claim_key(origin, stream_id),
+                    Arc::new(Mutex::new(RemoteResponseClaim {
+                        capability,
+                        next_sequence: 1,
+                    })),
+                );
+                Ok(true)
+            }
+            StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                self.response_claims
+                    .write()
+                    .await
+                    .remove(&Self::response_claim_key(origin, stream_id));
+                Ok(false)
+            }
             status => {
                 let body = response.text().await.unwrap_or_default();
                 Err(anyhow!(
@@ -509,18 +656,35 @@ impl RemoteIngressClient {
         stream_id: u64,
         worker_id: &str,
     ) -> Result<()> {
+        let claim_key = Self::response_claim_key(origin, stream_id);
+        let claim_handle = self.response_claim(origin, stream_id).await?;
+        let claim = claim_handle.lock().await;
         let response = self
             .client
             .delete(format!(
                 "{origin}/_upload_response/streams/{stream_id}/response/claim/{worker_id}"
             ))
+            .header(RESPONSE_CAPABILITY_HEADER, &claim.capability)
             .send()
             .await
             .map_err(|error| anyhow!("failed to release response for {stream_id}: {error}"))?;
+        let status = response.status();
+        drop(claim);
+        if status.is_success()
+            || matches!(
+                status,
+                StatusCode::UNAUTHORIZED
+                    | StatusCode::FORBIDDEN
+                    | StatusCode::NOT_FOUND
+                    | StatusCode::CONFLICT
+            )
+        {
+            self.remove_response_claim_if_current(&claim_key, &claim_handle)
+                .await;
+        }
         anyhow::ensure!(
-            response.status().is_success() || response.status() == StatusCode::NOT_FOUND,
-            "release response failed for stream {stream_id} with status {}",
-            response.status()
+            status.is_success() || status == StatusCode::NOT_FOUND,
+            "release response failed for stream {stream_id} with status {status}"
         );
         Ok(())
     }
@@ -699,17 +863,8 @@ impl RemoteIngressClient {
         headers: StreamHeaders,
     ) -> Result<()> {
         let encoded = encode_frame(&StreamFrame::Headers(headers));
-        self.client
-            .put(format!(
-                "{origin}/_upload_response/streams/{stream_id}/response/headers"
-            ))
-            .body(encoded)
-            .send()
+        self.send_response_write(origin, stream_id, "headers", Bytes::from(encoded))
             .await
-            .map_err(|error| anyhow!("write response headers for stream {stream_id}: {error}"))?
-            .error_for_status()
-            .map_err(|error| anyhow!("write response headers for stream {stream_id}: {error}"))?;
-        Ok(())
     }
 
     pub async fn append_response_body(
@@ -722,31 +877,15 @@ impl RemoteIngressClient {
             if chunk.is_empty() {
                 continue;
             }
-            self.client
-                .put(format!(
-                    "{origin}/_upload_response/streams/{stream_id}/response/body"
-                ))
-                .body(Bytes::copy_from_slice(chunk))
-                .send()
-                .await
-                .map_err(|error| anyhow!("write response body for stream {stream_id}: {error}"))?
-                .error_for_status()
-                .map_err(|error| anyhow!("write response body for stream {stream_id}: {error}"))?;
+            self.send_response_write(origin, stream_id, "body", Bytes::copy_from_slice(chunk))
+                .await?;
         }
         Ok(())
     }
 
     pub async fn end_response(&self, origin: &str, stream_id: u64) -> Result<()> {
-        self.client
-            .put(format!(
-                "{origin}/_upload_response/streams/{stream_id}/response/end"
-            ))
-            .send()
+        self.send_response_write(origin, stream_id, "end", Bytes::new())
             .await
-            .map_err(|error| anyhow!("finish response for stream {stream_id}: {error}"))?
-            .error_for_status()
-            .map_err(|error| anyhow!("finish response for stream {stream_id}: {error}"))?;
-        Ok(())
     }
 }
 

@@ -110,7 +110,7 @@ impl RawTcpServer {
         mut shutdown_rx: watch::Receiver<()>,
         startup_tx: Option<StartupSender>,
     ) -> ServerResult<()> {
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.config.raw_tcp_port));
+        let addr = SocketAddr::new(self.config.bind_addr, self.config.raw_tcp_port);
         let startup: ServerResult<_> = async {
             let listener = TcpListener::bind(addr).await.map_err(ServerError::Io)?;
             let tls_acceptor = if self.config.raw_tcp_tls {

@@ -14,7 +14,7 @@ use h3::server::{Connection, RequestStream};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
 use h3_webtransport::server::WebTransportSession;
 use http::{header::RANGE, HeaderName, HeaderValue, Method, Response, StatusCode};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tls_helpers::{load_certs_from_base64, load_keys_from_base64};
 use tokio::{
@@ -221,7 +221,7 @@ impl Http3Server {
             ));
             server_config.transport_config(Arc::new(build_quic_transport_config()));
 
-            let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.config.port);
+            let addr = SocketAddr::new(self.config.bind_addr, self.config.port);
             let endpoint = quinn::Endpoint::server(server_config, addr)
                 .map_err(|e| ServerError::Io(std::io::Error::other(e)))?;
             Ok(endpoint)

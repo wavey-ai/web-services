@@ -187,7 +187,13 @@ flowchart TB
 
 ### Internal Cache API
 
-For split CPU ingress and GPU worker deployments, `UploadResponseRouter` now exposes a private HTTP/2-friendly control/data plane under `/_upload_response`. The endpoints use the ingress-owned `stream_id`, and raw slot payloads stay binary.
+For split CPU ingress and GPU worker deployments, `UploadResponseControlRouter` exposes a private HTTP/2 control plane under `/_upload_response`.
+
+Run this router on a separate private listener. Configure `with_bind_address` and `with_client_ca`, enable HTTP/2, and disable HTTP/3.
+
+The listener requires a worker certificate signed by the configured client CA. It rejects HTTP/1.1 and injects the verified certificate fingerprint into each request.
+
+`UploadResponseRouter` never matches the internal prefix. Public requests to that prefix receive `404 Not Found`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -210,9 +216,13 @@ and transcode pods own the client connection and cache. GPU workers read request
 slots and write response slots through internal H2. A future high-throughput
 data plane can use raw TCP/TLS with the same semantics and `HPKS` framing.
 
-The router does not authenticate these internal routes. Keep them on a private listener until the control plane implements worker authentication.
+Create worker clients with `RemoteIngressClient::new_with_mtls_pem`. Provide the control server CA and a PEM containing the worker certificate and private key.
 
-Response claims are cooperative in this revision. The write routes do not yet prove that the caller owns the active claim.
+The claim response returns a random 256-bit capability in `x-upload-response-capability`. Only its SHA-256 digest remains in server memory.
+
+Response writes require that capability and a positive `x-upload-response-sequence`. Exact retries are idempotent; conflicting or skipped sequences fail.
+
+Use a Kubernetes `NetworkPolicy` as a second boundary. Mutual TLS provides the required worker authentication.
 
 ### Stream Format
 

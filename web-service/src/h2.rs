@@ -18,14 +18,20 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::upgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use std::convert::Infallible;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use tls_helpers::tls_acceptor_from_base64;
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
+use sha2::{Digest, Sha256};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{Arc, Once},
+};
+use tls_helpers::{certs_from_base64, privkey_from_base64, tls_acceptor_from_base64};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
     tungstenite::{handshake::derive_accept_key, protocol::Role},
     WebSocketStream,
@@ -33,6 +39,30 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info};
 
 const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
+static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
+
+/// Identity of a mutually authenticated client certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedClientCertificate {
+    sha256_fingerprint: [u8; 32],
+}
+
+impl VerifiedClientCertificate {
+    fn from_der(der: &[u8]) -> Self {
+        Self {
+            sha256_fingerprint: Sha256::digest(der).into(),
+        }
+    }
+
+    /// Create an identity after an external TLS terminator verifies it.
+    pub fn from_sha256_fingerprint(sha256_fingerprint: [u8; 32]) -> Self {
+        Self { sha256_fingerprint }
+    }
+
+    pub fn sha256_fingerprint(&self) -> [u8; 32] {
+        self.sha256_fingerprint
+    }
+}
 
 pub struct Http2Server {
     config: ServerConfig,
@@ -107,15 +137,9 @@ impl Http2Server {
         mut shutdown_rx: watch::Receiver<()>,
         startup_tx: Option<StartupSender>,
     ) -> ServerResult<()> {
-        let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.config.port);
+        let addr = SocketAddr::new(self.config.bind_addr, self.config.port);
         let startup: ServerResult<_> = (|| {
-            let tls_acceptor = tls_acceptor_from_base64(
-                &self.config.cert_pem_base64,
-                &self.config.privkey_pem_base64,
-                true,
-                true,
-            )
-            .map_err(|e| ServerError::Tls(e.to_string()))?;
+            let tls_acceptor = build_tls_acceptor(&self.config)?;
             let listener = bind_tcp_listener(addr)?;
             Ok((tls_acceptor, listener))
         })();
@@ -133,6 +157,7 @@ impl Http2Server {
         }
         info!("HTTP/1.1+HTTP/2 server listening at {}", addr);
         let enable_websocket = self.config.enable_websocket;
+        let require_client_certificate = self.config.client_ca_pem_base64.is_some();
         let connection_limit = Arc::new(Semaphore::new(self.config.max_connections.max(1)));
         let handshake_timeout = Duration::from_millis(self.config.handshake_timeout_ms.max(1));
         let mut connection_tasks = JoinSet::new();
@@ -166,14 +191,41 @@ impl Http2Server {
                                         return;
                                     }
                                     Ok(Err(e)) => {
-                                        error!("TLS handshake failed: {}", e);
+                                        debug!(%peer, %e, "TLS handshake failed");
                                         return;
                                     }
                                 };
 
                                 let alpn = tls_stream.get_ref().1.alpn_protocol();
-                                let service = service_fn(move |req: http::Request<Incoming>| {
+                                let is_h2 = matches!(alpn, Some(proto) if proto == b"h2");
+                                if require_client_certificate && !is_h2 {
+                                    debug!(%peer, "mutual TLS listener rejected a non-HTTP/2 client");
+                                    return;
+                                }
+                                let client_certificate = require_client_certificate
+                                    .then(|| {
+                                        tls_stream
+                                            .get_ref()
+                                            .1
+                                            .peer_certificates()
+                                            .and_then(|certificates| certificates.first())
+                                            .map(|certificate| {
+                                                VerifiedClientCertificate::from_der(
+                                                    certificate.as_ref(),
+                                                )
+                                            })
+                                    })
+                                    .flatten();
+                                if require_client_certificate && client_certificate.is_none() {
+                                    debug!(%peer, "mutual TLS connection omitted its client identity");
+                                    return;
+                                }
+
+                                let service = service_fn(move |mut req: http::Request<Incoming>| {
                                     let router = Arc::clone(&router);
+                                    if let Some(client_certificate) = client_certificate {
+                                        req.extensions_mut().insert(client_certificate);
+                                    }
                                     async move {
                                         match handle_h2_request(
                                             req,
@@ -191,7 +243,7 @@ impl Http2Server {
                                     }
                                 });
 
-                                if matches!(alpn, Some(proto) if proto == b"h2") {
+                                if is_h2 {
                                     let mut builder = http2::Builder::new(TokioExecutor::new());
                                     builder.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
                                     if let Err(e) = builder
@@ -228,6 +280,43 @@ impl Http2Server {
 
         Ok(())
     }
+}
+
+fn build_tls_acceptor(config: &ServerConfig) -> ServerResult<TlsAcceptor> {
+    INSTALL_CRYPTO_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+    let Some(client_ca) = config.client_ca_pem_base64.as_deref() else {
+        return tls_acceptor_from_base64(
+            &config.cert_pem_base64,
+            &config.privkey_pem_base64,
+            true,
+            true,
+        )
+        .map_err(|error| ServerError::Tls(error.to_string()));
+    };
+
+    let certificates = certs_from_base64(&config.cert_pem_base64)
+        .map_err(|error| ServerError::Tls(error.to_string()))?;
+    let private_key = privkey_from_base64(&config.privkey_pem_base64)
+        .map_err(|error| ServerError::Tls(error.to_string()))?;
+    let mut client_roots = RootCertStore::empty();
+    for certificate in
+        certs_from_base64(client_ca).map_err(|error| ServerError::Tls(error.to_string()))?
+    {
+        client_roots
+            .add(certificate)
+            .map_err(|error| ServerError::Tls(error.to_string()))?;
+    }
+    let verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+        .build()
+        .map_err(|error| ServerError::Tls(error.to_string()))?;
+    let mut tls_config = RustlsServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certificates, private_key)
+        .map_err(|error| ServerError::Tls(error.to_string()))?;
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }
 
 fn bind_tcp_listener(addr: SocketAddr) -> ServerResult<TcpListener> {

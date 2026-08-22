@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http::{Request, StatusCode};
@@ -10,10 +11,12 @@ use hyper_util::rt::TokioIo;
 use playlists::chunk_cache::ChunkCache;
 use playlists::Options;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use tokio::sync::{
     oneshot, Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore,
 };
@@ -23,7 +26,7 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, error, warn};
 use web_service::{
     BodyStream, HandlerResponse, HandlerResult, Router, ServerError, StreamWriter,
-    WebSocketHandler, WebTransportHandler,
+    VerifiedClientCertificate, WebSocketHandler, WebTransportHandler,
 };
 
 mod watcher;
@@ -94,6 +97,45 @@ const MAX_READERS_PER_STREAM: usize = 256;
 const MAX_STAGE_NAME_BYTES: usize = 64;
 const MAX_STAGE_LANES: usize = 16;
 const MAX_WORKER_HEARTBEATS: usize = 4_096;
+const RESPONSE_CAPABILITY_BYTES: usize = 32;
+pub const RESPONSE_CAPABILITY_HEADER: &str = "x-upload-response-capability";
+pub const RESPONSE_SEQUENCE_HEADER: &str = "x-upload-response-sequence";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseWriteKind {
+    Headers,
+    Body,
+    End,
+}
+
+impl ResponseWriteKind {
+    fn digest(self, data: &[u8]) -> [u8; 32] {
+        let tag = match self {
+            Self::Headers => b"headers".as_slice(),
+            Self::Body => b"body".as_slice(),
+            Self::End => b"end".as_slice(),
+        };
+        let mut digest = Sha256::new();
+        digest.update(tag);
+        digest.update(data);
+        digest.finalize().into()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResponseWriteRecord {
+    sequence: u64,
+    digest: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+struct ResponseClaim {
+    worker_id: String,
+    capability_digest: [u8; 32],
+    expires_at: Instant,
+    next_sequence: u64,
+    last_write: Option<ResponseWriteRecord>,
+}
 
 /// Control message embedded in a request stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,8 +441,8 @@ pub struct UploadResponseService {
     request_reader_notifies: Vec<Arc<Notify>>,
     response_reader_positions: Arc<RwLock<Vec<HashMap<String, usize>>>>,
     response_reader_notifies: Vec<Arc<Notify>>,
-    /// Per-stream response claim: None = unclaimed, Some(worker_id) = exclusive write access
-    response_claims: Arc<RwLock<Vec<Option<String>>>>,
+    /// Per-stream response claim and write capability.
+    response_claims: Vec<Mutex<Option<ResponseClaim>>>,
     response_dirty: Vec<AtomicBool>,
     response_updates: Arc<Notify>,
     /// Worker heartbeat/capacity registry keyed by worker id.
@@ -436,7 +478,7 @@ impl UploadResponseService {
             .collect();
 
         // Initialize per-stream response claims (for exclusive writer)
-        let response_claims: Vec<Option<String>> = (0..config.num_streams).map(|_| None).collect();
+        let response_claims = (0..config.num_streams).map(|_| Mutex::new(None)).collect();
 
         Self {
             request_cache,
@@ -459,7 +501,7 @@ impl UploadResponseService {
             request_reader_notifies: new_reader_notifies(config.num_streams),
             response_reader_positions: new_reader_positions(config.num_streams),
             response_reader_notifies: new_reader_notifies(config.num_streams),
-            response_claims: Arc::new(RwLock::new(response_claims)),
+            response_claims,
             response_dirty: (0..config.num_streams)
                 .map(|_| AtomicBool::new(false))
                 .collect(),
@@ -775,7 +817,6 @@ impl UploadResponseService {
     }
 
     pub async fn active_streams(&self) -> Vec<ActiveStreamInfo> {
-        let claims = self.response_claims.read().await.clone();
         let stage_lanes: Vec<(String, Arc<StageLane>)> = {
             let stages = self.stages.read().await;
             stages
@@ -802,13 +843,23 @@ impl UploadResponseService {
                 continue;
             }
 
+            let response_owner = self.response_claims[slot.stream_idx]
+                .lock()
+                .await
+                .as_ref()
+                .filter(|claim| claim.expires_at > Instant::now())
+                .map(|claim| claim.worker_id.clone());
+            if !self.is_current_slot(slot.stream_id, slot.stream_idx) {
+                continue;
+            }
+
             active.push(ActiveStreamInfo {
                 stream_id: slot.stream_id,
                 stream_idx: slot.stream_idx,
                 request_last: self.request_cache.last(slot.stream_idx).unwrap_or(0),
                 response_last: self.response_cache.last(slot.stream_idx).unwrap_or(0),
                 reader_count: self.stream_worker_counts[slot.stream_idx].load(Ordering::SeqCst),
-                response_owner: claims[slot.stream_idx].clone(),
+                response_owner,
                 stages,
             });
         }
@@ -845,8 +896,7 @@ impl UploadResponseService {
             }
         }
         {
-            let mut claims = self.response_claims.write().await;
-            claims[stream_idx] = None;
+            *self.response_claims[stream_idx].lock().await = None;
         }
         self.notify_response_update(stream_idx);
     }
@@ -1366,29 +1416,60 @@ impl UploadResponseService {
         claimed && self.is_current_slot(stream_id, stream_idx)
     }
 
-    /// Try to claim exclusive write access to a stream's response.
-    ///
-    /// Only one worker can hold the response claim at a time.
-    /// Returns `true` if the claim succeeded (response was unclaimed).
-    /// Returns `false` if another worker already claimed this response.
-    pub async fn try_claim_response(&self, stream_id: u64, worker_id: &str) -> bool {
+    fn response_claim_ttl(&self) -> Duration {
+        Duration::from_millis(self.config.response_timeout_ms.max(1_000))
+    }
+
+    fn capability_digest(capability: &str) -> [u8; 32] {
+        Sha256::digest(capability.as_bytes()).into()
+    }
+
+    fn new_response_capability() -> Result<(String, [u8; 32]), String> {
+        let mut bytes = [0_u8; RESPONSE_CAPABILITY_BYTES];
+        getrandom::fill(&mut bytes)
+            .map_err(|error| format!("failed to generate response capability: {error}"))?;
+        let capability = URL_SAFE_NO_PAD.encode(bytes);
+        let digest = Self::capability_digest(&capability);
+        Ok((capability, digest))
+    }
+
+    /// Try to claim exclusive write access and return its bearer capability.
+    pub async fn try_claim_response_with_capability(
+        &self,
+        stream_id: u64,
+        worker_id: &str,
+    ) -> Result<Option<String>, String> {
         if !Self::valid_reader_id(worker_id) {
-            return false;
+            return Ok(None);
         }
-        let Some(stream_idx) = self.stream_idx(stream_id) else {
-            return false;
-        };
-        let mut claims = self.response_claims.write().await;
-        if !self.is_current_slot(stream_id, stream_idx) {
-            return false;
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        let mut claim = self.response_claims[stream_idx].lock().await;
+        let now = Instant::now();
+        if claim.as_ref().is_some_and(|claim| claim.expires_at > now) {
+            return Ok(None);
         }
-        if claims[stream_idx].is_none() {
-            claims[stream_idx] = Some(worker_id.to_string());
-            debug!(stream_id, worker_id, "Response claimed");
-            true
-        } else {
-            false
-        }
+
+        let (capability, capability_digest) = Self::new_response_capability()?;
+        *claim = Some(ResponseClaim {
+            worker_id: worker_id.to_string(),
+            capability_digest,
+            expires_at: now + self.response_claim_ttl(),
+            next_sequence: 1,
+            last_write: None,
+        });
+        debug!(stream_id, worker_id, "Response claimed");
+        Ok(Some(capability))
+    }
+
+    /// Claim a response for trusted in-process writers.
+    ///
+    /// Remote writers must use `try_claim_response_with_capability`.
+    pub async fn try_claim_response(&self, stream_id: u64, worker_id: &str) -> bool {
+        self.try_claim_response_with_capability(stream_id, worker_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// Release a previously claimed response.
@@ -1396,15 +1477,15 @@ impl UploadResponseService {
     /// Returns `true` if released successfully (caller was the owner).
     /// Returns `false` if the response was not claimed by this worker.
     pub async fn release_response(&self, stream_id: u64, worker_id: &str) -> bool {
-        let Some(stream_idx) = self.stream_idx(stream_id) else {
+        let Ok((stream_idx, _slot_guard)) = self.lock_stream_slot(stream_id).await else {
             return false;
         };
-        let mut claims = self.response_claims.write().await;
-        if !self.is_current_slot(stream_id, stream_idx) {
-            return false;
-        }
-        if claims[stream_idx].as_deref() == Some(worker_id) {
-            claims[stream_idx] = None;
+        let mut claim = self.response_claims[stream_idx].lock().await;
+        if claim
+            .as_ref()
+            .is_some_and(|claim| claim.worker_id == worker_id)
+        {
+            *claim = None;
             debug!(stream_id, worker_id, "Response released");
             true
         } else {
@@ -1412,25 +1493,48 @@ impl UploadResponseService {
         }
     }
 
+    /// Release a remote response claim using its bearer capability.
+    pub async fn release_response_with_capability(
+        &self,
+        stream_id: u64,
+        worker_id: &str,
+        capability: &str,
+    ) -> bool {
+        let Ok((stream_idx, _slot_guard)) = self.lock_stream_slot(stream_id).await else {
+            return false;
+        };
+        let supplied_digest = Self::capability_digest(capability);
+        let mut claim = self.response_claims[stream_idx].lock().await;
+        let authorized = claim.as_ref().is_some_and(|claim| {
+            claim.worker_id == worker_id
+                && bool::from(claim.capability_digest.ct_eq(&supplied_digest))
+                && claim.expires_at > Instant::now()
+        });
+        if authorized {
+            *claim = None;
+            debug!(stream_id, worker_id, "Response capability released");
+        }
+        authorized
+    }
+
     /// Force-release a response regardless of owner (for cleanup/recovery).
     pub async fn force_release_response(&self, stream_id: u64) {
-        let Some(stream_idx) = self.stream_idx(stream_id) else {
+        let Ok((stream_idx, _slot_guard)) = self.lock_stream_slot(stream_id).await else {
             return;
         };
-        let mut claims = self.response_claims.write().await;
-        if !self.is_current_slot(stream_id, stream_idx) {
-            return;
-        }
-        claims[stream_idx] = None;
+        *self.response_claims[stream_idx].lock().await = None;
         debug!(stream_id, "Response force-released");
     }
 
     /// Get the worker ID that currently holds the response claim, if any.
     pub async fn response_owner(&self, stream_id: u64) -> Option<String> {
         let stream_idx = self.stream_idx(stream_id)?;
-        let claims = self.response_claims.read().await;
-        let owner = claims[stream_idx].clone();
-        drop(claims);
+        let claim = self.response_claims[stream_idx].lock().await;
+        let owner = claim
+            .as_ref()
+            .filter(|claim| claim.expires_at > Instant::now())
+            .map(|claim| claim.worker_id.clone());
+        drop(claim);
         self.is_current_slot(stream_id, stream_idx)
             .then_some(owner)
             .flatten()
@@ -1441,9 +1545,11 @@ impl UploadResponseService {
         let Some(stream_idx) = self.stream_idx(stream_id) else {
             return false;
         };
-        let claims = self.response_claims.read().await;
-        let claimed = claims[stream_idx].as_deref() == Some(worker_id);
-        drop(claims);
+        let claim = self.response_claims[stream_idx].lock().await;
+        let claimed = claim
+            .as_ref()
+            .is_some_and(|claim| claim.worker_id == worker_id && claim.expires_at > Instant::now());
+        drop(claim);
         claimed && self.is_current_slot(stream_id, stream_idx)
     }
 
@@ -1452,9 +1558,11 @@ impl UploadResponseService {
         let Some(stream_idx) = self.stream_idx(stream_id) else {
             return false;
         };
-        let claims = self.response_claims.read().await;
-        let claimed = claims[stream_idx].is_some();
-        drop(claims);
+        let claim = self.response_claims[stream_idx].lock().await;
+        let claimed = claim
+            .as_ref()
+            .is_some_and(|claim| claim.expires_at > Instant::now());
+        drop(claim);
         claimed && self.is_current_slot(stream_id, stream_idx)
     }
 
@@ -1781,76 +1889,198 @@ impl UploadResponseService {
         .await
     }
 
-    /// Write HPKS headers frame to slot 1 of response stream
+    async fn write_response_at(
+        &self,
+        stream_id: u64,
+        stream_idx: usize,
+        kind: ResponseWriteKind,
+        data: Bytes,
+    ) -> Result<(), String> {
+        match kind {
+            ResponseWriteKind::Headers => {
+                if self.response_started[stream_idx].load(Ordering::Acquire) {
+                    return Err(format!(
+                        "response headers already written for stream: {stream_id}"
+                    ));
+                }
+                self.response_cache
+                    .add(stream_idx, 1, data)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !self.is_current_slot(stream_id, stream_idx) {
+                    return Err(format!("response stream closed: {stream_id}"));
+                }
+                self.response_started[stream_idx].store(true, Ordering::Release);
+            }
+            ResponseWriteKind::Body => {
+                if data.is_empty() {
+                    return Err("response body chunks cannot be empty".to_string());
+                }
+                if !self.response_started[stream_idx].load(Ordering::Acquire) {
+                    return Err(format!(
+                        "response headers not written for stream: {stream_id}"
+                    ));
+                }
+                self.append_cache_with_backpressure(
+                    stream_id,
+                    stream_idx,
+                    &self.response_cache,
+                    &self.response_reader_positions,
+                    &self.response_reader_notifies,
+                    "response",
+                    data,
+                )
+                .await?;
+            }
+            ResponseWriteKind::End => {
+                if !self.response_started[stream_idx].load(Ordering::Acquire) {
+                    return Err(format!(
+                        "response headers not written for stream: {stream_id}"
+                    ));
+                }
+                self.append_cache_with_backpressure(
+                    stream_id,
+                    stream_idx,
+                    &self.response_cache,
+                    &self.response_reader_positions,
+                    &self.response_reader_notifies,
+                    "response",
+                    Bytes::from_static(END_MARKER),
+                )
+                .await?;
+            }
+        }
+        self.notify_response_update(stream_idx);
+        Ok(())
+    }
+
+    async fn write_claimed_response(
+        &self,
+        stream_id: u64,
+        capability: &str,
+        sequence: u64,
+        kind: ResponseWriteKind,
+        data: Bytes,
+    ) -> Result<(), String> {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        let supplied_digest = Self::capability_digest(capability);
+        let write_digest = kind.digest(&data);
+        let mut claim = self.response_claims[stream_idx].lock().await;
+        let claim = claim
+            .as_mut()
+            .ok_or_else(|| "response capability required".to_string())?;
+        if !bool::from(claim.capability_digest.ct_eq(&supplied_digest)) {
+            return Err("invalid response capability".to_string());
+        }
+        if claim.expires_at <= Instant::now() {
+            return Err("response capability expired".to_string());
+        }
+        if sequence < claim.next_sequence {
+            let retry_matches = claim.last_write.is_some_and(|last| {
+                last.sequence == sequence && bool::from(last.digest.ct_eq(&write_digest))
+            });
+            return if retry_matches {
+                Ok(())
+            } else {
+                Err(format!("conflicting response retry sequence: {sequence}"))
+            };
+        }
+        if sequence != claim.next_sequence {
+            return Err(format!(
+                "unexpected response sequence: {sequence}; expected {}",
+                claim.next_sequence
+            ));
+        }
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| "response sequence exhausted".to_string())?;
+
+        self.write_response_at(stream_id, stream_idx, kind, data)
+            .await?;
+        claim.next_sequence = next_sequence;
+        claim.last_write = Some(ResponseWriteRecord {
+            sequence,
+            digest: write_digest,
+        });
+        claim.expires_at = Instant::now() + self.response_claim_ttl();
+        Ok(())
+    }
+
+    /// Write an HPKS headers frame from a trusted in-process writer.
     pub async fn write_response_headers(
         &self,
         stream_id: u64,
         headers: StreamHeaders,
     ) -> Result<(), String> {
         let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
-        if self.response_started[stream_idx].load(Ordering::Acquire) {
-            return Err(format!(
-                "response headers already written for stream: {stream_id}"
-            ));
-        }
-        let encoded = encode_frame(&StreamFrame::Headers(headers));
-        self.response_cache
-            .add(stream_idx, 1, Bytes::from(encoded))
+        let encoded = Bytes::from(encode_frame(&StreamFrame::Headers(headers)));
+        self.write_response_at(stream_id, stream_idx, ResponseWriteKind::Headers, encoded)
             .await
-            .map_err(|e| e.to_string())?;
-        if !self.is_current_slot(stream_id, stream_idx) {
-            return Err(format!("response stream closed: {stream_id}"));
-        }
-        self.response_started[stream_idx].store(true, Ordering::Release);
-        self.notify_response_update(stream_idx);
-        Ok(())
     }
 
-    /// Append raw body bytes to response stream (slots 2+)
-    pub async fn append_response_body(&self, stream_id: u64, data: Bytes) -> Result<(), String> {
-        if data.is_empty() {
-            return Err("response body chunks cannot be empty".to_string());
-        }
-        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
-        if !self.response_started[stream_idx].load(Ordering::Acquire) {
-            return Err(format!(
-                "response headers not written for stream: {stream_id}"
-            ));
-        }
-        self.append_cache_with_backpressure(
+    pub async fn write_response_headers_claimed(
+        &self,
+        stream_id: u64,
+        capability: &str,
+        sequence: u64,
+        headers: StreamHeaders,
+    ) -> Result<(), String> {
+        let encoded = Bytes::from(encode_frame(&StreamFrame::Headers(headers)));
+        self.write_claimed_response(
             stream_id,
-            stream_idx,
-            &self.response_cache,
-            &self.response_reader_positions,
-            &self.response_reader_notifies,
-            "response",
+            capability,
+            sequence,
+            ResponseWriteKind::Headers,
+            encoded,
+        )
+        .await
+    }
+
+    /// Append raw body bytes from a trusted in-process writer.
+    pub async fn append_response_body(&self, stream_id: u64, data: Bytes) -> Result<(), String> {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        self.write_response_at(stream_id, stream_idx, ResponseWriteKind::Body, data)
+            .await
+    }
+
+    pub async fn append_response_body_claimed(
+        &self,
+        stream_id: u64,
+        capability: &str,
+        sequence: u64,
+        data: Bytes,
+    ) -> Result<(), String> {
+        self.write_claimed_response(
+            stream_id,
+            capability,
+            sequence,
+            ResponseWriteKind::Body,
             data,
         )
-        .await?;
-        self.notify_response_update(stream_idx);
-        Ok(())
+        .await
     }
 
-    /// Write end marker to response stream
+    /// End a response from a trusted in-process writer.
     pub async fn end_response(&self, stream_id: u64) -> Result<(), String> {
         let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
-        if !self.response_started[stream_idx].load(Ordering::Acquire) {
-            return Err(format!(
-                "response headers not written for stream: {stream_id}"
-            ));
-        }
-        self.append_cache_with_backpressure(
+        self.write_response_at(stream_id, stream_idx, ResponseWriteKind::End, Bytes::new())
+            .await
+    }
+
+    pub async fn end_response_claimed(
+        &self,
+        stream_id: u64,
+        capability: &str,
+        sequence: u64,
+    ) -> Result<(), String> {
+        self.write_claimed_response(
             stream_id,
-            stream_idx,
-            &self.response_cache,
-            &self.response_reader_positions,
-            &self.response_reader_notifies,
-            "response",
-            Bytes::from_static(END_MARKER),
+            capability,
+            sequence,
+            ResponseWriteKind::End,
+            Bytes::new(),
         )
-        .await?;
-        self.notify_response_update(stream_idx);
-        Ok(())
+        .await
     }
 
     pub async fn write_handler_response(
@@ -2205,6 +2435,46 @@ impl UploadResponseRouter {
             .map_err(|error| ServerError::Config(format!("invalid json body: {error}")))
     }
 
+    fn response_capability(req: &Request<()>) -> Option<&str> {
+        req.headers()
+            .get(RESPONSE_CAPABILITY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn response_write_authority(req: &Request<()>) -> Result<(String, u64), HandlerResponse> {
+        let capability = Self::response_capability(req)
+            .ok_or_else(|| Self::text_response(StatusCode::UNAUTHORIZED, "capability required"))?
+            .to_string();
+        let sequence = req
+            .headers()
+            .get(RESPONSE_SEQUENCE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|sequence| *sequence > 0)
+            .ok_or_else(|| {
+                Self::text_response(StatusCode::BAD_REQUEST, "positive sequence required")
+            })?;
+        Ok((capability, sequence))
+    }
+
+    fn claimed_response_error(error: String) -> HandlerResponse {
+        let status = if error.contains("capability required") {
+            StatusCode::UNAUTHORIZED
+        } else if error.contains("invalid response capability")
+            || error.contains("response capability expired")
+        {
+            StatusCode::FORBIDDEN
+        } else if error.contains("sequence") || error.contains("already written") {
+            StatusCode::CONFLICT
+        } else if error.contains("unknown stream") || error.contains("stream closed") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        Self::text_response(status, error)
+    }
+
     async fn route_internal(
         &self,
         req: Request<()>,
@@ -2492,18 +2762,33 @@ impl UploadResponseRouter {
                         "stream not found",
                     ));
                 }
-                if self.service.try_claim_response(stream_id, worker_id).await {
-                    Ok(Self::text_response(StatusCode::OK, "claimed"))
-                } else {
-                    let owner = self
-                        .service
-                        .response_owner(stream_id)
-                        .await
-                        .unwrap_or_else(|| "-".to_string());
-                    Ok(Self::text_response(
-                        StatusCode::CONFLICT,
-                        format!("already claimed by {owner}"),
-                    ))
+                match self
+                    .service
+                    .try_claim_response_with_capability(stream_id, worker_id)
+                    .await
+                    .map_err(ServerError::Config)?
+                {
+                    Some(capability) => {
+                        let mut response = Self::text_response(StatusCode::OK, "claimed");
+                        response
+                            .headers
+                            .push((RESPONSE_CAPABILITY_HEADER.into(), capability.into()));
+                        response
+                            .headers
+                            .push(("cache-control".into(), "no-store".into()));
+                        Ok(response)
+                    }
+                    None => {
+                        let owner = self
+                            .service
+                            .response_owner(stream_id)
+                            .await
+                            .unwrap_or_else(|| "-".to_string());
+                        Ok(Self::text_response(
+                            StatusCode::CONFLICT,
+                            format!("already claimed by {owner}"),
+                        ))
+                    }
                 }
             }
             (
@@ -2517,7 +2802,16 @@ impl UploadResponseRouter {
                         "stream not found",
                     ));
                 }
-                let released = self.service.release_response(stream_id, worker_id).await;
+                let Some(capability) = Self::response_capability(&req) else {
+                    return Ok(Self::text_response(
+                        StatusCode::UNAUTHORIZED,
+                        "capability required",
+                    ));
+                };
+                let released = self
+                    .service
+                    .release_response_with_capability(stream_id, worker_id, capability)
+                    .await;
                 let status = if released {
                     StatusCode::OK
                 } else {
@@ -2646,6 +2940,10 @@ impl UploadResponseRouter {
                         "stream not found",
                     ));
                 }
+                let (capability, sequence) = match Self::response_write_authority(&req) {
+                    Ok(authority) => authority,
+                    Err(response) => return Ok(response),
+                };
                 let body = Self::collect_body(body, self.service.config().slot_bytes()).await?;
                 let frame = decode_frame(&body)
                     .map_err(|e| ServerError::Config(format!("invalid HPKS headers frame: {e}")))?;
@@ -2654,10 +2952,17 @@ impl UploadResponseRouter {
                         if resp.stream_id == stream_id =>
                     {
                         self.service
-                            .write_response_headers(stream_id, StreamHeaders::Response(resp))
+                            .write_response_headers_claimed(
+                                stream_id,
+                                &capability,
+                                sequence,
+                                StreamHeaders::Response(resp),
+                            )
                             .await
-                            .map_err(ServerError::Config)?;
-                        Ok(Self::text_response(StatusCode::OK, "ok"))
+                            .map_or_else(
+                                |error| Ok(Self::claimed_response_error(error)),
+                                |_| Ok(Self::text_response(StatusCode::OK, "ok")),
+                            )
                     }
                     StreamFrame::Headers(StreamHeaders::Response(_)) => Ok(Self::text_response(
                         StatusCode::BAD_REQUEST,
@@ -2677,12 +2982,19 @@ impl UploadResponseRouter {
                         "stream not found",
                     ));
                 }
+                let (capability, sequence) = match Self::response_write_authority(&req) {
+                    Ok(authority) => authority,
+                    Err(response) => return Ok(response),
+                };
                 let body = Self::collect_body(body, self.service.config().slot_bytes()).await?;
-                self.service
-                    .append_response_body(stream_id, body)
+                match self
+                    .service
+                    .append_response_body_claimed(stream_id, &capability, sequence, body)
                     .await
-                    .map_err(ServerError::Config)?;
-                Ok(Self::text_response(StatusCode::OK, "ok"))
+                {
+                    Ok(()) => Ok(Self::text_response(StatusCode::OK, "ok")),
+                    Err(error) => Ok(Self::claimed_response_error(error)),
+                }
             }
             ("PUT", ["_upload_response", "streams", stream_id, "response", "end"]) => {
                 let stream_id = Self::parse_u64_component(stream_id, "stream_id")?;
@@ -2692,11 +3004,18 @@ impl UploadResponseRouter {
                         "stream not found",
                     ));
                 }
-                self.service
-                    .end_response(stream_id)
+                let (capability, sequence) = match Self::response_write_authority(&req) {
+                    Ok(authority) => authority,
+                    Err(response) => return Ok(response),
+                };
+                match self
+                    .service
+                    .end_response_claimed(stream_id, &capability, sequence)
                     .await
-                    .map_err(ServerError::Config)?;
-                Ok(Self::text_response(StatusCode::OK, "ok"))
+                {
+                    Ok(()) => Ok(Self::text_response(StatusCode::OK, "ok")),
+                    Err(error) => Ok(Self::claimed_response_error(error)),
+                }
             }
             _ => Ok(Self::text_response(StatusCode::NOT_FOUND, "not found")),
         }
@@ -2829,7 +3148,7 @@ impl UploadResponseRouter {
 impl Router for UploadResponseRouter {
     async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
         if Self::is_internal_path(req.uri().path()) {
-            return self.route_internal(req, None).await;
+            return Ok(Self::text_response(StatusCode::NOT_FOUND, "not found"));
         }
         self.stream_request(req, None).await
     }
@@ -2840,13 +3159,13 @@ impl Router for UploadResponseRouter {
         body: BodyStream,
     ) -> HandlerResult<HandlerResponse> {
         if Self::is_internal_path(req.uri().path()) {
-            return self.route_internal(req, Some(body)).await;
+            return Ok(Self::text_response(StatusCode::NOT_FOUND, "not found"));
         }
         self.stream_request(req, Some(body)).await
     }
 
-    fn has_body_handler(&self, _path: &str) -> bool {
-        true
+    fn has_body_handler(&self, path: &str) -> bool {
+        !Self::is_internal_path(path)
     }
 
     fn is_streaming(&self, _path: &str) -> bool {
@@ -2873,6 +3192,94 @@ impl Router for UploadResponseRouter {
         } else {
             None
         }
+    }
+}
+
+/// Private router for mutually authenticated worker coordination.
+pub struct UploadResponseControlRouter {
+    inner: UploadResponseRouter,
+}
+
+impl UploadResponseControlRouter {
+    pub fn new(service: Arc<UploadResponseService>) -> Self {
+        Self {
+            inner: UploadResponseRouter::new(service),
+        }
+    }
+
+    pub fn service(&self) -> Arc<UploadResponseService> {
+        self.inner.service()
+    }
+
+    fn authorize(req: &Request<()>) -> Option<HandlerResponse> {
+        req.extensions()
+            .get::<VerifiedClientCertificate>()
+            .is_none()
+            .then(|| {
+                UploadResponseRouter::text_response(
+                    StatusCode::UNAUTHORIZED,
+                    "verified client certificate required",
+                )
+            })
+    }
+}
+
+#[async_trait]
+impl Router for UploadResponseControlRouter {
+    async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
+        if !UploadResponseRouter::is_internal_path(req.uri().path()) {
+            return Ok(UploadResponseRouter::text_response(
+                StatusCode::NOT_FOUND,
+                "not found",
+            ));
+        }
+        if let Some(response) = Self::authorize(&req) {
+            return Ok(response);
+        }
+        self.inner.route_internal(req, None).await
+    }
+
+    async fn route_body(
+        &self,
+        req: Request<()>,
+        body: BodyStream,
+    ) -> HandlerResult<HandlerResponse> {
+        if !UploadResponseRouter::is_internal_path(req.uri().path()) {
+            return Ok(UploadResponseRouter::text_response(
+                StatusCode::NOT_FOUND,
+                "not found",
+            ));
+        }
+        if let Some(response) = Self::authorize(&req) {
+            return Ok(response);
+        }
+        self.inner.route_internal(req, Some(body)).await
+    }
+
+    fn has_body_handler(&self, path: &str) -> bool {
+        UploadResponseRouter::is_internal_path(path)
+    }
+
+    fn is_streaming(&self, _path: &str) -> bool {
+        false
+    }
+
+    async fn route_stream(
+        &self,
+        _req: Request<()>,
+        _stream_writer: Box<dyn StreamWriter>,
+    ) -> HandlerResult<()> {
+        Err(ServerError::Config(
+            "streaming responses not supported".to_string(),
+        ))
+    }
+
+    fn webtransport_handler(&self) -> Option<&dyn WebTransportHandler> {
+        None
+    }
+
+    fn websocket_handler(&self, _path: &str) -> Option<&dyn WebSocketHandler> {
+        None
     }
 }
 
@@ -4105,6 +4512,173 @@ mod tests {
         assert!(service.response_owner(stream_id).await.is_none());
 
         upload_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn response_capability_fences_writers_retries_and_slot_reuse() {
+        let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 16,
+            ..Default::default()
+        }));
+        let first_stream = service.open_stream().await.unwrap();
+        let first_id = first_stream.stream_id();
+        let capability = service
+            .try_claim_response_with_capability(first_id, "writer-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let headers = || {
+            StreamHeaders::Response(StreamResponseHeaders {
+                stream_id: first_id,
+                version: http_pack::HttpVersion::Http11,
+                status: 200,
+                headers: vec![],
+            })
+        };
+
+        let wrong_capability = service
+            .write_response_headers_claimed(first_id, "wrong", 1, headers())
+            .await
+            .unwrap_err();
+        assert!(wrong_capability.contains("invalid response capability"));
+
+        service
+            .write_response_headers_claimed(first_id, &capability, 1, headers())
+            .await
+            .unwrap();
+        service
+            .write_response_headers_claimed(first_id, &capability, 1, headers())
+            .await
+            .unwrap();
+        let conflicting_retry = service
+            .append_response_body_claimed(
+                first_id,
+                &capability,
+                1,
+                Bytes::from_static(b"different"),
+            )
+            .await
+            .unwrap_err();
+        assert!(conflicting_retry.contains("conflicting response retry"));
+        let skipped_sequence = service
+            .append_response_body_claimed(first_id, &capability, 3, Bytes::from_static(b"body"))
+            .await
+            .unwrap_err();
+        assert!(skipped_sequence.contains("expected 2"));
+
+        service
+            .append_response_body_claimed(first_id, &capability, 2, Bytes::from_static(b"body"))
+            .await
+            .unwrap();
+        service
+            .append_response_body_claimed(first_id, &capability, 2, Bytes::from_static(b"body"))
+            .await
+            .unwrap();
+        assert_eq!(service.response_last(first_id), Some(2));
+        service
+            .end_response_claimed(first_id, &capability, 3)
+            .await
+            .unwrap();
+
+        first_stream.close().await;
+        let second_stream = service.open_stream().await.unwrap();
+        let second_id = second_stream.stream_id();
+        assert_ne!(first_id, second_id);
+        let stale = service
+            .write_response_headers_claimed(second_id, &capability, 1, headers())
+            .await
+            .unwrap_err();
+        assert!(stale.contains("capability required"));
+        second_stream.close().await;
+    }
+
+    #[tokio::test]
+    async fn response_backpressure_does_not_block_unrelated_claims() {
+        let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 2,
+            slots_per_stream: 1,
+            response_timeout_ms: 1_000,
+            ..Default::default()
+        }));
+        let first_stream = service.open_stream().await.unwrap();
+        let second_stream = service.open_stream().await.unwrap();
+        let first_id = first_stream.stream_id();
+        let second_id = second_stream.stream_id();
+        let first_capability = service
+            .try_claim_response_with_capability(first_id, "writer-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let second_capability = service
+            .try_claim_response_with_capability(second_id, "writer-2")
+            .await
+            .unwrap()
+            .unwrap();
+        let headers = |stream_id| {
+            StreamHeaders::Response(StreamResponseHeaders {
+                stream_id,
+                version: http_pack::HttpVersion::Http11,
+                status: 200,
+                headers: vec![],
+            })
+        };
+
+        assert!(service.register_response_reader(first_id, "reader-1").await);
+        assert!(
+            service
+                .register_response_reader(second_id, "reader-2")
+                .await
+        );
+        service
+            .write_response_headers_claimed(first_id, &first_capability, 1, headers(first_id))
+            .await
+            .unwrap();
+        service
+            .write_response_headers_claimed(second_id, &second_capability, 1, headers(second_id))
+            .await
+            .unwrap();
+
+        let blocked_service = Arc::clone(&service);
+        let blocked = tokio::spawn(async move {
+            blocked_service
+                .append_response_body_claimed(
+                    first_id,
+                    &first_capability,
+                    2,
+                    Bytes::from_static(b"first"),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!blocked.is_finished());
+
+        assert!(
+            service
+                .mark_response_reader_position(second_id, "reader-2", 1)
+                .await
+        );
+        timeout(
+            Duration::from_millis(250),
+            service.append_response_body_claimed(
+                second_id,
+                &second_capability,
+                2,
+                Bytes::from_static(b"second"),
+            ),
+        )
+        .await
+        .expect("unrelated response write must not wait for the first stream")
+        .unwrap();
+
+        assert!(
+            service
+                .mark_response_reader_position(first_id, "reader-1", 1)
+                .await
+        );
+        blocked.await.unwrap().unwrap();
+        first_stream.close().await;
+        second_stream.close().await;
     }
 
     #[tokio::test]

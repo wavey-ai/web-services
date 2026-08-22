@@ -10,7 +10,7 @@ The previous implementation selected useful concurrency primitives. However, its
 
 This review retained the useful structure and corrected the unsafe lifecycle paths. The result is suitable for continued development and controlled deployment.
 
-Three production gates remain open. Secure the internal worker API, enforce response ownership, and complete a production soak test.
+The two code security gates are implemented. The production soak test remains open until its complete workload passes.
 
 ## Reviewed revisions
 
@@ -55,7 +55,7 @@ The design also has important costs:
 - One logical stream has ordered writes, so one hot stream cannot scale across writers.
 - A stalled reader applies backpressure to its complete lane.
 - Slot reuse requires strict identity checks at every asynchronous boundary.
-- Worker coordination currently assumes a trusted internal network.
+- Worker coordination requires a private mutual TLS listener and a network policy.
 - Protocol adapters do not all have identical session and shutdown semantics.
 
 ## Assessment of the previous implementation
@@ -173,7 +173,11 @@ The pure RIST receiver still polls an idle nonblocking socket each millisecond. 
 
 ### P0: Isolate and authenticate the internal worker API
 
-The `/_upload_response` routes currently share the public router. The routes do not authenticate a worker.
+Status: implemented. Deployment must still provide the private bind address, certificates, and network policy.
+
+`UploadResponseControlRouter` owns the internal prefix. The public router returns `404 Not Found` for every internal path.
+
+The control listener requires HTTP/2 and a verified client certificate. Tests reject absent and unknown certificates and accept a valid worker certificate.
 
 Do not expose these routes on a public listener. A network policy is necessary, but it is not sufficient authentication.
 
@@ -194,7 +198,11 @@ A bearer token can provide a short transition. Do not make an unauthenticated mo
 
 ### P0: Enforce response ownership on every write
 
-`try_claim_response` records a worker name. The response write routes do not prove that the caller owns that claim.
+Status: implemented.
+
+Claims return a 256-bit bearer capability. The service stores its SHA-256 digest and compares each supplied capability in constant time.
+
+Per-stream claim locks preserve parallel writes across unrelated streams. Exact retries succeed once without duplicating response data.
 
 Recommended implementation:
 
@@ -210,6 +218,8 @@ Recommended implementation:
 10. Test stale capabilities after slot reuse and concurrent writes from two workers.
 
 ### P0: Complete a production soak test
+
+Status: running a static H3 saturation soak. The mixed upload, worker, stage, and RIST workload remains required.
 
 Run the test for at least one hour after a ten-minute warmup. Use twice the expected steady connection count.
 

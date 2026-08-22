@@ -16,6 +16,7 @@ pub mod traits;
 
 pub use config::{H3Backend, ServerConfig};
 pub use error::{ServerError, ServerResult};
+pub use h2::VerifiedClientCertificate;
 pub use proxy::{
     Backend, BackendScheme, BackendView, LoadBalancingMode, ProxyConfig, ProxyIngress, ProxyRouter,
     ProxyState, UpstreamProtocol,

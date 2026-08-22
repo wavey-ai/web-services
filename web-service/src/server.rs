@@ -8,7 +8,7 @@ use crate::{
     raw_tcp::RawTcpServer,
     traits::{HandlerResult, RawTcpHandler, Router, Server, ServerBuilder, ServerHandle},
 };
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 
@@ -240,6 +240,21 @@ impl ServerBuilder for H2H3ServerBuilder {
                 "At least one protocol (HTTP/2 or HTTP/3) must be enabled".into(),
             ));
         }
+        if self
+            .config
+            .client_ca_pem_base64
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err(ServerError::Config("Client CA must not be empty".into()));
+        }
+        if self.config.client_ca_pem_base64.is_some()
+            && (!self.config.enable_h2 || self.config.enable_h3)
+        {
+            return Err(ServerError::Config(
+                "Client certificate authentication requires an HTTP/2-only server".into(),
+            ));
+        }
         #[cfg(feature = "h3-tokio-quiche")]
         if self.config.enable_h3
             && self.config.h3_backend == H3Backend::TokioQuiche
@@ -264,6 +279,19 @@ impl ServerBuilder for H2H3ServerBuilder {
 }
 
 impl H2H3ServerBuilder {
+    pub fn with_bind_address(mut self, bind_addr: IpAddr) -> Self {
+        self.config.bind_addr = bind_addr;
+        self
+    }
+
+    /// Require a client certificate signed by this CA.
+    ///
+    /// This option requires HTTP/2 and rejects HTTP/3.
+    pub fn with_client_ca(mut self, client_ca_pem_base64: String) -> Self {
+        self.config.client_ca_pem_base64 = Some(client_ca_pem_base64);
+        self
+    }
+
     pub fn with_h3_backend(mut self, backend: H3Backend) -> Self {
         self.config.h3_backend = backend;
         self

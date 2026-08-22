@@ -1,5 +1,7 @@
 // h2h3-server/src/config.rs
 
+use std::net::{IpAddr, Ipv4Addr};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum H3Backend {
     #[default]
@@ -12,7 +14,10 @@ pub enum H3Backend {
 pub struct ServerConfig {
     pub cert_pem_base64: String,
     pub privkey_pem_base64: String,
+    pub bind_addr: IpAddr,
     pub port: u16,
+    /// Client CA for an HTTP/2-only mutual TLS listener.
+    pub client_ca_pem_base64: Option<String>,
     pub enable_h2: bool,
     pub enable_h3: bool,
     pub h3_backend: H3Backend,
@@ -32,7 +37,9 @@ impl Default for ServerConfig {
         Self {
             cert_pem_base64: String::new(),
             privkey_pem_base64: String::new(),
+            bind_addr: Ipv4Addr::UNSPECIFIED.into(),
             port: 443,
+            client_ca_pem_base64: None,
             enable_h2: true,
             enable_h3: true,
             h3_backend: H3Backend::default(),
