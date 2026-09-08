@@ -86,13 +86,31 @@ pub trait StreamingHandler: Send + Sync + 'static {
     fn is_streaming(&self, path: &str) -> bool;
 }
 
-/// Trait for writing to a stream
+/// Trait for writing to a stream.
+///
+/// # Completion contract
+///
+/// A response head cannot be un-sent, so once [`send_response`] has been
+/// called the only way to report a failure is to reset the stream. Every
+/// implementation therefore treats `finish` as the sole marker of a complete
+/// response: dropping a writer that sent a head but was never finished resets
+/// the stream (HTTP/2 `RST_STREAM`, HTTP/3 `H3_INTERNAL_ERROR`) instead of
+/// ending the body cleanly.
+///
+/// This makes the failure modes that matter — a handler returning `Err`
+/// mid-body, a panic, and shutdown cancellation — all visible to the peer
+/// rather than arriving as a short body that looks complete. Handlers must
+/// call `finish` on the success path; a handler that returns without
+/// finishing is reporting failure.
+///
+/// [`send_response`]: StreamWriter::send_response
 #[async_trait]
 pub trait StreamWriter: Send + Sync {
     async fn send_response(&mut self, response: Response<()>) -> Result<(), ServerError>;
 
     async fn send_data(&mut self, data: Bytes) -> Result<(), ServerError>;
 
+    /// Complete the response. Not calling this before drop resets the stream.
     async fn finish(&mut self) -> Result<(), ServerError>;
 }
 

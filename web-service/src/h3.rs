@@ -10,6 +10,7 @@ use crate::{
 };
 use bytes::{Buf, Bytes};
 use futures_util::stream::unfold;
+use h3::error::Code;
 use h3::ext::Protocol;
 use h3::server::{Connection, RequestStream};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
@@ -40,6 +41,17 @@ pub struct Http3Server {
 
 pub struct H3StreamWriter {
     stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    finished: bool,
+}
+
+impl Drop for H3StreamWriter {
+    fn drop(&mut self) {
+        // A handler that stops without finishing has produced a short body.
+        // Reset the stream so the peer cannot mistake it for a complete one.
+        if !self.finished {
+            self.stream.stop_stream(Code::H3_INTERNAL_ERROR);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -82,7 +94,9 @@ impl StreamWriter for H3StreamWriter {
         self.stream
             .finish()
             .await
-            .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))
+            .map_err(|e| ServerError::Handler(Box::new(H3Error::Transport(e.to_string()))))?;
+        self.finished = true;
+        Ok(())
     }
 }
 
@@ -426,7 +440,10 @@ async fn dispatch_h3_request(
     if has_body_stream_handler {
         handle_h3_body_stream_request(req, stream, router).await
     } else if is_streaming {
-        let writer = H3StreamWriter { stream };
+        let writer = H3StreamWriter {
+            stream,
+            finished: false,
+        };
         router
             .route_stream(req, Box::new(writer))
             .await
@@ -460,11 +477,17 @@ async fn handle_h3_body_stream_request(
     let writer = H3SharedStreamWriter {
         stream: Arc::clone(&shared_stream),
     };
-    router
+    let handler_result = router
         .route_body_stream(req, body_stream, Box::new(writer))
         .await
-        .map_err(H3Error::Router)?;
+        .map_err(H3Error::Router);
     let mut guard = shared_stream.lock().await;
+    if let Err(error) = handler_result {
+        // Reset rather than finish: the response head may already be on the
+        // wire, so a clean finish would look like a complete short body.
+        guard.stop_stream(Code::H3_INTERNAL_ERROR);
+        return Err(error);
+    }
     guard
         .finish()
         .await

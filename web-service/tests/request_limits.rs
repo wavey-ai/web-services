@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bytes::Bytes;
 use common::load_test_env;
 use futures_util::StreamExt;
 use http::{Request, Response, StatusCode};
@@ -19,6 +20,8 @@ use web_service::{
     H2H3Server, HandlerResponse, HandlerResult, Router, Server, ServerBuilder, ServerError,
     ServerHandle, StreamWriter, WebSocketHandler, WebTransportHandler,
 };
+
+const PARTIAL_BODY: &[u8] = b"partial-body-chunk";
 
 struct TestServer {
     shutdown_tx: tokio::sync::watch::Sender<()>,
@@ -115,14 +118,35 @@ impl Router for LimitRouter {
     }
 
     fn is_streaming(&self, path: &str) -> bool {
-        path == "/stream"
+        matches!(path, "/stream" | "/abort" | "/complete")
     }
 
     async fn route_stream(
         &self,
-        _req: Request<()>,
+        req: Request<()>,
         mut stream_writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()> {
+        match req.uri().path() {
+            // Head, a partial body, then failure without `finish`. The peer
+            // must not be able to read this as a complete response.
+            "/abort" => {
+                stream_writer.send_response(Response::new(())).await?;
+                stream_writer
+                    .send_data(Bytes::from_static(PARTIAL_BODY))
+                    .await?;
+                return Err(ServerError::Config("handler failed mid-body".into()));
+            }
+            // Control: the same shape, completed properly.
+            "/complete" => {
+                stream_writer.send_response(Response::new(())).await?;
+                stream_writer
+                    .send_data(Bytes::from_static(PARTIAL_BODY))
+                    .await?;
+                stream_writer.finish().await?;
+                return Ok(());
+            }
+            _ => {}
+        }
         stream_writer.send_response(Response::new(())).await?;
         self.state.stream_started.notify_one();
         let _guard = StreamDropGuard(Arc::clone(&self.state.stream_dropped));
@@ -190,6 +214,15 @@ fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .http1_only()
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap()
+}
+
+fn http2_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
         .connect_timeout(Duration::from_secs(1))
         .timeout(Duration::from_secs(2))
         .build()
@@ -324,6 +357,88 @@ async fn streaming_client_disconnect_releases_request_capacity() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    stop_server(handle).await;
+}
+
+/// A handler that fails after sending the response head must not leave the
+/// peer holding a short body that looks complete. The head is already on the
+/// wire and its status cannot be revised, so the transfer has to be aborted.
+///
+/// The error may surface either while awaiting the head or while reading the
+/// body — the server writes the head, the partial chunk and the abort back to
+/// back, so a client can observe the abort before it yields the response. What
+/// matters is that no client path ends with a complete body.
+async fn read_aborted_stream(
+    client: reqwest::Client,
+    url: String,
+) -> Result<Bytes, reqwest::Error> {
+    client.get(url).send().await?.bytes().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_handler_error_after_head_aborts_the_body_over_http1() {
+    let state = LimitState::new();
+    let (handle, port, _, _) = start_server(state, 4, 4).await;
+
+    // HTTP/1.1 has no stream reset, so an aborted body tears down the
+    // connection. Either way the client sees a transport error, not a body.
+    let result =
+        read_aborted_stream(http_client(), format!("https://127.0.0.1:{port}/abort")).await;
+    assert!(
+        result.is_err(),
+        "aborted stream delivered a complete body: {:?}",
+        result.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    );
+
+    stop_server(handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_handler_error_after_head_resets_the_stream_over_http2() {
+    let state = LimitState::new();
+    let (handle, port, _, _) = start_server(state, 4, 4).await;
+
+    let result =
+        read_aborted_stream(http2_client(), format!("https://127.0.0.1:{port}/abort")).await;
+    let error = match result {
+        Ok(body) => panic!(
+            "aborted stream delivered a complete body: {:?}",
+            String::from_utf8_lossy(&body)
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    // Pin the mechanism, not just the failure: the peer must see RST_STREAM
+    // with INTERNAL_ERROR rather than a dropped connection or a short body.
+    assert!(
+        error.contains("Reset") && error.contains("INTERNAL_ERROR"),
+        "expected an HTTP/2 stream reset, got: {error}"
+    );
+
+    stop_server(handle).await;
+}
+
+/// Control for the two tests above: the same handler shape, finished properly,
+/// still delivers its body intact. Without this a reset-everything regression
+/// would keep those tests green.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_handler_that_finishes_delivers_a_complete_body() {
+    let state = LimitState::new();
+    let (handle, port, _, _) = start_server(state, 4, 4).await;
+
+    for (label, client) in [("http/1.1", http_client()), ("h2", http2_client())] {
+        let response = client
+            .get(format!("https://127.0.0.1:{port}/complete"))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{label} request failed: {error}"));
+        assert_eq!(response.status(), StatusCode::OK, "{label}");
+        let body = response
+            .bytes()
+            .await
+            .unwrap_or_else(|error| panic!("{label} body failed: {error}"));
+        assert_eq!(body.as_ref(), PARTIAL_BODY, "{label}");
+    }
+
     stop_server(handle).await;
 }
 

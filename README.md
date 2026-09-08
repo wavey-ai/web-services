@@ -360,6 +360,30 @@ async fn write_response(
 }
 ```
 
+### Response Streaming
+
+Public HTTP traffic streams end to end. A worker's response body slots reach the
+client as it writes them, so time-to-first-byte is the worker's first slot
+rather than its last, and response size is not capped. Writes apply backpressure
+against the slowest registered response reader, so a slow client throttles a
+fast worker instead of losing slots to ring reuse.
+
+Message-oriented consumers still receive a complete `CachedResponse`: the
+WebSocket handler, the WebRTC data channel, and the TCP/RIST ingests. Those are
+capped at `slot_bytes * slots_per_stream`.
+
+Streaming responses are bounded by idle time (`response_idle_timeout_ms`)
+rather than total duration, so a response may take as long to generate as it
+needs provided it keeps producing; only a stalled worker is cut off.
+
+Handlers must call `StreamWriter::finish`; returning without it resets the
+stream, so a failure mid-body can never reach a client as a short but
+well-formed response.
+
+See [`docs/response-streaming.md`](./docs/response-streaming.md) for the
+hop-by-hop breakdown, which router hook to use and why, the backpressure
+semantics, and the remaining work.
+
 ### Performance
 
 Benchmarks below were captured on Apple M1 in release mode.

@@ -993,3 +993,304 @@ async fn test_internal_cache_api_writes_response() {
 
     upload_stream.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// Streaming response egress (router -> peer, slot by slot)
+// ---------------------------------------------------------------------------
+
+/// A `StreamWriter` that records what reached the peer and signals each chunk.
+#[derive(Clone)]
+struct RecordingWriter {
+    status: Arc<std::sync::Mutex<Option<u16>>>,
+    chunks: Arc<std::sync::Mutex<Vec<Bytes>>>,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+    chunk_seen: Arc<tokio::sync::Notify>,
+}
+
+impl RecordingWriter {
+    fn new() -> Self {
+        Self {
+            status: Arc::new(std::sync::Mutex::new(None)),
+            chunks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            chunk_seen: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn body(&self) -> Vec<u8> {
+        self.chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|chunk| chunk.to_vec())
+            .collect()
+    }
+
+    fn chunk_count(&self) -> usize {
+        self.chunks.lock().unwrap().len()
+    }
+}
+
+#[async_trait::async_trait]
+impl web_service::StreamWriter for RecordingWriter {
+    async fn send_response(
+        &mut self,
+        response: http::Response<()>,
+    ) -> Result<(), web_service::ServerError> {
+        *self.status.lock().unwrap() = Some(response.status().as_u16());
+        Ok(())
+    }
+
+    async fn send_data(&mut self, data: Bytes) -> Result<(), web_service::ServerError> {
+        self.chunks.lock().unwrap().push(data);
+        self.chunk_seen.notify_waiters();
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<(), web_service::ServerError> {
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.chunk_seen.notify_waiters();
+        Ok(())
+    }
+}
+
+/// Emit `chunks` one at a time, each only after the previous one has actually
+/// reached the writer. If the egress buffered the response instead of
+/// streaming it, the first wait would never resolve and the test would hang.
+async fn run_gated_worker(
+    service: Arc<UploadResponseService>,
+    writer: RecordingWriter,
+    chunks: &[&'static [u8]],
+) {
+    let stream_id = await_completed_request(&service).await;
+
+    service
+        .write_response_headers(
+            stream_id,
+            StreamHeaders::Response(StreamResponseHeaders {
+                stream_id,
+                version: http_pack::HttpVersion::Http11,
+                status: 200,
+                headers: vec![],
+            }),
+        )
+        .await
+        .unwrap();
+
+    for (index, chunk) in chunks.iter().enumerate() {
+        service
+            .append_response_body(stream_id, Bytes::from_static(chunk))
+            .await
+            .unwrap();
+        // Block until the peer has seen this chunk before producing the next.
+        while writer.chunk_count() <= index {
+            writer.chunk_seen.notified().await;
+        }
+    }
+
+    service.end_response(stream_id).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn router_streams_response_slots_as_the_worker_produces_them() {
+    let config = UploadResponseConfig {
+        num_streams: 4,
+        slot_size_kb: 64,
+        slots_per_stream: 64,
+        response_timeout_ms: 5000,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+    let router = UploadResponseRouter::new(service.clone());
+
+    // Deliberately no ResponseWatcher: the streaming path must not depend on
+    // it, and its absence proves the body is not being assembled centrally.
+    let writer = RecordingWriter::new();
+    let observed = writer.clone();
+
+    let worker_service = service.clone();
+    let worker_writer = writer.clone();
+    let worker = tokio::spawn(async move {
+        run_gated_worker(worker_service, worker_writer, &[b"one ", b"two ", b"three"]).await;
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/llm")
+        .body(())
+        .unwrap();
+    let body: web_service::BodyStream =
+        Box::pin(stream::iter(vec![Ok(Bytes::from_static(b"prompt"))]));
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        router.route_body_stream(req, body, Box::new(writer)),
+    )
+    .await
+    .expect("streaming response did not complete: egress is buffering")
+    .expect("streaming response failed");
+
+    worker.await.unwrap();
+
+    assert_eq!(*observed.status.lock().unwrap(), Some(200));
+    assert_eq!(observed.body(), b"one two three".to_vec());
+    assert_eq!(observed.chunk_count(), 3, "chunks were coalesced");
+    assert!(
+        observed.finished.load(std::sync::atomic::Ordering::Acquire),
+        "response stream was never finished"
+    );
+}
+
+/// Wait for an active stream whose request has been fully written, and return
+/// its id. Workers only answer a completed prompt.
+async fn await_completed_request(service: &Arc<UploadResponseService>) -> u64 {
+    let stream_id = loop {
+        if let Some(slot) = service.active_stream_slots().first() {
+            if service.request_last(slot.stream_id).unwrap_or(0) > 0 {
+                break slot.stream_id;
+            }
+        }
+        tokio::task::yield_now().await;
+    };
+
+    let mut slot_id = 0usize;
+    loop {
+        let last = service.request_last(stream_id).unwrap_or(0);
+        if slot_id >= last {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        slot_id += 1;
+        if let Some(TailSlot::End) = service.tail_request(stream_id, slot_id).await {
+            break;
+        }
+    }
+    stream_id
+}
+
+async fn write_response_head(service: &Arc<UploadResponseService>, stream_id: u64) {
+    service
+        .write_response_headers(
+            stream_id,
+            StreamHeaders::Response(StreamResponseHeaders {
+                stream_id,
+                version: http_pack::HttpVersion::Http11,
+                status: 200,
+                headers: vec![],
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+fn streaming_request() -> (Request<()>, web_service::BodyStream) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/llm")
+        .body(())
+        .unwrap();
+    let body: web_service::BodyStream =
+        Box::pin(stream::iter(vec![Ok(Bytes::from_static(b"prompt"))]));
+    (req, body)
+}
+
+/// A response may take far longer than `response_timeout_ms` to generate, as
+/// long as it keeps producing. Only idleness ends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_but_productive_worker_outlives_the_legacy_response_deadline() {
+    let config = UploadResponseConfig {
+        num_streams: 4,
+        slot_size_kb: 64,
+        slots_per_stream: 64,
+        response_timeout_ms: 300,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+    let router = UploadResponseRouter::new(service.clone());
+
+    let writer = RecordingWriter::new();
+    let observed = writer.clone();
+
+    let worker_service = service.clone();
+    let worker = tokio::spawn(async move {
+        let stream_id = await_completed_request(&worker_service).await;
+        write_response_head(&worker_service, stream_id).await;
+        // Five 120ms gaps: 600ms total, well past the 300ms deadline, but no
+        // single gap reaches it.
+        for index in 0..5u8 {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            worker_service
+                .append_response_body(stream_id, Bytes::from(vec![b'a' + index]))
+                .await
+                .unwrap();
+        }
+        worker_service.end_response(stream_id).await.unwrap();
+    });
+
+    let (req, body) = streaming_request();
+    let started = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        router.route_body_stream(req, body, Box::new(writer)),
+    )
+    .await
+    .expect("streaming response hung")
+    .expect("a slow but productive worker must not time out");
+
+    worker.await.unwrap();
+
+    assert!(
+        started.elapsed() > Duration::from_millis(300),
+        "test did not actually outlive the legacy deadline"
+    );
+    assert_eq!(observed.body(), b"abcde".to_vec());
+    assert!(observed.finished.load(std::sync::atomic::Ordering::Acquire));
+}
+
+/// A worker that stops producing is still cut off, mid-response.
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_worker_fails_the_streaming_response() {
+    let config = UploadResponseConfig {
+        num_streams: 4,
+        slot_size_kb: 64,
+        slots_per_stream: 64,
+        response_timeout_ms: 250,
+    };
+    let service = Arc::new(UploadResponseService::new(config));
+    let router = UploadResponseRouter::new(service.clone());
+
+    let writer = RecordingWriter::new();
+    let observed = writer.clone();
+
+    let worker_service = service.clone();
+    let _worker = tokio::spawn(async move {
+        let stream_id = await_completed_request(&worker_service).await;
+        write_response_head(&worker_service, stream_id).await;
+        worker_service
+            .append_response_body(stream_id, Bytes::from_static(b"partial"))
+            .await
+            .unwrap();
+        // Never ends the response.
+        std::future::pending::<()>().await;
+    });
+
+    let (req, body) = streaming_request();
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        router.route_body_stream(req, body, Box::new(writer)),
+    )
+    .await
+    .expect("stalled response was never cut off")
+    .expect_err("a stalled worker must fail the response");
+
+    assert!(
+        error.to_string().contains("produced no slot"),
+        "unexpected error: {error}"
+    );
+    // The head and the partial chunk did reach the peer; the stream is then
+    // reset rather than finished, so the peer cannot read it as complete.
+    assert_eq!(observed.body(), b"partial".to_vec());
+    assert!(
+        !observed.finished.load(std::sync::atomic::Ordering::Acquire),
+        "a stalled response must not be finished"
+    );
+}

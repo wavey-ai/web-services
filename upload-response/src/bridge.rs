@@ -185,116 +185,9 @@ impl CachedIngress {
     pub async fn proxy_streaming_response(
         &self,
         stream_id: u64,
-        mut stream_writer: Box<dyn StreamWriter>,
+        stream_writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()> {
-        if !self
-            .service
-            .register_response_reader(stream_id, STREAMING_RESPONSE_READER_ID)
-            .await
-        {
-            return Err(ServerError::Config(
-                "response stream is not available".into(),
-            ));
-        }
-        let Some(updates) = self.service.response_update_notifier(stream_id) else {
-            let _ = self
-                .service
-                .unregister_response_reader(stream_id, STREAMING_RESPONSE_READER_ID)
-                .await;
-            return Err(ServerError::Config(
-                "response stream is not available".into(),
-            ));
-        };
-        let timeout_duration = Duration::from_millis(self.timeouts.response_deadline_ms);
-        let result = match timeout(timeout_duration, async {
-            let mut last_slot = 0usize;
-            let mut headers_sent = false;
-
-            loop {
-                let notified = updates.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-
-                if !headers_sent {
-                    if let Some(headers) = self.service.get_response_headers(stream_id).await {
-                        stream_writer
-                            .send_response(build_streaming_response_head(&headers)?)
-                            .await?;
-                        headers_sent = true;
-                        last_slot = 1;
-                        let _ = self
-                            .service
-                            .mark_response_reader_position(
-                                stream_id,
-                                STREAMING_RESPONSE_READER_ID,
-                                1,
-                            )
-                            .await;
-                    } else {
-                        if self.service.response_last(stream_id).is_none() {
-                            return Err(ServerError::Config("response stream closed".into()));
-                        }
-                        notified.await;
-                        continue;
-                    }
-                }
-
-                let Some(current_last) = self.service.response_last(stream_id) else {
-                    return Err(ServerError::Config("response stream closed".into()));
-                };
-                if current_last <= last_slot {
-                    notified.await;
-                    continue;
-                }
-
-                let mut processed_last = last_slot;
-                for slot_id in (last_slot + 1)..=current_last {
-                    match self.service.tail_response(stream_id, slot_id).await {
-                        Some(TailSlot::Body(bytes)) => {
-                            stream_writer.send_data(bytes).await?;
-                        }
-                        Some(TailSlot::End) => {
-                            stream_writer.finish().await?;
-                            let _ = self
-                                .service
-                                .mark_response_reader_position(
-                                    stream_id,
-                                    STREAMING_RESPONSE_READER_ID,
-                                    slot_id,
-                                )
-                                .await;
-                            return Ok(());
-                        }
-                        _ => break,
-                    }
-                    let _ = self
-                        .service
-                        .mark_response_reader_position(
-                            stream_id,
-                            STREAMING_RESPONSE_READER_ID,
-                            slot_id,
-                        )
-                        .await;
-                    processed_last = slot_id;
-                }
-
-                last_slot = processed_last;
-                if last_slot < current_last {
-                    continue;
-                }
-                notified.await;
-            }
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(ServerError::Config("response timeout".into())),
-        };
-        let _ = self
-            .service
-            .unregister_response_reader(stream_id, STREAMING_RESPONSE_READER_ID)
-            .await;
-        result
+        proxy_streaming_response_with(&self.service, &self.timeouts, stream_id, stream_writer).await
     }
 
     pub async fn write_handler_response(&self, stream_id: u64, response: HandlerResponse) {
@@ -443,4 +336,126 @@ fn build_request_from_parts(
     builder
         .body(())
         .map_err(|error| anyhow!("failed to build request: {error}"))
+}
+
+/// Proxy one response lane straight to the peer, slot by slot.
+///
+/// Registers a response reader for the duration, which is what makes the
+/// worker's `append_response_body` backpressure against this consumer instead
+/// of recycling ring slots underneath it. The caller must not have registered
+/// the stream with [`UploadResponseService::register_response`]; that hands the
+/// lane to `ResponseWatcher`, which would buffer it instead.
+fn response_idle_error(stream_id: u64, idle: Duration) -> ServerError {
+    ServerError::Config(format!(
+        "response stream {stream_id} produced no slot for {}ms",
+        idle.as_millis()
+    ))
+}
+
+pub async fn proxy_streaming_response_with(
+    service: &Arc<UploadResponseService>,
+    timeouts: &UploadResponseTimeouts,
+    stream_id: u64,
+    mut stream_writer: Box<dyn StreamWriter>,
+) -> HandlerResult<()> {
+    if !service
+        .register_response_reader(stream_id, STREAMING_RESPONSE_READER_ID)
+        .await
+    {
+        return Err(ServerError::Config(
+            "response stream is not available".into(),
+        ));
+    }
+    let Some(updates) = service.response_update_notifier(stream_id) else {
+        let _ = service
+            .unregister_response_reader(stream_id, STREAMING_RESPONSE_READER_ID)
+            .await;
+        return Err(ServerError::Config(
+            "response stream is not available".into(),
+        ));
+    };
+    // Bounded by idle time, not total duration: a worker that keeps producing
+    // may run as long as it likes, while one that stalls is cut off. A total
+    // deadline would cap how long a response is allowed to take to generate,
+    // which is wrong for incrementally produced output.
+    let idle = Duration::from_millis(timeouts.response_idle_timeout_ms);
+    let result = async {
+        let mut last_slot = 0usize;
+        let mut headers_sent = false;
+
+        loop {
+            let notified = updates.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if !headers_sent {
+                if let Some(headers) = service.get_response_headers(stream_id).await {
+                    stream_writer
+                        .send_response(build_streaming_response_head(&headers)?)
+                        .await?;
+                    headers_sent = true;
+                    last_slot = 1;
+                    let _ = service
+                        .mark_response_reader_position(stream_id, STREAMING_RESPONSE_READER_ID, 1)
+                        .await;
+                } else {
+                    if service.response_last(stream_id).is_none() {
+                        return Err(ServerError::Config("response stream closed".into()));
+                    }
+                    if timeout(idle, notified).await.is_err() {
+                        return Err(response_idle_error(stream_id, idle));
+                    }
+                    continue;
+                }
+            }
+
+            let Some(current_last) = service.response_last(stream_id) else {
+                return Err(ServerError::Config("response stream closed".into()));
+            };
+            if current_last <= last_slot {
+                if timeout(idle, notified).await.is_err() {
+                    return Err(response_idle_error(stream_id, idle));
+                }
+                continue;
+            }
+
+            let mut processed_last = last_slot;
+            for slot_id in (last_slot + 1)..=current_last {
+                match service.tail_response(stream_id, slot_id).await {
+                    Some(TailSlot::Body(bytes)) => {
+                        stream_writer.send_data(bytes).await?;
+                    }
+                    Some(TailSlot::End) => {
+                        stream_writer.finish().await?;
+                        let _ = service
+                            .mark_response_reader_position(
+                                stream_id,
+                                STREAMING_RESPONSE_READER_ID,
+                                slot_id,
+                            )
+                            .await;
+                        return Ok(());
+                    }
+                    _ => break,
+                }
+                let _ = service
+                    .mark_response_reader_position(stream_id, STREAMING_RESPONSE_READER_ID, slot_id)
+                    .await;
+                processed_last = slot_id;
+            }
+
+            last_slot = processed_last;
+            if last_slot < current_last {
+                continue;
+            }
+            if timeout(idle, notified).await.is_err() {
+                return Err(response_idle_error(stream_id, idle));
+            }
+        }
+    }
+    .await;
+    let _ = service
+        .unregister_response_reader(stream_id, STREAMING_RESPONSE_READER_ID)
+        .await;
+    result
 }

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use http::{Request, StatusCode};
+use http::{Request, Response, StatusCode};
 use http_pack::stream::{
     decode_frame, encode_frame, StreamFrame, StreamHeaders, StreamRequestHeaders,
     StreamResponseHeaders,
@@ -37,8 +37,8 @@ pub use watcher::{ResponseWatcher, ResponseWatcherHandle};
 mod bridge;
 pub use bridge::{
     build_streaming_response_head, clone_request_head, handler_response_from_cached,
-    request_from_headers_slot, request_from_stream_headers, response_content_type, CachedIngress,
-    CachedRequestGuard, IngressProxyConfig,
+    proxy_streaming_response_with, request_from_headers_slot, request_from_stream_headers,
+    response_content_type, CachedIngress, CachedRequestGuard, IngressProxyConfig,
 };
 
 mod remote;
@@ -213,7 +213,15 @@ pub struct UploadResponseConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UploadResponseTimeouts {
     /// Maximum wait after a request finishes before its response must complete.
+    /// Applies to buffered delivery, where the whole body arrives at once.
     pub response_deadline_ms: u64,
+    /// Maximum wait for the *next* slot of a streaming response.
+    ///
+    /// Streaming responses are bounded by idle time rather than total
+    /// duration: a worker that keeps producing may run indefinitely, while one
+    /// that stalls fails after this long. A total deadline would cap how long a
+    /// response may take to generate, which is wrong for incremental output.
+    pub response_idle_timeout_ms: u64,
     /// Maximum wait before a writer may overwrite a cache ring slot.
     pub reader_backpressure_timeout_ms: u64,
     /// Maximum wait for a protocol adapter to acquire a stream slot.
@@ -227,6 +235,7 @@ impl UploadResponseTimeouts {
     pub const fn from_legacy_response_timeout(response_timeout_ms: u64) -> Self {
         Self {
             response_deadline_ms: response_timeout_ms,
+            response_idle_timeout_ms: response_timeout_ms,
             reader_backpressure_timeout_ms: response_timeout_ms,
             stream_admission_timeout_ms: response_timeout_ms,
             remote_io_timeout_ms: 60_000,
@@ -3479,6 +3488,113 @@ impl UploadResponseRouter {
         }
     }
 
+    /// Copy a request body into the cache one slot at a time.
+    async fn copy_request_body(
+        &self,
+        stream_id: u64,
+        body: Option<&mut BodyStream>,
+    ) -> HandlerResult<()> {
+        let Some(body_stream) = body else {
+            return Ok(());
+        };
+        let slot_bytes = self.service.config.slot_bytes();
+
+        while let Some(chunk) = body_stream.next().await {
+            let chunk = chunk?;
+            if chunk.is_empty() {
+                continue;
+            }
+
+            if chunk.len() <= slot_bytes {
+                self.service
+                    .append_request_body(stream_id, chunk)
+                    .await
+                    .map_err(ServerError::Config)?;
+            } else {
+                let mut remaining = chunk;
+                while !remaining.is_empty() {
+                    let take = remaining.len().min(slot_bytes);
+                    let data = remaining.split_to(take);
+                    self.service
+                        .append_request_body(stream_id, data)
+                        .await
+                        .map_err(ServerError::Config)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Send a bodiless status through a stream writer and complete it.
+    async fn write_stream_status(
+        mut stream_writer: Box<dyn StreamWriter>,
+        status: StatusCode,
+        headers: &[(&str, &str)],
+    ) -> HandlerResult<()> {
+        let mut builder = Response::builder().status(status);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let response = builder.body(()).map_err(ServerError::Http)?;
+        stream_writer.send_response(response).await?;
+        stream_writer.finish().await
+    }
+
+    /// Stream a request into the cache and stream the response straight back
+    /// out of it, slot by slot, without assembling a whole body first.
+    async fn stream_request_and_response(
+        &self,
+        req: Request<()>,
+        mut body: Option<BodyStream>,
+        stream_writer: Box<dyn StreamWriter>,
+    ) -> HandlerResult<()> {
+        let stream = match self.service.try_open_stream().await {
+            Ok(stream) => stream,
+            Err(error) => {
+                debug!(%error, "upload-response admission capacity is full");
+                return Self::write_stream_status(
+                    stream_writer,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &[("retry-after", "1")],
+                )
+                .await;
+            }
+        };
+        let stream_id = stream.stream_id();
+        // Deliberately no `register_response` here: that assigns the lane to
+        // ResponseWatcher, which would buffer the whole body before delivery.
+        debug!(stream_id, uri = %req.uri(), "Streaming request and response");
+
+        let result = async {
+            let headers = StreamHeaders::from_request(stream_id, &req)
+                .map_err(|e| ServerError::Config(e.to_string()))?;
+            self.service
+                .write_request_headers(stream_id, headers)
+                .await
+                .map_err(ServerError::Config)?;
+
+            self.copy_request_body(stream_id, body.as_mut()).await?;
+
+            self.service
+                .end_request(stream_id)
+                .await
+                .map_err(ServerError::Config)?;
+
+            debug!(stream_id, "Request complete, streaming response");
+            proxy_streaming_response_with(
+                &self.service,
+                self.service.timeouts(),
+                stream_id,
+                stream_writer,
+            )
+            .await
+        }
+        .await;
+
+        stream.close().await;
+        result
+    }
+
     /// Stream a request into the cache and wait for response
     ///
     /// Format:
@@ -3513,35 +3629,7 @@ impl UploadResponseRouter {
                 .await
                 .map_err(ServerError::Config)?;
 
-            if let Some(ref mut body_stream) = body {
-                use futures_util::StreamExt;
-
-                let slot_bytes = self.service.config.slot_bytes();
-
-                while let Some(chunk) = body_stream.next().await {
-                    let chunk = chunk?;
-                    if chunk.is_empty() {
-                        continue;
-                    }
-
-                    if chunk.len() <= slot_bytes {
-                        self.service
-                            .append_request_body(stream_id, chunk)
-                            .await
-                            .map_err(ServerError::Config)?;
-                    } else {
-                        let mut remaining = chunk;
-                        while !remaining.is_empty() {
-                            let take = remaining.len().min(slot_bytes);
-                            let data = remaining.split_to(take);
-                            self.service
-                                .append_request_body(stream_id, data)
-                                .await
-                                .map_err(ServerError::Config)?;
-                        }
-                    }
-                }
-            }
+            self.copy_request_body(stream_id, body.as_mut()).await?;
 
             self.service
                 .end_request(stream_id)
@@ -3580,6 +3668,26 @@ impl Router for UploadResponseRouter {
 
     fn has_body_handler(&self, path: &str) -> bool {
         !Self::is_internal_path(path)
+    }
+
+    /// Public traffic takes the combined path: the request body streams into
+    /// the cache and the response streams back out of it. This is checked
+    /// ahead of `has_body_handler` and `is_streaming` by every backend.
+    fn has_body_stream_handler(&self, path: &str) -> bool {
+        !Self::is_internal_path(path)
+    }
+
+    async fn route_body_stream(
+        &self,
+        req: Request<()>,
+        body: BodyStream,
+        stream_writer: Box<dyn StreamWriter>,
+    ) -> HandlerResult<()> {
+        if Self::is_internal_path(req.uri().path()) {
+            return Self::write_stream_status(stream_writer, StatusCode::NOT_FOUND, &[]).await;
+        }
+        self.stream_request_and_response(req, Some(body), stream_writer)
+            .await
     }
 
     fn is_streaming(&self, _path: &str) -> bool {
@@ -3980,6 +4088,7 @@ mod tests {
             config.legacy_timeouts(),
             UploadResponseTimeouts {
                 response_deadline_ms: 1_234,
+                response_idle_timeout_ms: 1_234,
                 reader_backpressure_timeout_ms: 1_234,
                 stream_admission_timeout_ms: 1_234,
                 remote_io_timeout_ms: 60_000,

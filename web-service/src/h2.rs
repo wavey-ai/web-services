@@ -25,7 +25,10 @@ use sha2::{Digest, Sha256};
 use std::{
     convert::Infallible,
     net::SocketAddr,
-    sync::{Arc, Mutex as StdMutex, Once},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex, Once,
+    },
 };
 use tls_helpers::{certs_from_base64, privkey_from_base64, tls_acceptor_from_base64};
 use tokio::net::{TcpListener, TcpSocket};
@@ -72,17 +75,29 @@ pub struct Http2Server {
     request_limit: Arc<RequestLimiter>,
 }
 
-type H2ResponseBody = BoxBody<Bytes, Infallible>;
+type H2ResponseBody = BoxBody<Bytes, ServerError>;
 type ConnectionPermitSlot = Arc<StdMutex<Option<OwnedSemaphorePermit>>>;
+
+/// Wrap a fully buffered body in the fallible body type shared with streaming responses.
+fn buffered_body(bytes: Bytes) -> H2ResponseBody {
+    Full::new(bytes)
+        .map_err(|never: Infallible| match never {})
+        .boxed()
+}
 
 struct H2StreamWriter {
     response_tx: Option<oneshot::Sender<Result<Response<()>, ServerError>>>,
     data_tx: Option<mpsc::Sender<Bytes>>,
+    completed: Arc<AtomicBool>,
 }
 
 struct H2StreamBodyState {
     data_rx: mpsc::Receiver<Bytes>,
     handler_cancellation: CancellationToken,
+    /// Set only by `StreamWriter::finish`. A closed body channel with this
+    /// unset means the handler stopped early, so the stream must be reset
+    /// rather than ended cleanly.
+    completed: Arc<AtomicBool>,
 }
 
 impl Drop for H2StreamBodyState {
@@ -95,10 +110,12 @@ impl H2StreamWriter {
     fn new(
         response_tx: oneshot::Sender<Result<Response<()>, ServerError>>,
         data_tx: mpsc::Sender<Bytes>,
+        completed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             response_tx: Some(response_tx),
             data_tx: Some(data_tx),
+            completed,
         }
     }
 }
@@ -125,6 +142,7 @@ impl StreamWriter for H2StreamWriter {
     }
 
     async fn finish(&mut self) -> Result<(), ServerError> {
+        self.completed.store(true, Ordering::Release);
         self.data_tx.take();
         Ok(())
     }
@@ -396,7 +414,7 @@ async fn handle_h2_request(
             if !has_handler {
                 return Response::builder()
                     .status(StatusCode::NOT_FOUND)
-                    .body(Full::new(Bytes::new()).boxed())
+                    .body(buffered_body(Bytes::new()))
                     .map_err(|e| H2Error::Router(ServerError::Http(e)));
             }
 
@@ -479,7 +497,7 @@ async fn handle_h2_request(
                     HeaderName::from_static("sec-websocket-accept"),
                     HeaderValue::from_str(&accept_key)?,
                 )
-                .body(Full::new(Bytes::new()).boxed())
+                .body(buffered_body(Bytes::new()))
                 .map_err(|e| H2Error::Router(ServerError::Http(e)))?;
 
             return Ok(response);
@@ -560,9 +578,11 @@ async fn handle_h2_stream(
     let (data_tx, data_rx) = mpsc::channel(32);
     let handler_cancellation = CancellationToken::new();
     let task_cancellation = handler_cancellation.clone();
+    let completed = Arc::new(AtomicBool::new(false));
+    let writer_completed = Arc::clone(&completed);
     drop(detached_tasks.spawn(async move {
         let _request_permit = request_permit;
-        let writer = H2StreamWriter::new(response_tx, data_tx);
+        let writer = H2StreamWriter::new(response_tx, data_tx, writer_completed);
         tokio::select! {
             _ = detached_shutdown.cancelled() => {}
             _ = task_cancellation.cancelled() => {}
@@ -578,6 +598,7 @@ async fn handle_h2_stream(
         H2StreamBodyState {
             data_rx,
             handler_cancellation,
+            completed,
         },
     )
     .await
@@ -595,9 +616,11 @@ async fn handle_h2_body_stream(
     let (data_tx, data_rx) = mpsc::channel(32);
     let handler_cancellation = CancellationToken::new();
     let task_cancellation = handler_cancellation.clone();
+    let completed = Arc::new(AtomicBool::new(false));
+    let writer_completed = Arc::clone(&completed);
     drop(detached_tasks.spawn(async move {
         let _request_permit = request_permit;
-        let writer = H2StreamWriter::new(response_tx, data_tx);
+        let writer = H2StreamWriter::new(response_tx, data_tx, writer_completed);
         tokio::select! {
             _ = detached_shutdown.cancelled() => {}
             _ = task_cancellation.cancelled() => {}
@@ -613,6 +636,7 @@ async fn handle_h2_body_stream(
         H2StreamBodyState {
             data_rx,
             handler_cancellation,
+            completed,
         },
     )
     .await
@@ -637,7 +661,7 @@ async fn await_h2_stream_response(
 fn build_buffered_response(
     handler_response: HandlerResponse,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
-    let mut response = Response::new(Full::from(handler_response.body.unwrap_or_default()).boxed());
+    let mut response = Response::new(buffered_body(handler_response.body.unwrap_or_default()));
     *response.status_mut() = handler_response.status;
 
     if let Some(ct) = handler_response.content_type {
@@ -664,7 +688,7 @@ fn build_buffered_response(
 }
 
 fn overloaded_h2_response() -> Response<H2ResponseBody> {
-    let mut response = Response::new(Full::from(Bytes::from_static(b"service overloaded")).boxed());
+    let mut response = Response::new(buffered_body(Bytes::from_static(b"service overloaded")));
     *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
     response.headers_mut().insert(
         HeaderName::from_static("retry-after"),
@@ -679,12 +703,21 @@ fn build_streaming_response(
     body_state: H2StreamBodyState,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
     let (parts, ()) = response_head.into_parts();
-    let body_stream = unfold(body_state, |mut state| async move {
-        state
-            .data_rx
-            .recv()
-            .await
-            .map(|chunk| (Ok::<Frame<Bytes>, Infallible>(Frame::data(chunk)), state))
+    let body_stream = unfold(Some(body_state), |state| async move {
+        let mut state = state?;
+        match state.data_rx.recv().await {
+            Some(chunk) => Some((Ok(Frame::data(chunk)), Some(state))),
+            // The handler dropped its writer without calling `finish`, so the
+            // body is short. Fail the body to reset the stream instead of
+            // letting the peer read a truncated response as a complete one.
+            None if !state.completed.load(Ordering::Acquire) => Some((
+                Err(ServerError::Config(
+                    "streaming response ended before the handler finished".into(),
+                )),
+                None,
+            )),
+            None => None,
+        }
     });
     let mut response = Response::from_parts(parts, StreamBody::new(body_stream).boxed());
     add_cors_headers(&mut response);
