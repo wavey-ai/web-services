@@ -544,30 +544,24 @@ where
     H3Error::Transport(error.to_string())
 }
 
+/// A handler that stops without calling [`StreamWriter::finish`] has produced a
+/// short body, and the peer must see a reset rather than a clean end.
+///
+/// Nothing here does that explicitly: the writer owns the only
+/// [`OutboundFrameSender`] for the stream, so dropping it closes the channel and
+/// tokio-quiche's driver resets with H3_REQUEST_CANCELLED. An earlier `Drop`
+/// sent `OutboundFrame::PeerStreamError` first; removing it left the code the
+/// peer observes byte-identical, so it was doing nothing. If this sender ever
+/// becomes shared, that implicit reset disappears and the signal has to come
+/// back — `h3_streaming_reset.rs` covers the behaviour either way.
 struct TokioQuicheStreamWriter {
     sender: tokio::sync::Mutex<OutboundFrameSender>,
-    finished: bool,
 }
 
 impl TokioQuicheStreamWriter {
     fn new(sender: OutboundFrameSender) -> Self {
         Self {
             sender: tokio::sync::Mutex::new(sender),
-            finished: false,
-        }
-    }
-}
-
-impl Drop for TokioQuicheStreamWriter {
-    fn drop(&mut self) {
-        // A handler that stops without finishing has produced a short body.
-        // Signal the driver to close the stream with an error so the peer
-        // cannot mistake it for a complete response.
-        if self.finished {
-            return;
-        }
-        if let Some(sender) = self.sender.get_mut().get_ref() {
-            let _ = sender.try_send(OutboundFrame::PeerStreamError);
         }
     }
 }
@@ -600,7 +594,6 @@ impl StreamWriter for TokioQuicheStreamWriter {
             .send(OutboundFrame::Body(Bytes::new(), true))
             .await
             .map_err(|error| transport_server_error(error.to_string()))?;
-        self.finished = true;
         Ok(())
     }
 }
