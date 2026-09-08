@@ -1177,6 +1177,10 @@ impl UploadResponseService {
         names
     }
 
+    /// Every open stream, oldest first.
+    ///
+    /// The order is the contract: a worker claims the first stream it can
+    /// serve, so this is what decides who waits.
     pub async fn active_streams(&self) -> Vec<ActiveStreamInfo> {
         let stage_lanes: Vec<(String, Arc<StageLane>)> = {
             let stages = self.stages.read().await;
@@ -1224,6 +1228,15 @@ impl UploadResponseService {
                 stages,
             });
         }
+
+        // Oldest first. Workers claim the first stream they find that they can
+        // serve, so this ordering is the queue discipline for the whole ring.
+        // Slot index would be the wrong one: slots are handed out from a stack
+        // and reused newest-first, which leaves a request parked in a rarely
+        // reached slot waiting behind every stream that arrived after it.
+        // Stream ids are allocated in order, so sorting by them is arrival
+        // order, and no worker has to know that to get it.
+        active.sort_unstable_by_key(|stream| stream.stream_id);
 
         active
     }
