@@ -53,30 +53,34 @@ responses have no such cap.
 
 ## Backpressure
 
-Response body and end writes go through `append_cache_with_backpressure`, which
-blocks in `wait_for_reader_capacity` until the **slowest registered response
-reader** has consumed past the slot about to be overwritten, bounded by
-`reader_backpressure_timeout_ms`.
+The response ring decouples the worker from the client. `wait_for_reader_capacity`
+returns immediately while `next_slot <= slots_per_stream`
+(`upload-response/src/lib.rs:1006`), so a worker can run a **full ring ahead** —
+1024 slots by default — without ever waiting on the peer. Client speed does not
+enter into it until then.
+
+Only when the worker would overwrite a slot the slowest registered reader has
+not yet consumed does it wait, bounded by `reader_backpressure_timeout_ms`.
+That is a bounded buffer doing its job rather than the worker tracking the
+client: reaching that point means the client is already more than one whole ring
+behind, and continuing would destroy data the reader still needs.
 
 `proxy_streaming_response_with` registers itself as a response reader for the
-duration and calls `mark_response_reader_position` as it goes. That is what
-makes a slow client throttle a fast worker instead of having ring slots
-recycled underneath the reader mid-response.
+duration and calls `mark_response_reader_position` as it goes, which is what
+keeps slots from being recycled underneath it mid-response.
 
-Registration happens after `end_request`, so a worker can briefly reach the
-capacity check before a reader exists. This is safe rather than merely unlikely:
-with no reader registered `wait_for_reader_capacity` blocks instead of
-overwriting, and `register_response_reader` calls `notify_waiters()`, which
-wakes the blocked writer. The wait is also armed before the check, so the
-wakeup cannot be missed.
+Registration happens after `end_request`, so a worker could in principle reach
+the capacity check before a reader exists. This is safe twice over: the check is
+skipped entirely until the ring wraps, and with no reader registered it blocks
+rather than overwriting, while `register_response_reader` calls
+`notify_waiters()` to wake the blocked writer — with the wait armed before the
+check, so the wakeup cannot be missed.
 
-The real trade is that worker liveness is now coupled to client speed. A slow
-client can block a worker's `append_response_body` for up to
-`reader_backpressure_timeout_ms` and then fail it — where previously the watcher
-drained at memory speed and a client could never stall a worker.
-`from_legacy_response_timeout` still maps that field from the same legacy value
-as everything else (30s default), which is unlikely to be right now that it
-gates real client consumption. See planned work.
+**Sizing.** A producer writing one slot per unit of output exhausts the ring
+after `slots_per_stream` writes and paces to the client for the remainder. For
+incremental output such as token generation, either size the ring for the
+expected length or batch several units per slot. The default ring is 1024 slots
+of 32KB.
 
 ## Deadlines
 
@@ -162,7 +166,9 @@ reverted.
 4. Partly done: `response_idle_timeout_ms` is now its own field, so response
    delivery no longer shares a deadline with request admission. Still
    outstanding is `reader_backpressure_timeout_ms`, which continues to inherit
-   the legacy value even though it now gates real client consumption.
+   the legacy value. Lower priority than it first looked: it applies only once
+   the ring is full, by which point the client is a full ring behind, and a
+   generous wait before giving up is defensible.
 
 ## Known gaps
 

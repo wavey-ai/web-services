@@ -282,6 +282,7 @@ let config = UploadResponseConfig {
 let capacity = config.validate()?;
 let timeouts = UploadResponseTimeouts {
     response_deadline_ms: 30_000,
+    response_idle_timeout_ms: 30_000,
     reader_backpressure_timeout_ms: 5_000,
     stream_admission_timeout_ms: 1_000,
     remote_io_timeout_ms: 15_000,
@@ -293,7 +294,7 @@ Validation includes the request lane, response lane, and all 16 possible stage l
 
 `UploadResponseService::new` remains available as a compatibility wrapper. It panics when capacity validation fails.
 
-The compatibility constructors map `response_timeout_ms` to response, backpressure, and admission waits. Remote worker requests retain their previous 60-second default.
+The compatibility constructors map `response_timeout_ms` to the response, streaming-idle, backpressure, and admission waits. Remote worker requests retain their previous 60-second default.
 
 ### Slot Size Selection
 
@@ -364,9 +365,10 @@ async fn write_response(
 
 Public HTTP traffic streams end to end. A worker's response body slots reach the
 client as it writes them, so time-to-first-byte is the worker's first slot
-rather than its last, and response size is not capped. Writes apply backpressure
-against the slowest registered response reader, so a slow client throttles a
-fast worker instead of losing slots to ring reuse.
+rather than its last, and response size is not capped. The response ring
+decouples the two: a worker may run a full ring ahead (1024 slots by default)
+before it waits on the client at all. Past that it paces to the slowest
+registered reader rather than recycling slots the reader still needs.
 
 Message-oriented consumers still receive a complete `CachedResponse`: the
 WebSocket handler, the WebRTC data channel, and the TCP/RIST ingests. Those are
