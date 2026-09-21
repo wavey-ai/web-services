@@ -57,6 +57,7 @@ rustls = { version = "0.23.40", default-features = false, features = ["ring", "s
 rustls-pemfile = "2"
 
 [dev-dependencies]
+tokio = { version = "1.52.3", features = ["test-util"] }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 reqwest = { version = "0.13.4", features = ["rustls", "http2", "stream"] }
 portpicker = "0.1"

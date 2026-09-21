@@ -17,6 +17,7 @@ a low-latency live HLS playlist.
 ## Run
 
 ```bash
+bash scripts/generate-local-tls.sh
 cargo run -p obs-rist-llhls -- \
   --rist-bind 0.0.0.0:7000 \
   --rist-profile main \
@@ -25,7 +26,8 @@ cargo run -p obs-rist-llhls -- \
 
 Open `https://127.0.0.1:9444/`.
 
-The default TLS certificate is loaded from `web-services/tls/local.wavey.ai`.
+The default TLS certificate is loaded from `web-services/tls/local.wavey.ai/generated`.
+Trust `chain.pem` from that directory in your browser before you open the page.
 Use `--cert` and `--key` to provide another certificate pair.
 
 ## OBS

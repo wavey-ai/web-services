@@ -66,21 +66,10 @@ use matchbox_signaling::SignalingServerBuilder;
 use matchbox_socket::{ChannelConfig, PeerState, WebRtcSocket, WebRtcSocketBuilder};
 
 use base64::Engine;
-use std::fs;
 
 const SLOT_SIZE_KB: usize = 64;
 #[cfg(feature = "rist-pure")]
 const PURE_RIST_FLOW_ID: u32 = 0x1122_3344;
-
-// Local cert paths (checked into repo)
-const LOCAL_CERT_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../tls/local.wavey.ai/fullchain.pem"
-);
-const LOCAL_KEY_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../tls/local.wavey.ai/privkey.pem"
-);
 
 fn load_test_env() -> Option<(String, String)> {
     dotenvy::dotenv().ok();
@@ -93,12 +82,15 @@ fn load_test_env() -> Option<(String, String)> {
         return Some((cert, key));
     }
 
-    // Fall back to local certs
-    let cert_pem = fs::read(LOCAL_CERT_PATH).ok()?;
-    let key_pem = fs::read(LOCAL_KEY_PATH).ok()?;
-
-    let cert_b64 = base64::engine::general_purpose::STANDARD.encode(&cert_pem);
-    let key_b64 = base64::engine::general_purpose::STANDARD.encode(&key_pem);
+    let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(vec![
+        "local.wavey.ai".into(),
+        "localhost".into(),
+        "127.0.0.1".into(),
+        "::1".into(),
+    ])
+    .ok()?;
+    let cert_b64 = base64::engine::general_purpose::STANDARD.encode(cert.pem());
+    let key_b64 = base64::engine::general_purpose::STANDARD.encode(key_pair.serialize_pem());
 
     Some((cert_b64, key_b64))
 }

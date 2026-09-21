@@ -24,7 +24,7 @@ frame is mesh JSON, media access-unit bytes, or another application payload.
 | [`upload-response/tests`](./upload-response/tests/) | Worker integration tests and protocol throughput benchmarks. |
 | [`web-service/tests`](./web-service/tests/) | Server and proxy benchmarks. |
 | [`examples/obs-rist-llhls`](./examples/obs-rist-llhls/) | OBS RIST ingest with the pure Rust RIST receiver and browser LL-HLS playback through hls.js. |
-| [`tls`](./tls/) | Local TLS material used by tests and local development. |
+| [`tls`](./tls/) | Configuration for local TLS certificate generation. |
 | [`pem_to_env.sh`](./pem_to_env.sh) | Helper script for exporting PEM files into environment variables. |
 
 ## External Dependencies
@@ -55,7 +55,26 @@ cargo test -p av-upload-response --release -- --nocapture
 cargo run -p obs-rist-llhls -- --rist-bind 0.0.0.0:7000 --http-port 9444
 ```
 
-Automated tests generate short-lived loopback certificates. Local development material remains under [`tls/local.wavey.ai`](./tls/local.wavey.ai/).
+Automated tests generate their own loopback certificates.
+
+### Local TLS
+
+Generate a local certificate authority (CA) and a server certificate:
+
+```bash
+bash scripts/generate-local-tls.sh
+```
+
+The script stores files in `tls/local.wavey.ai/generated`, which Git ignores.
+The server certificate covers `local.wavey.ai`, `localhost`, `127.0.0.1`, and `::1`.
+It expires after 90 days. Run the script again to issue a new server certificate with the same CA.
+The default TLS loader uses the generated files.
+
+Configure your client to trust `chain.pem` from that directory. For example:
+
+```bash
+curl --cacert tls/local.wavey.ai/generated/chain.pem https://localhost:8443/
+```
 
 ## upload-response
 
@@ -182,6 +201,32 @@ External cache readers should use `request_lane_handle`, `response_lane_handle`,
 Response writes require that capability and a positive `x-upload-response-sequence`. Exact retries are idempotent; conflicting or skipped sequences fail.
 
 Use a Kubernetes `NetworkPolicy` as a second boundary. Mutual TLS provides the required worker authentication.
+
+### Local workers
+
+Call `watch_active_streams()` to create an independent activity watcher.
+Its first `next().await` returns the current streams in arrival order.
+Later calls wait for stream changes, request or stage publication, ownership changes, or response lease expiry.
+Snapshots can combine multiple changes. Workers must check stream state and claim work before processing it.
+
+Use `UploadLaneHandle::wait_for_slot(slot_id)` to wait for request, stage, or response bytes.
+It returns an error after closure, slot reuse, or loss of the requested slot.
+Register a lane reader before consuming data. Mark each consumed slot to release buffer capacity.
+
+Call `claim_response_writer(stream_id, worker_id)` to obtain a `ClaimedResponseWriter`.
+The writer carries the response capability and rejects writes after ownership expires or changes.
+Use `ensure_started`, `send_body`, and `finish` to send a response.
+Use `write_handler_response` to send a complete `HandlerResponse`.
+Successful writes renew the lease. Call `renew().await` during work that does not produce response bytes.
+
+`response_claim_lease_ms` controls the lease duration. Its default is 30,000 milliseconds, independent of response delivery timeouts.
+Dropping the writer releases its claim. Use `release().await` when subsequent work requires immediate release.
+A response that has started cannot be claimed again. An expired partial response must fail through the response timeout.
+
+The existing local write methods reject streams that have had a response claim.
+Migrate callers that combine `try_claim_response` with these methods to `claim_response_writer`.
+Methods ending in `_unchecked` bypass ownership checks for adapters that guarantee one writer per stream.
+Code that constructs `UploadResponseTimeouts` directly must include `response_claim_lease_ms` or use `..Default::default()`.
 
 ### Stream Format
 

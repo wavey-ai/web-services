@@ -4,8 +4,8 @@ use base64::Engine;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_TLS_CERT_REL_PATH: &str = "../tls/local.wavey.ai/fullchain.pem";
-const DEFAULT_TLS_KEY_REL_PATH: &str = "../tls/local.wavey.ai/privkey.pem";
+const DEFAULT_TLS_CERT_REL_PATH: &str = "../tls/local.wavey.ai/generated/fullchain.pem";
+const DEFAULT_TLS_KEY_REL_PATH: &str = "../tls/local.wavey.ai/generated/privkey.pem";
 
 pub fn default_tls_paths() -> (PathBuf, PathBuf) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -18,6 +18,7 @@ pub fn default_tls_paths() -> (PathBuf, PathBuf) {
 pub fn load_default_tls_base64() -> anyhow::Result<(String, String)> {
     let (cert_path, key_path) = default_tls_paths();
     load_tls_base64_from_paths(cert_path, key_path)
+        .context("generate local TLS files with bash scripts/generate-local-tls.sh")
 }
 
 pub fn load_tls_base64_from_paths(

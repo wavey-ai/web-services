@@ -2,3 +2,4 @@ target
 example.pem
 .env
 *.rcgu.o
+/tls/local.wavey.ai/generated/

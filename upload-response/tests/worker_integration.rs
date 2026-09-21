@@ -1064,32 +1064,31 @@ async fn run_gated_worker(
     chunks: &[&'static [u8]],
 ) {
     let stream_id = await_completed_request(&service).await;
-
-    service
-        .write_response_headers(
-            stream_id,
-            StreamHeaders::Response(StreamResponseHeaders {
-                stream_id,
-                version: http_pack::HttpVersion::Http11,
-                status: 200,
-                headers: vec![],
-            }),
-        )
+    let mut response = service
+        .claim_response_writer(stream_id, "gated-worker")
+        .await
+        .unwrap()
+        .unwrap();
+    response
+        .ensure_started(http::Response::builder().status(200).body(()).unwrap())
         .await
         .unwrap();
 
     for (index, chunk) in chunks.iter().enumerate() {
-        service
-            .append_response_body(stream_id, Bytes::from_static(chunk))
-            .await
-            .unwrap();
+        response.send_body(Bytes::from_static(chunk)).await.unwrap();
         // Block until the peer has seen this chunk before producing the next.
-        while writer.chunk_count() <= index {
-            writer.chunk_seen.notified().await;
+        loop {
+            let notified = writer.chunk_seen.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if writer.chunk_count() > index {
+                break;
+            }
+            notified.await;
         }
     }
 
-    service.end_response(stream_id).await.unwrap();
+    response.finish().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1144,27 +1143,31 @@ async fn router_streams_response_slots_as_the_worker_produces_them() {
 /// Wait for an active stream whose request has been fully written, and return
 /// its id. Workers only answer a completed prompt.
 async fn await_completed_request(service: &Arc<UploadResponseService>) -> u64 {
+    let mut activity = service.watch_active_streams();
     let stream_id = loop {
-        if let Some(slot) = service.active_stream_slots().first() {
-            if service.request_last(slot.stream_id).unwrap_or(0) > 0 {
-                break slot.stream_id;
-            }
+        if let Some(stream) = activity.next().await.first() {
+            break stream.stream_id;
         }
-        tokio::task::yield_now().await;
     };
 
+    let lane = service.request_lane_handle(stream_id).unwrap();
+    assert!(
+        service
+            .register_request_reader(stream_id, "test-worker")
+            .await
+    );
     let mut slot_id = 0usize;
     loop {
-        let last = service.request_last(stream_id).unwrap_or(0);
-        if slot_id >= last {
-            tokio::task::yield_now().await;
-            continue;
-        }
         slot_id += 1;
-        if let Some(TailSlot::End) = service.tail_request(stream_id, slot_id).await {
+        let bytes = lane.wait_for_slot(slot_id).await.unwrap();
+        service
+            .mark_request_reader_position(stream_id, "test-worker", slot_id)
+            .await;
+        if bytes.is_empty() {
             break;
         }
     }
+    service.unregister_reader(stream_id, "test-worker").await;
     stream_id
 }
 

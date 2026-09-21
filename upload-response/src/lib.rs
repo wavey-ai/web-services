@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::sync::{
-    oneshot, Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore,
+    oneshot, watch, Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore,
     TryAcquireError,
 };
 use tokio::time::{timeout, timeout_at, Duration, Instant};
@@ -49,6 +49,12 @@ pub use remote::{
 
 mod response_writer;
 pub use response_writer::ResponseCacheWriter;
+
+mod claimed_writer;
+pub use claimed_writer::ClaimedResponseWriter;
+
+mod activity;
+pub use activity::ActiveStreamWatcher;
 
 pub(crate) const RESPONSE_WATCHER_READER_ID: &str = "__upload_response_watcher";
 
@@ -212,6 +218,8 @@ pub struct UploadResponseConfig {
 /// Independent deadlines for upload-response work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UploadResponseTimeouts {
+    /// Duration of a response ownership lease between renewals.
+    pub response_claim_lease_ms: u64,
     /// Maximum wait after a request finishes before its response must complete.
     /// Applies to buffered delivery, where the whole body arrives at once.
     pub response_deadline_ms: u64,
@@ -234,6 +242,7 @@ impl UploadResponseTimeouts {
     /// Map the legacy response timeout into the migration policy.
     pub const fn from_legacy_response_timeout(response_timeout_ms: u64) -> Self {
         Self {
+            response_claim_lease_ms: 30_000,
             response_deadline_ms: response_timeout_ms,
             response_idle_timeout_ms: response_timeout_ms,
             reader_backpressure_timeout_ms: response_timeout_ms,
@@ -741,6 +750,39 @@ impl UploadLaneHandle {
         let notifier = self.cache().update_notifier(self.stream_idx)?;
         self.is_current().then_some(notifier)
     }
+
+    /// Wait for one slot. Register a lane reader separately to retain unread slots.
+    /// Closure, slot reuse, and overwritten slots return an error.
+    pub async fn wait_for_slot(&self, slot_id: usize) -> Result<Bytes, String> {
+        if slot_id == 0 {
+            return Err("slot indices start at 1".into());
+        }
+        let updates = self.update_notifier().ok_or("stream closed")?;
+        loop {
+            let notified = updates.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let last = self.last().ok_or("stream closed")?;
+            if last >= slot_id {
+                return self
+                    .get(slot_id)
+                    .await
+                    .ok_or_else(|| "slot unavailable or stream closed".into());
+            }
+            if last > 0
+                && self
+                    .get(last)
+                    .await
+                    .is_some_and(|bytes| bytes.as_ref() == END_MARKER)
+            {
+                return Err("lane ended before the requested slot".into());
+            }
+            if !self.is_current() {
+                return Err("stream closed".into());
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Main service for handling upload-response lifecycle.
@@ -764,6 +806,8 @@ pub struct UploadResponseService {
     stream_worker_counts: Vec<AtomicU64>,
     request_started: Vec<AtomicBool>,
     response_started: Vec<AtomicBool>,
+    response_finished: Vec<AtomicBool>,
+    response_claim_required: Vec<AtomicBool>,
     /// Per-stream worker sets: which worker IDs are reading/processing each stream
     stream_workers: Arc<RwLock<Vec<std::collections::HashSet<String>>>>,
     request_reader_positions: Arc<RwLock<Vec<HashMap<String, usize>>>>,
@@ -774,6 +818,7 @@ pub struct UploadResponseService {
     response_claims: Vec<Mutex<Option<ResponseClaim>>>,
     response_dirty: Vec<AtomicBool>,
     response_updates: Arc<Notify>,
+    activity_updates: watch::Sender<u64>,
     /// Worker heartbeat/capacity registry keyed by worker id.
     workers: Arc<RwLock<HashMap<String, WorkerHeartbeat>>>,
     config: UploadResponseConfig,
@@ -855,6 +900,12 @@ impl UploadResponseService {
             stream_worker_counts,
             request_started,
             response_started,
+            response_finished: (0..config.num_streams)
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+            response_claim_required: (0..config.num_streams)
+                .map(|_| AtomicBool::new(false))
+                .collect(),
             stream_workers: Arc::new(RwLock::new(stream_workers)),
             request_reader_positions: new_reader_positions(config.num_streams),
             request_reader_notifies: new_reader_notifies(config.num_streams),
@@ -865,6 +916,7 @@ impl UploadResponseService {
                 .map(|_| AtomicBool::new(false))
                 .collect(),
             response_updates: Arc::new(Notify::new()),
+            activity_updates: watch::channel(0).0,
             workers: Arc::new(RwLock::new(HashMap::new())),
             config,
             timeouts,
@@ -900,6 +952,19 @@ impl UploadResponseService {
             dirty.store(true, Ordering::Release);
             self.response_updates.notify_one();
         }
+    }
+
+    fn notify_activity(&self) {
+        if self.activity_updates.receiver_count() == 0 {
+            return;
+        }
+        self.activity_updates
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    /// Watch active streams, cache publications, ownership changes, and lease expiry.
+    pub fn watch_active_streams(self: &Arc<Self>) -> ActiveStreamWatcher {
+        ActiveStreamWatcher::new(Arc::clone(self), self.activity_updates.subscribe())
     }
 
     pub(crate) fn take_response_dirty_slots(&self) -> Vec<usize> {
@@ -1087,6 +1152,7 @@ impl UploadResponseService {
             bytes,
             "upload-response slot written"
         );
+        self.notify_activity();
         Ok(())
     }
 
@@ -1261,6 +1327,8 @@ impl UploadResponseService {
         self.stream_worker_counts[stream_idx].store(0, Ordering::SeqCst);
         self.request_started[stream_idx].store(false, Ordering::SeqCst);
         self.response_started[stream_idx].store(false, Ordering::SeqCst);
+        self.response_finished[stream_idx].store(false, Ordering::SeqCst);
+        self.response_claim_required[stream_idx].store(false, Ordering::SeqCst);
         {
             let stages = self.stages.read().await;
             let lanes: Vec<_> = stages.values().cloned().collect();
@@ -1276,6 +1344,11 @@ impl UploadResponseService {
     }
 
     async fn notify_slot_waiters(&self, stream_idx: usize) {
+        for cache in [&self.request_cache, &self.response_cache] {
+            if let Some(notify) = cache.update_notifier(stream_idx) {
+                notify.notify_waiters();
+            }
+        }
         if let Some(notify) = self.request_reader_notifies.get(stream_idx) {
             notify.notify_waiters();
         }
@@ -1288,6 +1361,9 @@ impl UploadResponseService {
             stages.values().cloned().collect()
         };
         for lane in lanes {
+            if let Some(notify) = lane.cache.update_notifier(stream_idx) {
+                notify.notify_waiters();
+            }
             if let Some(notify) = lane.reader_notifies.get(stream_idx) {
                 notify.notify_waiters();
             }
@@ -1316,6 +1392,7 @@ impl UploadResponseService {
         };
 
         self.slot_stream_ids[stream_idx].store(0, Ordering::Release);
+        self.notify_activity();
         self.notify_slot_waiters(stream_idx).await;
         let slot_guard = Arc::clone(&self.slot_locks[stream_idx]).lock_owned().await;
         self.clear_slot_state(stream_idx).await;
@@ -1365,6 +1442,7 @@ impl UploadResponseService {
         }
         self.slot_stream_ids[stream_idx].store(stream_id, Ordering::Release);
         drop(slot_guard);
+        self.notify_activity();
 
         debug!(stream_id, stream_idx, "Stream opened");
 
@@ -1715,6 +1793,7 @@ impl UploadResponseService {
         }
         if claims[stream_idx].is_none() {
             claims[stream_idx] = Some(worker_id.to_string());
+            self.notify_activity();
             debug!(stream_id, stage, worker_id, "Stage claimed");
             true
         } else {
@@ -1736,6 +1815,7 @@ impl UploadResponseService {
         }
         if claims[stream_idx].as_deref() == Some(worker_id) {
             claims[stream_idx] = None;
+            self.notify_activity();
             debug!(stream_id, stage, worker_id, "Stage released");
             true
         } else {
@@ -1756,6 +1836,7 @@ impl UploadResponseService {
             return;
         }
         claims[stream_idx] = None;
+        self.notify_activity();
         debug!(stream_id, stage, "Stage force-released");
     }
 
@@ -1786,7 +1867,7 @@ impl UploadResponseService {
     }
 
     fn response_claim_ttl(&self) -> Duration {
-        Duration::from_millis(self.timeouts.response_deadline_ms.max(1_000))
+        Duration::from_millis(self.timeouts.response_claim_lease_ms.max(1))
     }
 
     fn capability_digest(capability: &str) -> [u8; 32] {
@@ -1813,6 +1894,10 @@ impl UploadResponseService {
         }
         let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
         let mut claim = self.response_claims[stream_idx].lock().await;
+        // A replacement writer cannot restart a response already visible to readers.
+        if self.response_started[stream_idx].load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let now = Instant::now();
         if claim.as_ref().is_some_and(|claim| claim.expires_at > now) {
             return Ok(None);
@@ -1826,19 +1911,63 @@ impl UploadResponseService {
             next_sequence: 1,
             last_write: None,
         });
+        self.response_claim_required[stream_idx].store(true, Ordering::Release);
+        self.notify_activity();
         debug!(stream_id, worker_id, "Response claimed");
         Ok(Some(capability))
     }
 
-    /// Claim a response for trusted in-process writers.
-    ///
-    /// Remote writers must use `try_claim_response_with_capability`.
+    /// Claim a response without retaining its write capability.
+    /// Use `claim_response_writer` for local response writes.
     pub async fn try_claim_response(&self, stream_id: u64, worker_id: &str) -> bool {
         self.try_claim_response_with_capability(stream_id, worker_id)
             .await
             .ok()
             .flatten()
             .is_some()
+    }
+
+    /// Claim a response and retain its write capability until the writer is dropped.
+    pub async fn claim_response_writer(
+        self: &Arc<Self>,
+        stream_id: u64,
+        worker_id: &str,
+    ) -> Result<Option<ClaimedResponseWriter>, String> {
+        Ok(self
+            .try_claim_response_with_capability(stream_id, worker_id)
+            .await?
+            .map(|capability| {
+                ClaimedResponseWriter::new(
+                    Arc::clone(self),
+                    stream_id,
+                    worker_id.to_string(),
+                    capability,
+                )
+            }))
+    }
+
+    /// Renew a current response lease. An expired lease cannot be renewed.
+    pub async fn renew_response_claim(
+        &self,
+        stream_id: u64,
+        capability: &str,
+    ) -> Result<(), String> {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        let mut claims = self.response_claims[stream_idx].lock().await;
+        let claim = claims.as_mut().ok_or("response capability required")?;
+        if !bool::from(
+            claim
+                .capability_digest
+                .ct_eq(&Self::capability_digest(capability)),
+        ) {
+            return Err("invalid response capability".into());
+        }
+        if claim.expires_at <= Instant::now() {
+            return Err("response capability expired".into());
+        }
+        claim.expires_at = Instant::now() + self.response_claim_ttl();
+        self.notify_activity();
+        Ok(())
     }
 
     /// Release a previously claimed response.
@@ -1855,6 +1984,7 @@ impl UploadResponseService {
             .is_some_and(|claim| claim.worker_id == worker_id)
         {
             *claim = None;
+            self.notify_activity();
             debug!(stream_id, worker_id, "Response released");
             true
         } else {
@@ -1881,6 +2011,7 @@ impl UploadResponseService {
         });
         if authorized {
             *claim = None;
+            self.notify_activity();
             debug!(stream_id, worker_id, "Response capability released");
         }
         authorized
@@ -1892,6 +2023,7 @@ impl UploadResponseService {
             return;
         };
         *self.response_claims[stream_idx].lock().await = None;
+        self.notify_activity();
         debug!(stream_id, "Response force-released");
     }
 
@@ -2150,6 +2282,10 @@ impl UploadResponseService {
             return Err(format!("request stream closed: {stream_id}"));
         }
         self.request_started[stream_idx].store(true, Ordering::Release);
+        if let Some(notify) = self.request_cache.update_notifier(stream_idx) {
+            notify.notify_waiters();
+        }
+        self.notify_activity();
         debug!(
             stream_id,
             stream_idx,
@@ -2252,6 +2388,10 @@ impl UploadResponseService {
             return Err(format!("stage stream closed: {stream_id}"));
         }
         lane.started[stream_idx].store(true, Ordering::Release);
+        if let Some(notify) = lane.cache.update_notifier(stream_idx) {
+            notify.notify_waiters();
+        }
+        self.notify_activity();
         Ok(())
     }
 
@@ -2332,6 +2472,9 @@ impl UploadResponseService {
         kind: ResponseWriteKind,
         data: Bytes,
     ) -> Result<(), String> {
+        if self.response_finished[stream_idx].load(Ordering::Acquire) {
+            return Err("response already finished".into());
+        }
         match kind {
             ResponseWriteKind::Headers => {
                 if self.response_started[stream_idx].load(Ordering::Acquire) {
@@ -2347,6 +2490,9 @@ impl UploadResponseService {
                     return Err(format!("response stream closed: {stream_id}"));
                 }
                 self.response_started[stream_idx].store(true, Ordering::Release);
+                if let Some(notify) = self.response_cache.update_notifier(stream_idx) {
+                    notify.notify_waiters();
+                }
             }
             ResponseWriteKind::Body => {
                 if data.is_empty() {
@@ -2384,9 +2530,11 @@ impl UploadResponseService {
                     Bytes::from_static(END_MARKER),
                 )
                 .await?;
+                self.response_finished[stream_idx].store(true, Ordering::Release);
             }
         }
         self.notify_response_update(stream_idx);
+        self.notify_activity();
         Ok(())
     }
 
@@ -2442,8 +2590,33 @@ impl UploadResponseService {
         Ok(())
     }
 
-    /// Write an HPKS headers frame from a trusted in-process writer.
+    async fn write_unclaimed_response(
+        &self,
+        stream_id: u64,
+        kind: ResponseWriteKind,
+        data: Bytes,
+    ) -> Result<(), String> {
+        let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
+        if self.response_claim_required[stream_idx].load(Ordering::Acquire) {
+            return Err("response requires a claimed writer".into());
+        }
+        self.write_response_at(stream_id, stream_idx, kind, data)
+            .await
+    }
+
+    /// Write response headers for a stream that has never had a response claim.
     pub async fn write_response_headers(
+        &self,
+        stream_id: u64,
+        headers: StreamHeaders,
+    ) -> Result<(), String> {
+        let encoded = Bytes::from(encode_frame(&StreamFrame::Headers(headers)));
+        self.write_unclaimed_response(stream_id, ResponseWriteKind::Headers, encoded)
+            .await
+    }
+
+    /// Bypass response ownership for an adapter with one exclusive writer.
+    pub async fn write_response_headers_unchecked(
         &self,
         stream_id: u64,
         headers: StreamHeaders,
@@ -2472,8 +2645,18 @@ impl UploadResponseService {
         .await
     }
 
-    /// Append raw body bytes from a trusted in-process writer.
+    /// Append response bytes for a stream that has never had a response claim.
     pub async fn append_response_body(&self, stream_id: u64, data: Bytes) -> Result<(), String> {
+        self.write_unclaimed_response(stream_id, ResponseWriteKind::Body, data)
+            .await
+    }
+
+    /// Bypass response ownership for an adapter with one exclusive writer.
+    pub async fn append_response_body_unchecked(
+        &self,
+        stream_id: u64,
+        data: Bytes,
+    ) -> Result<(), String> {
         let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
         self.write_response_at(stream_id, stream_idx, ResponseWriteKind::Body, data)
             .await
@@ -2496,8 +2679,14 @@ impl UploadResponseService {
         .await
     }
 
-    /// End a response from a trusted in-process writer.
+    /// End a response for a stream that has never had a response claim.
     pub async fn end_response(&self, stream_id: u64) -> Result<(), String> {
+        self.write_unclaimed_response(stream_id, ResponseWriteKind::End, Bytes::new())
+            .await
+    }
+
+    /// Bypass response ownership for an adapter with one exclusive writer.
+    pub async fn end_response_unchecked(&self, stream_id: u64) -> Result<(), String> {
         let (stream_idx, _slot_guard) = self.lock_stream_slot(stream_id).await?;
         self.write_response_at(stream_id, stream_idx, ResponseWriteKind::End, Bytes::new())
             .await
@@ -4100,6 +4289,7 @@ mod tests {
         assert_eq!(
             config.legacy_timeouts(),
             UploadResponseTimeouts {
+                response_claim_lease_ms: 30_000,
                 response_deadline_ms: 1_234,
                 response_idle_timeout_ms: 1_234,
                 reader_backpressure_timeout_ms: 1_234,

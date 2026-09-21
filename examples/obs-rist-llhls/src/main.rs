@@ -181,7 +181,7 @@ fn load_tls(args: &Args) -> Result<(String, String)> {
             )
         }),
         (None, None) => load_default_tls_base64()
-            .context("failed to load default TLS files from web-services/tls/local.wavey.ai"),
+            .context("failed to load generated local TLS files"),
         _ => bail!("--cert and --key must be provided together"),
     }
 }

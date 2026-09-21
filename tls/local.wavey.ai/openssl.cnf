@@ -1,0 +1,25 @@
+[req]
+distinguished_name = subject
+prompt = no
+
+[subject]
+CN = local.wavey.ai
+
+[ca_extensions]
+basicConstraints = critical, CA:TRUE, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+
+[server_extensions]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid, issuer
+subjectAltName = @names
+
+[names]
+DNS.1 = local.wavey.ai
+DNS.2 = localhost
+IP.1 = 127.0.0.1
+IP.2 = ::1
