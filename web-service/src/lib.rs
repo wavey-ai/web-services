@@ -12,6 +12,7 @@ pub mod quic_relay;
 pub mod raw_tcp;
 mod request_limit;
 pub mod server;
+pub mod static_files;
 pub mod tls;
 pub mod traits;
 
@@ -25,6 +26,7 @@ pub use proxy::{
 pub use quic_relay::QuicRelayConfig;
 pub use raw_tcp::{read_length_prefixed_frame, write_length_prefixed_frame};
 pub use server::{H2H3Server, H2H3ServerBuilder};
+pub use static_files::StaticFiles;
 pub use tls::{default_tls_paths, load_default_tls_base64, load_tls_base64_from_paths};
 pub use traits::{
     BodyStream, HandlerResponse, HandlerResult, RawTcpHandler, RequestHandler, Router, Server,
