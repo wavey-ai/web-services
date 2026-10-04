@@ -1,0 +1,19 @@
+[package]
+name = "av-web-service-core"
+authors = ["Jamie Brough <jamie@wavey.ai>"]
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+description = "The response and error types web-service handlers return, without the servers"
+
+[lib]
+name = "web_service_core"
+
+# Handler code (domain logic that builds responses) depends on this crate alone, so it compiles
+# without hyper, h2, h3, quinn, WebTransport or WebSockets. `av-web-service` re-exports it.
+[dependencies]
+bytes = "1.11.1"
+futures-core = "0.3"
+http = "1.4.1"
+thiserror = "2.0.12"

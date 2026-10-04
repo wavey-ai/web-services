@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "web-service",
+    "web-service-core",
     "hls",
     "chunks",
     "upload-response",

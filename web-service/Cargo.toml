@@ -19,6 +19,7 @@ h3-tokio-quiche = ["dep:tempfile", "dep:tokio-quiche"]
 plain-http = []
 
 [dependencies]
+web-service-core = { package = "av-web-service-core", path = "../web-service-core" }
 hyper-util = { version = "0.1.20", features = ["full"] }
 env_logger = "0.11.0"
 tokio = { version = "1.52.3", features = ["full"] }

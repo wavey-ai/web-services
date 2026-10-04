@@ -2,25 +2,7 @@ use http::header::{InvalidHeaderName, InvalidHeaderValue};
 use http::Error as HttpError;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
-pub enum ServerError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("HTTP error: {0}")]
-    Http(#[from] http::Error),
-
-    #[error("TLS error: {0}")]
-    Tls(String),
-
-    #[error("configuration error: {0}")]
-    Config(String),
-
-    #[error("handler error: {0}")]
-    Handler(#[from] Box<dyn std::error::Error + Send + Sync>),
-}
-
-pub type ServerResult<T> = Result<T, ServerError>;
+pub use web_service_core::{ServerError, ServerResult};
 
 #[derive(Debug, Error)]
 pub enum H2Error {

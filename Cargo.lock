@@ -477,6 +477,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "av-web-service-core",
  "base64 0.22.1",
  "bytes",
  "clap",
@@ -525,6 +526,16 @@ dependencies = [
  "webpki-roots 1.0.9",
  "xmpegts",
  "xxhash-rust",
+]
+
+[[package]]
+name = "av-web-service-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

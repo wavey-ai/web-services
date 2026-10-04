@@ -1,7 +1,6 @@
 use crate::error::ServerError;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::stream::BoxStream;
 use h3_webtransport::server::WebTransportSession;
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -9,36 +8,10 @@ use std::borrow::Cow;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 
-/// Result type for handlers
-pub type HandlerResult<T> = Result<T, ServerError>;
+pub use web_service_core::{BodyStream, HandlerResponse, HandlerResult};
 
 /// Reports whether one transport completed its listener setup.
 pub(crate) type StartupSender = tokio::sync::oneshot::Sender<Result<(), String>>;
-
-/// Response type that handlers return
-#[derive(Debug)]
-pub struct HandlerResponse {
-    pub status: StatusCode,
-    pub body: Option<Bytes>,
-    pub content_type: Option<Cow<'static, str>>,
-    pub headers: Vec<(Cow<'static, str>, Cow<'static, str>)>,
-    pub etag: Option<u64>,
-}
-
-/// Stream type for request bodies
-pub type BodyStream = BoxStream<'static, Result<Bytes, ServerError>>;
-
-impl Default for HandlerResponse {
-    fn default() -> Self {
-        Self {
-            status: StatusCode::OK,
-            body: None,
-            content_type: None,
-            headers: vec![],
-            etag: None,
-        }
-    }
-}
 
 pub(crate) fn response_header_name(
     value: Cow<'static, str>,
