@@ -32,6 +32,25 @@ pub struct ServerConfig {
     pub max_in_flight_requests: usize,
     /// Maximum TLS or QUIC handshake time.
     pub handshake_timeout_ms: u64,
+    /// How long an HTTP/1.1 or HTTP/2 request waits for an in-flight slot before it is
+    /// answered 503 with `Retry-After`. Zero refuses at once.
+    pub request_queue_timeout_ms: u64,
+    /// Paths that skip the in-flight request limit on HTTP/1.1 and HTTP/2, matched exactly.
+    /// Meant for load balancer health checks, so a busy server is not replaced as a dead one.
+    pub limit_exempt_paths: Vec<String>,
+    /// How long open HTTP/1.1 and HTTP/2 connections get to finish their requests after
+    /// shutdown, with no new connections taken. Zero closes them at once.
+    pub shutdown_drain_ms: u64,
+    /// Most a client may send to a route that reads no body. The server reads and drops such
+    /// a body so the connection can be reused, and past this answers 413.
+    pub max_unread_body_bytes: u64,
+    /// HTTP/1.1 time to read a request head, counted from the end of the previous response,
+    /// so it also closes idle keep-alive connections. Behind a load balancer keep it above
+    /// the balancer's idle timeout. Zero leaves it unbounded.
+    pub http1_header_read_timeout_ms: u64,
+    /// Serve the HTTP/1.1+HTTP/2 listener as cleartext HTTP/1.1, with no TLS.
+    #[cfg(feature = "plain-http")]
+    pub plain_http: bool,
 }
 
 impl Default for ServerConfig {
@@ -53,6 +72,13 @@ impl Default for ServerConfig {
             max_connections: 4_096,
             max_in_flight_requests: 4_096,
             handshake_timeout_ms: 10_000,
+            request_queue_timeout_ms: 0,
+            limit_exempt_paths: Vec::new(),
+            shutdown_drain_ms: 0,
+            max_unread_body_bytes: 16 * 1024 * 1024,
+            http1_header_read_timeout_ms: 0,
+            #[cfg(feature = "plain-http")]
+            plain_http: false,
         }
     }
 }

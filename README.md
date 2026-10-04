@@ -111,6 +111,19 @@ WebTransport permits one session on each QUIC connection. Clients open separate 
 
 Excess HTTP work receives `503` with `Retry-After: 1`. The server does not consume rejected request bodies, which preserves transport flow control.
 
+On the HTTP/1.1+HTTP/2 listener:
+
+- `with_request_queue_timeout_ms` lets a request wait that long for a slot before the `503`. The default, zero, refuses at once.
+- `with_limit_exempt_paths` names paths, matched exactly, that skip the limit. Use it for load balancer health checks, so a busy server is not replaced as a dead one.
+- `with_max_connections` stops accepting at the limit, so new connections wait in the kernel's backlog rather than being dropped.
+- `with_shutdown_drain_ms` gives open connections that long to finish their requests after shutdown. The default, zero, closes them at once.
+- A route with no body handler reads and drops the request body up to `with_max_unread_body_bytes` (16 MiB by default), then answers `413`. On HTTP/1.x, a body a handler leaves unread is drained in the background (up to 8 MiB for 10 seconds) so an early answer reaches a client that is still sending.
+- `with_http1_header_read_timeout_ms` bounds the time to read an HTTP/1.1 request head. Hyper counts it from the end of the previous response, so it also closes idle keep-alive connections. Behind a load balancer, set it above the balancer's idle timeout. The default, zero, leaves it unbounded.
+- Every request runs in a `request` span and answers with an `x-request-id`: the caller's when it is a short visible-ASCII token, otherwise a new UUIDv7. Handlers see the same id on the request.
+- A handler that fails before it produces a response is answered `500`.
+
+The `plain-http` feature adds `H2H3ServerBuilder::with_plain_http`, which serves that listener as cleartext HTTP/1.1 with the same limits, for a server behind a proxy that terminates TLS. It needs no certificate, and it disables HTTP/3 and WebTransport, which need TLS.
+
 The `rist` feature keeps the existing librist/C-wrapper backend. The `rist-pure` feature adds `PureRistIngest`, backed by the pure Rust `rist-core` and `rist-mio` crates from [`wavey-ai/rist-rs`](https://github.com/wavey-ai/rist-rs). Pure RIST byte-stream delivery suppresses duplicate arrivals and holds packets behind a sequence gap until retransmission restores wire order. The reorder queue is bounded and fails closed instead of concatenating bytes across an unresolved gap.
 
 Each RIST source address has a separate ordered request. Queue overflow aborts all active requests because the dropped packet owner is not retained.

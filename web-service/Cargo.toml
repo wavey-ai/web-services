@@ -14,6 +14,9 @@ name = "web_service"
 default = ["h3-quinn"]
 h3-quinn = []
 h3-tokio-quiche = ["dep:tempfile", "dep:tokio-quiche"]
+# Cleartext HTTP/1.1 on the HTTP/1.1+HTTP/2 listener (`H2H3ServerBuilder::with_plain_http`),
+# for a server behind a proxy that terminates TLS. Off unless a build opts in.
+plain-http = []
 
 [dependencies]
 hyper-util = { version = "0.1.20", features = ["full"] }
@@ -69,6 +72,7 @@ mime_guess = "2.0.5"
 percent-encoding = "2.3"
 tempfile = { version = "3", optional = true }
 tokio-quiche = { version = "0.19.1", default-features = false, optional = true }
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 rcgen = "0.13"

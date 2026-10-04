@@ -245,7 +245,24 @@ impl ServerBuilder for H2H3ServerBuilder {
             .router
             .ok_or_else(|| ServerError::Config("Router not configured".into()))?;
 
-        if self.config.cert_pem_base64.is_empty() || self.config.privkey_pem_base64.is_empty() {
+        #[cfg(feature = "plain-http")]
+        let plain_http = self.config.plain_http;
+        #[cfg(not(feature = "plain-http"))]
+        let plain_http = false;
+        if plain_http {
+            if !self.config.enable_h2 || self.config.enable_h3 {
+                return Err(ServerError::Config(
+                    "Plain HTTP serves HTTP/1.1 only: enable HTTP/2 and disable HTTP/3".into(),
+                ));
+            }
+            if self.config.client_ca_pem_base64.is_some() {
+                return Err(ServerError::Config(
+                    "Client certificate authentication requires TLS".into(),
+                ));
+            }
+        } else if self.config.cert_pem_base64.is_empty()
+            || self.config.privkey_pem_base64.is_empty()
+        {
             return Err(ServerError::Config(
                 "TLS certificate and key must be provided".into(),
             ));
@@ -325,6 +342,49 @@ impl H2H3ServerBuilder {
 
     pub fn with_handshake_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.config.handshake_timeout_ms = timeout_ms.max(1);
+        self
+    }
+
+    /// Let an HTTP/1.1 or HTTP/2 request wait this long for an in-flight slot before it is
+    /// answered 503. The default, zero, refuses at once.
+    pub fn with_request_queue_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.config.request_queue_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Paths, matched exactly, that skip the in-flight request limit: health checks.
+    pub fn with_limit_exempt_paths<I, S>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.limit_exempt_paths = paths.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Give open HTTP/1.1 and HTTP/2 connections this long to finish after shutdown.
+    pub fn with_shutdown_drain_ms(mut self, drain_ms: u64) -> Self {
+        self.config.shutdown_drain_ms = drain_ms;
+        self
+    }
+
+    pub fn with_max_unread_body_bytes(mut self, max_bytes: u64) -> Self {
+        self.config.max_unread_body_bytes = max_bytes;
+        self
+    }
+
+    pub fn with_http1_header_read_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.config.http1_header_read_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Serve cleartext HTTP/1.1 instead of TLS, for a listener behind a proxy that terminates
+    /// TLS. Disables HTTP/3 and WebTransport, which need TLS; no certificate is required.
+    #[cfg(feature = "plain-http")]
+    pub fn with_plain_http(mut self) -> Self {
+        self.config.plain_http = true;
+        self.config.enable_h3 = false;
+        self.config.enable_webtransport = false;
         self
     }
 }
