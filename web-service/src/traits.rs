@@ -217,6 +217,25 @@ pub trait Router: Send + Sync + 'static {
 
     /// Get WebSocket handler if available
     fn websocket_handler(&self, path: &str) -> Option<&dyn WebSocketHandler>;
+
+    /// The answer for a request the HTTP/1.1+HTTP/2 server refuses or fails on its own:
+    /// `503` when no request slot frees in time (the server adds `Retry-After`), `413` for a
+    /// body too large for a route that reads none, and `500` when a handler fails before it
+    /// answers. Override it to give these the application's error shape; a wrapping router
+    /// forwards it. The default is a short plain-text body.
+    fn server_response(&self, status: StatusCode) -> HandlerResponse {
+        let body: &'static [u8] = match status {
+            StatusCode::SERVICE_UNAVAILABLE => b"service overloaded",
+            StatusCode::PAYLOAD_TOO_LARGE => b"request body too large",
+            _ => b"internal server error",
+        };
+        HandlerResponse {
+            status,
+            body: Some(Bytes::from_static(body)),
+            content_type: Some(Cow::Borrowed("text/plain")),
+            ..Default::default()
+        }
+    }
 }
 
 /// Server builder trait

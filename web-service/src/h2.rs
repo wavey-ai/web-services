@@ -498,7 +498,7 @@ impl Listener {
             let started = Instant::now();
             trace!("request received");
             let Some(request_permit) = self.admission.admit(req.uri().path()).await else {
-                return with_request_id(overloaded_h2_response(), &id);
+                return with_request_id(self.server_response(StatusCode::SERVICE_UNAVAILABLE), &id);
             };
             let response = match handle_h2_request(
                 req,
@@ -515,7 +515,7 @@ impl Listener {
                 Ok(response) => response,
                 Err(e) => {
                     error!("Request handling error: {}", e);
-                    internal_error_response()
+                    self.server_response(StatusCode::INTERNAL_SERVER_ERROR)
                 }
             };
             debug!(
@@ -527,6 +527,28 @@ impl Listener {
         }
         .instrument(span)
         .await
+    }
+}
+
+impl Listener {
+    /// The server's own answer for `status`, in the router's shape; a 503 also carries
+    /// `Retry-After`.
+    fn server_response(&self, status: StatusCode) -> Response<H2ResponseBody> {
+        let mut response = build_buffered_response(self.router.server_response(status))
+            .unwrap_or_else(|error| {
+                error!(%error, "the router's server response is not a valid response");
+                let mut response = Response::new(buffered_body(Bytes::new()));
+                *response.status_mut() = status;
+                add_cors_headers(&mut response);
+                response
+            });
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response.headers_mut().insert(
+                HeaderName::from_static("retry-after"),
+                HeaderValue::from_static("1"),
+            );
+        }
+        response
     }
 }
 
@@ -757,12 +779,7 @@ async fn handle_h2_request(
             limit = max_unread_body_bytes,
             "request body to a route that reads none is too large"
         );
-        return build_buffered_response(HandlerResponse {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            body: Some(Bytes::from_static(b"request body too large")),
-            content_type: Some("text/plain".into()),
-            ..Default::default()
-        });
+        return build_buffered_response(router.server_response(StatusCode::PAYLOAD_TOO_LARGE));
     }
 
     let req = http::Request::from_parts(parts, ());
@@ -1024,25 +1041,6 @@ fn build_buffered_response(
     add_cors_headers(&mut response);
 
     Ok(response)
-}
-
-/// The answer to a request whose handler failed before it produced a response.
-fn internal_error_response() -> Response<H2ResponseBody> {
-    let mut response = Response::new(buffered_body(Bytes::from_static(b"internal server error")));
-    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-    add_cors_headers(&mut response);
-    response
-}
-
-fn overloaded_h2_response() -> Response<H2ResponseBody> {
-    let mut response = Response::new(buffered_body(Bytes::from_static(b"service overloaded")));
-    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-    response.headers_mut().insert(
-        HeaderName::from_static("retry-after"),
-        HeaderValue::from_static("1"),
-    );
-    add_cors_headers(&mut response);
-    response
 }
 
 fn build_streaming_response(

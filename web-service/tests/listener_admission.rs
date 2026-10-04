@@ -117,7 +117,11 @@ fn client() -> reqwest::Client {
 }
 
 async fn get(origin: &str, path: &str) -> reqwest::Response {
-    client().get(format!("{origin}{path}")).send().await.unwrap()
+    client()
+        .get(format!("{origin}{path}"))
+        .send()
+        .await
+        .unwrap()
 }
 
 async fn hold(gate: &Gate, origin: &str) -> tokio::task::JoinHandle<reqwest::Response> {
@@ -198,7 +202,10 @@ async fn past_the_connection_limit_new_connections_wait_instead_of_being_dropped
         async move { get(&origin, "/fast").await }
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!waiting.is_finished(), "a connection past the limit was served or dropped");
+    assert!(
+        !waiting.is_finished(),
+        "a connection past the limit was served or dropped"
+    );
 
     gate.release.add_permits(1);
     assert_eq!(held.await.unwrap().status(), StatusCode::OK);
@@ -230,17 +237,27 @@ async fn a_failed_handler_is_answered_500_and_the_connection_survives() {
         .http1_only()
         .build()
         .unwrap();
-    let failed = keep_alive.get(format!("{origin}/fail")).send().await.unwrap();
+    let failed = keep_alive
+        .get(format!("{origin}/fail"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let next = keep_alive.get(format!("{origin}/fast")).send().await.unwrap();
+    let next = keep_alive
+        .get(format!("{origin}/fast"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(next.status(), StatusCode::OK);
     stop(handle).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_large_body_to_a_route_that_reads_none_is_refused() {
-    let (handle, origin) =
-        start(Gate::default(), |builder| builder.with_max_unread_body_bytes(1024)).await;
+    let (handle, origin) = start(Gate::default(), |builder| {
+        builder.with_max_unread_body_bytes(1024)
+    })
+    .await;
     let small = client()
         .post(format!("{origin}/fast"))
         .body(vec![b'x'; 512])
@@ -261,8 +278,10 @@ async fn a_large_body_to_a_route_that_reads_none_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_lets_requests_in_flight_finish_within_the_drain() {
     let gate = Gate::default();
-    let (handle, origin) =
-        start(gate.clone(), |builder| builder.with_shutdown_drain_ms(5_000)).await;
+    let (handle, origin) = start(gate.clone(), |builder| {
+        builder.with_shutdown_drain_ms(5_000)
+    })
+    .await;
     let held = hold(&gate, &origin).await;
 
     let _ = handle.shutdown_tx.send(());
@@ -273,6 +292,92 @@ async fn shutdown_lets_requests_in_flight_finish_within_the_drain() {
         .await
         .expect("server did not stop after its connections drained")
         .unwrap();
+}
+
+/// [`Gate`], with the server's own answers in a JSON error shape.
+struct Shaped(Gate);
+
+#[async_trait]
+impl Router for Shaped {
+    async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
+        self.0.route(req).await
+    }
+
+    fn is_streaming(&self, path: &str) -> bool {
+        self.0.is_streaming(path)
+    }
+
+    async fn route_stream(
+        &self,
+        req: Request<()>,
+        writer: Box<dyn StreamWriter>,
+    ) -> HandlerResult<()> {
+        self.0.route_stream(req, writer).await
+    }
+
+    fn webtransport_handler(&self) -> Option<&dyn WebTransportHandler> {
+        None
+    }
+
+    fn websocket_handler(&self, _path: &str) -> Option<&dyn WebSocketHandler> {
+        None
+    }
+
+    fn server_response(&self, status: StatusCode) -> HandlerResponse {
+        HandlerResponse {
+            status,
+            body: Some(Bytes::from(format!(
+                r#"{{"detail":"{}"}}"#,
+                status.as_u16()
+            ))),
+            content_type: Some("application/json".into()),
+            ..Default::default()
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_router_shapes_the_servers_own_answers() {
+    ensure_rustls_provider();
+    let (certificate, private_key, _) = load_test_env().expect("test TLS material");
+    let port = pick_unused_port().expect("unused test port");
+    let gate = Gate::default();
+    let handle = H2H3Server::builder()
+        .with_tls(certificate, private_key)
+        .with_bind_address(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .with_port(port)
+        .enable_h3(false)
+        .enable_webtransport(false)
+        .with_max_in_flight_requests(1)
+        .with_max_unread_body_bytes(16)
+        .with_router(Box::new(Shaped(gate.clone())))
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let origin = format!("https://127.0.0.1:{port}");
+
+    let failed = get(&origin, "/fail").await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(failed.text().await.unwrap(), r#"{"detail":"500"}"#);
+    let large = client()
+        .post(format!("{origin}/fast"))
+        .body(vec![b'x'; 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(large.headers()["content-type"], "application/json");
+
+    let held = hold(&gate, &origin).await;
+    let busy = get(&origin, "/fast").await;
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(busy.headers()["retry-after"], "1");
+    assert_eq!(busy.text().await.unwrap(), r#"{"detail":"503"}"#);
+    gate.release.add_permits(1);
+    assert_eq!(held.await.unwrap().status(), StatusCode::OK);
+    stop(handle).await;
 }
 
 #[cfg(feature = "plain-http")]

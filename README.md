@@ -121,6 +121,7 @@ On the HTTP/1.1+HTTP/2 listener:
 - `with_http1_header_read_timeout_ms` bounds the time to read an HTTP/1.1 request head. Hyper counts it from the end of the previous response, so it also closes idle keep-alive connections. Behind a load balancer, set it above the balancer's idle timeout. The default, zero, leaves it unbounded.
 - Every request runs in a `request` span and answers with an `x-request-id`: the caller's when it is a short visible-ASCII token, otherwise a new UUIDv7. Handlers see the same id on the request.
 - A handler that fails before it produces a response is answered `500`.
+- `Router::server_response` shapes the answers the server gives on its own (the `503`, `413` and `500` above), for an application with its own error format. The default is a short plain-text body.
 
 The `plain-http` feature adds `H2H3ServerBuilder::with_plain_http`, which serves that listener as cleartext HTTP/1.1 with the same limits, for a server behind a proxy that terminates TLS. It needs no certificate, and it disables HTTP/3 and WebTransport, which need TLS.
 
