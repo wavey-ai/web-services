@@ -378,6 +378,7 @@ impl Listener {
         peer: SocketAddr,
         connection_permit: OwnedSemaphorePermit,
     ) {
+        disable_nagle(&stream, peer);
         let connection_permit = Arc::new(StdMutex::new(Some(connection_permit)));
         let (io, is_h2, client_certificate): (Box<dyn Io>, bool, _) = match &self.tls_acceptor {
             None => (Box::new(stream), false, None),
@@ -608,6 +609,16 @@ fn build_tls_acceptor(config: &ServerConfig) -> ServerResult<TlsAcceptor> {
         .map_err(|error| ServerError::Tls(error.to_string()))?;
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
+}
+
+/// Set `TCP_NODELAY` on an accepted connection. Responses go out as several writes (a head
+/// and body chunks, TLS records, a frame's length prefix and payload). With Nagle's algorithm
+/// on, a small write waits for the ACK of the write before it, and a client that delays its
+/// ACK adds about 40 ms to the exchange.
+pub(crate) fn disable_nagle(stream: &TcpStream, peer: SocketAddr) {
+    if let Err(error) = stream.set_nodelay(true) {
+        debug!(%peer, %error, "could not set TCP_NODELAY");
+    }
 }
 
 fn bind_tcp_listener(addr: SocketAddr) -> ServerResult<TcpListener> {
@@ -1119,6 +1130,17 @@ fn header_has_token(headers: &http::HeaderMap, name: &str, token: &str) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn accepted_connections_send_small_writes_at_once() {
+        let listener = bind_tcp_listener(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap());
+        let (accepted, client) = tokio::join!(listener.accept(), client);
+        let (stream, peer) = accepted.unwrap();
+        disable_nagle(&stream, peer);
+        assert!(stream.nodelay().unwrap());
+        drop(client);
+    }
 
     #[test]
     fn a_callers_request_id_is_kept_and_a_malformed_one_replaced() {

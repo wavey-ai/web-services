@@ -1,6 +1,7 @@
 use crate::{
     config::ServerConfig,
     error::{ServerError, ServerResult},
+    h2::disable_nagle,
     request_limit::RequestLimiter,
     traits::{RawStream, RawTcpHandler, StartupSender},
 };
@@ -194,6 +195,7 @@ impl RawTcpServer {
                             let handler = Arc::clone(&self.handler);
                             let tls_acceptor = tls_acceptor.clone();
                             let is_tls = self.config.raw_tcp_tls;
+                            disable_nagle(&stream, peer);
                             connection_tasks.spawn(async move {
                                 let _connection_permit = connection_permit;
                                 let _request_permit = request_permit;
