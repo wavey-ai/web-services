@@ -29,10 +29,7 @@ const PARTIAL_BODY: &[u8] = b"partial-body-chunk";
 struct StreamingRouter;
 
 impl StreamingRouter {
-    async fn drive(
-        path: &str,
-        stream_writer: &mut Box<dyn StreamWriter>,
-    ) -> HandlerResult<()> {
+    async fn drive(path: &str, stream_writer: &mut Box<dyn StreamWriter>) -> HandlerResult<()> {
         stream_writer.send_response(Response::new(())).await?;
         stream_writer
             .send_data(Bytes::from_static(PARTIAL_BODY))
@@ -145,10 +142,7 @@ fn client_config(
 /// completion. The error may surface at the response head or during the body:
 /// the server writes head, chunk and reset back to back, so what matters is
 /// that no successful read yields a complete-looking short body.
-async fn fetch(
-    backend: H3Backend,
-    path: &'static str,
-) -> Result<(StatusCode, Bytes), String> {
+async fn fetch(backend: H3Backend, path: &'static str) -> Result<(StatusCode, Bytes), String> {
     let tls = test_tls();
     let port = unused_udp_port();
     let server = H2H3Server::builder()
@@ -193,7 +187,11 @@ async fn fetch(
 
     let result = tokio::time::timeout(Duration::from_secs(10), async {
         let request = Request::builder()
-            .method(if path.ends_with("-body") { "POST" } else { "GET" })
+            .method(if path.ends_with("-body") {
+                "POST"
+            } else {
+                "GET"
+            })
             .uri(format!("https://localhost:{port}{path}"))
             .body(())
             .map_err(|error| error.to_string())?;

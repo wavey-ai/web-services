@@ -238,6 +238,15 @@ pub struct UploadResponseTimeouts {
     pub remote_io_timeout_ms: u64,
 }
 
+/// Policy for a writer that reaches an unread slot in a full cache ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadResponseBackpressure {
+    /// Return an error after `reader_backpressure_timeout_ms`.
+    Timed,
+    /// Wait for a reader to consume the slot or for the stream to close.
+    Reliable,
+}
+
 impl UploadResponseTimeouts {
     /// Map the legacy response timeout into the migration policy.
     pub const fn from_legacy_response_timeout(response_timeout_ms: u64) -> Self {
@@ -823,6 +832,7 @@ pub struct UploadResponseService {
     workers: Arc<RwLock<HashMap<String, WorkerHeartbeat>>>,
     config: UploadResponseConfig,
     timeouts: UploadResponseTimeouts,
+    backpressure: UploadResponseBackpressure,
 }
 
 impl UploadResponseService {
@@ -841,6 +851,16 @@ impl UploadResponseService {
             .unwrap_or_else(|error| panic!("invalid upload-response config: {error}"))
     }
 
+    /// Create a service with an explicit cache backpressure policy.
+    pub fn new_with_backpressure(
+        config: UploadResponseConfig,
+        timeouts: UploadResponseTimeouts,
+        backpressure: UploadResponseBackpressure,
+    ) -> Self {
+        Self::try_new_with_backpressure(config, timeouts, backpressure)
+            .unwrap_or_else(|error| panic!("invalid upload-response config: {error}"))
+    }
+
     /// Validate capacity before allocation and create a service.
     pub fn try_new(config: UploadResponseConfig) -> Result<Self, UploadResponseConfigError> {
         let timeouts = config.legacy_timeouts();
@@ -849,8 +869,17 @@ impl UploadResponseService {
 
     /// Validate capacity and create a service with independent timeouts.
     pub fn try_new_with_timeouts(
+        config: UploadResponseConfig,
+        timeouts: UploadResponseTimeouts,
+    ) -> Result<Self, UploadResponseConfigError> {
+        Self::try_new_with_backpressure(config, timeouts, UploadResponseBackpressure::Timed)
+    }
+
+    /// Validate capacity and create a service with an explicit backpressure policy.
+    pub fn try_new_with_backpressure(
         mut config: UploadResponseConfig,
         timeouts: UploadResponseTimeouts,
+        backpressure: UploadResponseBackpressure,
     ) -> Result<Self, UploadResponseConfigError> {
         config.normalize();
         let capacity = config.validate()?;
@@ -920,6 +949,7 @@ impl UploadResponseService {
             workers: Arc::new(RwLock::new(HashMap::new())),
             config,
             timeouts,
+            backpressure,
         })
     }
 
@@ -1073,8 +1103,9 @@ impl UploadResponseService {
         }
 
         let overwrite_slot = next_slot - capacity;
-        let deadline =
-            Instant::now() + Duration::from_millis(self.timeouts.reader_backpressure_timeout_ms);
+        let deadline = (self.backpressure == UploadResponseBackpressure::Timed).then(|| {
+            Instant::now() + Duration::from_millis(self.timeouts.reader_backpressure_timeout_ms)
+        });
         loop {
             let notified = notifies[stream_idx].notified();
             tokio::pin!(notified);
@@ -1107,11 +1138,15 @@ impl UploadResponseService {
                 min_consumed = min_consumed.unwrap_or(0),
                 "waiting for upload-response reader capacity"
             );
-            timeout_at(deadline, notified).await.map_err(|_| {
-                format!(
-                    "{lane} buffer capacity wait timed out for stream {stream_id} before slot {next_slot}"
-                )
-            })?;
+            if let Some(deadline) = deadline {
+                timeout_at(deadline, notified).await.map_err(|_| {
+                    format!(
+                        "{lane} buffer capacity wait timed out for stream {stream_id} before slot {next_slot}"
+                    )
+                })?;
+            } else {
+                notified.await;
+            }
         }
     }
 
@@ -2226,6 +2261,11 @@ impl UploadResponseService {
     /// Get the independent timeout policy.
     pub fn timeouts(&self) -> &UploadResponseTimeouts {
         &self.timeouts
+    }
+
+    /// Return the cache backpressure policy.
+    pub fn backpressure(&self) -> UploadResponseBackpressure {
+        self.backpressure
     }
 
     /// Get the response channels map for the watcher
@@ -5181,6 +5221,137 @@ mod tests {
         );
 
         upload_stream.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reliable_backpressure_waits_for_slowest_reader() {
+        let config = UploadResponseConfig {
+            num_streams: 1,
+            slots_per_stream: 2,
+            ..Default::default()
+        };
+        let service = Arc::new(UploadResponseService::new_with_backpressure(
+            config,
+            UploadResponseTimeouts {
+                reader_backpressure_timeout_ms: 10,
+                ..Default::default()
+            },
+            UploadResponseBackpressure::Reliable,
+        ));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+        assert!(service.register_response_reader(stream_id, "fast").await);
+        assert!(service.register_response_reader(stream_id, "slow").await);
+        service
+            .write_response_headers(
+                stream_id,
+                StreamHeaders::Response(StreamResponseHeaders {
+                    stream_id,
+                    version: http_pack::HttpVersion::Http11,
+                    status: 200,
+                    headers: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        service
+            .append_response_body(stream_id, Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+
+        let append_service = Arc::clone(&service);
+        let append = tokio::spawn(async move {
+            append_service
+                .append_response_body(stream_id, Bytes::from_static(b"b"))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            service
+                .mark_response_reader_position(stream_id, "fast", 1)
+                .await
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!append.is_finished());
+        assert!(service.response_get(stream_id, 1).await.is_some());
+        assert!(
+            service
+                .mark_response_reader_position(stream_id, "slow", 1)
+                .await
+        );
+        append.await.unwrap().unwrap();
+        assert_eq!(
+            service.response_get(stream_id, 3).await,
+            Some(Bytes::from_static(b"b"))
+        );
+
+        upload_stream.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reliable_backpressure_waits_for_reader_registration_and_wakes_on_close() {
+        let service = Arc::new(UploadResponseService::new_with_backpressure(
+            UploadResponseConfig {
+                num_streams: 1,
+                slots_per_stream: 2,
+                ..Default::default()
+            },
+            UploadResponseTimeouts {
+                reader_backpressure_timeout_ms: 10,
+                ..Default::default()
+            },
+            UploadResponseBackpressure::Reliable,
+        ));
+        let upload_stream = service.open_stream().await.unwrap();
+        let stream_id = upload_stream.stream_id();
+        service
+            .write_stage_head(stream_id, "pcm", Bytes::from_static(b"head"))
+            .await
+            .unwrap();
+        service
+            .append_stage_body(stream_id, "pcm", Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+
+        let append_service = Arc::clone(&service);
+        let append = tokio::spawn(async move {
+            append_service
+                .append_stage_body(stream_id, "pcm", Bytes::from_static(b"b"))
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!append.is_finished());
+        assert_eq!(
+            service.stage_get(stream_id, "pcm", 1).await,
+            Some(Bytes::from_static(b"head"))
+        );
+        assert!(
+            service
+                .register_stage_reader(stream_id, "pcm", "consumer")
+                .await
+        );
+        assert!(
+            service
+                .mark_stage_reader_position(stream_id, "pcm", "consumer", 1)
+                .await
+        );
+        append.await.unwrap().unwrap();
+
+        let append_service = Arc::clone(&service);
+        let blocked = tokio::spawn(async move {
+            append_service
+                .append_stage_body(stream_id, "pcm", Bytes::from_static(b"c"))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        upload_stream.close().await;
+        assert!(blocked
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("stream closed"));
     }
 
     #[tokio::test]

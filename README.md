@@ -340,6 +340,7 @@ let config = UploadResponseConfig {
 
 let capacity = config.validate()?;
 let timeouts = UploadResponseTimeouts {
+    response_claim_lease_ms: 30_000,
     response_deadline_ms: 30_000,
     response_idle_timeout_ms: 30_000,
     reader_backpressure_timeout_ms: 5_000,
@@ -354,6 +355,28 @@ Validation includes the request lane, response lane, and all 16 possible stage l
 `UploadResponseService::new` remains available as a compatibility wrapper. It panics when capacity validation fails.
 
 The compatibility constructors map `response_timeout_ms` to the response, streaming-idle, backpressure, and admission waits. Remote worker requests retain their previous 60-second default.
+
+### Reliable backpressure
+
+Use `UploadResponseBackpressure::Reliable` to pause writers when a cache lane is full:
+
+```rust
+use upload_response::{UploadResponseBackpressure, UploadResponseService};
+
+let service = UploadResponseService::try_new_with_backpressure(
+    config,
+    timeouts,
+    UploadResponseBackpressure::Reliable,
+)?;
+```
+
+The policy applies to request, response, and stage lanes. A writer waits for the slowest registered reader before it reuses a slot. The ring reuses consumed slots. It never overwrites unread slots. A writer also waits when the ring is full and no reader is registered. Reader progress, reader registration, or stream closure wakes the writer.
+
+The default `Timed` policy returns an error after `reader_backpressure_timeout_ms`. The `Reliable` policy has no cache capacity deadline. A reader must report its slot position to let writers continue. Response delivery and transport deadlines still apply.
+
+Buffered response delivery has a body limit of `slot_bytes * slots_per_stream`. Use streaming response delivery for larger responses.
+
+This policy controls cache writes. TCP and SRT receive loops wait for cache writes. `UdpFecIngest` rejects the `Reliable` policy at startup. The pure Rust RIST receive queue can overflow during a long wait.
 
 ### Slot Size Selection
 

@@ -33,7 +33,10 @@ async fn active_streams_are_ordered_by_arrival() {
         .iter()
         .map(|stream| stream.stream_id)
         .collect();
-    assert_eq!(seen, ids, "streams should come back in the order they opened");
+    assert_eq!(
+        seen, ids,
+        "streams should come back in the order they opened"
+    );
 
     // Close the middle one and open another. Its slot is the freshest on the
     // free stack, so the newcomer lands in the middle of the ring while being

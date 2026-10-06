@@ -180,8 +180,9 @@ fn load_tls(args: &Args) -> Result<(String, String)> {
                 key.display()
             )
         }),
-        (None, None) => load_default_tls_base64()
-            .context("failed to load generated local TLS files"),
+        (None, None) => {
+            load_default_tls_base64().context("failed to load generated local TLS files")
+        }
         _ => bail!("--cert and --key must be provided together"),
     }
 }

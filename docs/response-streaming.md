@@ -54,13 +54,14 @@ responses have no such cap.
 ## Backpressure
 
 The response ring decouples the worker from the client. `wait_for_reader_capacity`
-returns immediately while `next_slot <= slots_per_stream`
-(`upload-response/src/lib.rs:1006`), so a worker can run a **full ring ahead** —
+returns immediately while `next_slot <= slots_per_stream`, so a worker can run a **full ring ahead** —
 1024 slots by default — without ever waiting on the peer. Client speed does not
 enter into it until then.
 
 Only when the worker would overwrite a slot the slowest registered reader has
-not yet consumed does it wait, bounded by `reader_backpressure_timeout_ms`.
+not yet consumed does it wait. The default `Timed` policy uses
+`reader_backpressure_timeout_ms`. The `Reliable` policy waits until the reader
+consumes the slot or the stream closes.
 That is a bounded buffer doing its job rather than the worker tracking the
 client: reaching that point means the client is already more than one whole ring
 behind, and continuing would destroy data the reader still needs.

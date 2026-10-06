@@ -1,6 +1,6 @@
 //! UDP ingest integration for the reusable `raptorq-datagram-fec` protocol crate.
 
-use crate::{UploadResponseService, UploadStream};
+use crate::{UploadResponseBackpressure, UploadResponseService, UploadStream};
 use bytes::Bytes;
 use http_pack::stream::{StreamHeaders, StreamRequestHeaders};
 use http_pack::{HeaderField, HttpVersion};
@@ -38,6 +38,13 @@ impl UdpFecIngest {
         self,
         addr: SocketAddr,
     ) -> Result<watch::Sender<()>, Box<dyn std::error::Error + Send + Sync>> {
+        if self.service.backpressure() == UploadResponseBackpressure::Reliable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "UDP+FEC ingest does not support reliable backpressure",
+            )
+            .into());
+        }
         let (shutdown_tx, mut shutdown_rx) = watch::channel(());
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         let service = self.service;
@@ -79,6 +86,29 @@ impl UdpFecIngest {
         });
 
         Ok(shutdown_tx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{UploadResponseConfig, UploadResponseTimeouts};
+
+    #[tokio::test]
+    async fn udp_fec_rejects_reliable_backpressure() {
+        let service = Arc::new(UploadResponseService::new_with_backpressure(
+            UploadResponseConfig::default(),
+            UploadResponseTimeouts::default(),
+            UploadResponseBackpressure::Reliable,
+        ));
+        let error = match UdpFecIngest::new(service)
+            .start(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+        {
+            Ok(_) => panic!("UDP+FEC accepted reliable backpressure"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not support reliable"));
     }
 }
 
