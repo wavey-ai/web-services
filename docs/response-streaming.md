@@ -77,6 +77,11 @@ rather than overwriting, while `register_response_reader` calls
 `notify_waiters()` to wake the blocked writer — with the wait armed before the
 check, so the wakeup cannot be missed.
 
+**Transport.** On the HTTP/1.1+HTTP/2 listener, the handler runs inside the
+response body, on the task that serves the stream. The writer holds one chunk.
+`send_data` waits until hyper takes the previous chunk. hyper takes a chunk only
+when it can send or buffer it. A handler is at most one chunk ahead of hyper.
+
 **Sizing.** A producer writing one slot per unit of output exhausts the ring
 after `slots_per_stream` writes and paces to the client for the remainder. For
 incremental output such as token generation, either size the ring for the
@@ -119,9 +124,9 @@ without finishing is reporting failure.
 
 Enforced per backend:
 
-- `h2.rs` — `H2ResponseBody` carries a real error type; the body yields `Err`
-  when the writer's channel closes without the completion flag set, and hyper
-  resets the stream.
+- `h2.rs` and `stream_response.rs` — The response body owns the handler and
+  polls it. The body yields `Err` when the writer is dropped before `finish`.
+  hyper then resets the stream.
 - `h3.rs` — `H3StreamWriter::drop` calls `stop_stream(Code::H3_INTERNAL_ERROR)`.
   `handle_h3_body_stream_request` resets rather than finishes on handler error.
 - `h3_tokio_quiche.rs` — `TokioQuicheStreamWriter::drop` sends
@@ -143,6 +148,11 @@ had to land before streaming egress, not after.
   body as complete; the h2 case asserts specifically on `RST_STREAM` /
   `INTERNAL_ERROR`. `streaming_handler_that_finishes_delivers_a_complete_body`
   is the control that keeps those honest.
+- `web-service/tests/h2_streaming.rs` — runs each case over HTTP/1.1 and
+  HTTP/2 against a TLS listener. The cases are head and body order,
+  backpressure on a stalled client, reset of an unfinished body, failure and
+  panic before the head, client disconnect, the request permit, shutdown, and
+  a request body echoed while the response streams.
 - `upload-response/tests/worker_integration.rs` —
   `router_streams_response_slots_as_the_worker_produces_them` gates each worker
   chunk on the previous one reaching the peer, so a buffering egress deadlocks

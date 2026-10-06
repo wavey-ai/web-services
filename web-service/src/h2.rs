@@ -3,17 +3,17 @@ use crate::{
     error::{H2Error, ServerError, ServerResult},
     http_range::apply_byte_range,
     request_limit::{Admission, RequestLimiter, RequestPermit},
+    stream_response::{self, Detached, HandlerFuture},
     traits::{
         response_header_name, response_header_value, BodyStream, HandlerResponse, Router,
         StartupSender, StreamWriter,
     },
 };
 use bytes::Bytes;
-use futures_util::stream::unfold;
 use http::header::{HeaderName, HeaderValue, RANGE};
 use http::{Response, StatusCode};
-use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
-use hyper::body::{Body as _, Frame, Incoming};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use hyper::body::{Body as _, Incoming};
 use hyper::server::conn::http1;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
@@ -26,16 +26,13 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex as StdMutex, Once,
-    },
+    sync::{Arc, Mutex as StdMutex, Once},
     task::{Context, Poll},
 };
 use tls_helpers::{certs_from_base64, privkey_from_base64, tls_acceptor_from_base64};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration, Instant};
 use tokio_rustls::TlsAcceptor;
@@ -43,7 +40,7 @@ use tokio_tungstenite::{
     tungstenite::{handshake::derive_accept_key, protocol::Role},
     WebSocketStream,
 };
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, info_span, trace, Instrument, Span};
 
 const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
@@ -79,77 +76,15 @@ pub struct Http2Server {
     request_limit: Arc<RequestLimiter>,
 }
 
-type H2ResponseBody = BoxBody<Bytes, ServerError>;
+/// Not `Sync`: a streaming body owns its handler future.
+type H2ResponseBody = UnsyncBoxBody<Bytes, ServerError>;
 type ConnectionPermitSlot = Arc<StdMutex<Option<OwnedSemaphorePermit>>>;
 
 /// Wrap a fully buffered body in the fallible body type shared with streaming responses.
 fn buffered_body(bytes: Bytes) -> H2ResponseBody {
     Full::new(bytes)
         .map_err(|never: Infallible| match never {})
-        .boxed()
-}
-
-struct H2StreamWriter {
-    response_tx: Option<oneshot::Sender<Result<Response<()>, ServerError>>>,
-    data_tx: Option<mpsc::Sender<Bytes>>,
-    completed: Arc<AtomicBool>,
-}
-
-struct H2StreamBodyState {
-    data_rx: mpsc::Receiver<Bytes>,
-    handler_cancellation: CancellationToken,
-    /// Set only by `StreamWriter::finish`. A closed body channel with this
-    /// unset means the handler stopped early, so the stream must be reset
-    /// rather than ended cleanly.
-    completed: Arc<AtomicBool>,
-}
-
-impl Drop for H2StreamBodyState {
-    fn drop(&mut self) {
-        self.handler_cancellation.cancel();
-    }
-}
-
-impl H2StreamWriter {
-    fn new(
-        response_tx: oneshot::Sender<Result<Response<()>, ServerError>>,
-        data_tx: mpsc::Sender<Bytes>,
-        completed: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            response_tx: Some(response_tx),
-            data_tx: Some(data_tx),
-            completed,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl StreamWriter for H2StreamWriter {
-    async fn send_response(&mut self, response: Response<()>) -> Result<(), ServerError> {
-        let tx = self
-            .response_tx
-            .take()
-            .ok_or_else(|| ServerError::Config("stream response already sent".into()))?;
-        tx.send(Ok(response))
-            .map_err(|_| ServerError::Config("failed to send stream response head".into()))
-    }
-
-    async fn send_data(&mut self, data: Bytes) -> Result<(), ServerError> {
-        let tx = self
-            .data_tx
-            .as_ref()
-            .ok_or_else(|| ServerError::Config("stream already finished".into()))?;
-        tx.send(data)
-            .await
-            .map_err(|_| ServerError::Config("failed to send stream body chunk".into()))
-    }
-
-    async fn finish(&mut self) -> Result<(), ServerError> {
-        self.completed.store(true, Ordering::Release);
-        self.data_tx.take();
-        Ok(())
-    }
+        .boxed_unsync()
 }
 
 impl Http2Server {
@@ -243,8 +178,7 @@ impl Http2Server {
                 Duration::from_millis(self.config.request_queue_timeout_ms),
                 &self.config.limit_exempt_paths,
             ),
-            detached_tasks: TaskTracker::new(),
-            detached_shutdown: CancellationToken::new(),
+            detached: Arc::new(Detached::new()),
             draining: CancellationToken::new(),
         });
 
@@ -310,8 +244,8 @@ impl Http2Server {
                 while let Some(result) = connection_tasks.join_next().await {
                     log_connection_task(result);
                 }
-                shared.detached_tasks.close();
-                shared.detached_tasks.wait().await;
+                shared.detached.tasks.close();
+                shared.detached.tasks.wait().await;
             })
             .await;
             if drained.is_err() {
@@ -321,10 +255,13 @@ impl Http2Server {
                 );
             }
         }
-        shared.detached_shutdown.cancel();
+        shared.detached.shutdown.cancel();
+        // Closing a connection drops the streaming responses it serves, and with them their
+        // handlers. On HTTP/2 hyper drops them on its per-stream tasks, which the wait below
+        // covers: every streaming response counts as a detached task until it is dropped.
         connection_tasks.shutdown().await;
-        shared.detached_tasks.close();
-        shared.detached_tasks.wait().await;
+        shared.detached.tasks.close();
+        shared.detached.tasks.wait().await;
 
         Ok(())
     }
@@ -363,10 +300,8 @@ struct Listener {
     max_unread_body_bytes: u64,
     router: Arc<dyn Router>,
     admission: Admission,
-    /// Streaming handlers and WebSocket sessions, which outlive the request that started them.
-    detached_tasks: TaskTracker,
-    /// Cancelled when the server stops: detached tasks end.
-    detached_shutdown: CancellationToken,
+    /// WebSocket sessions and streaming responses.
+    detached: Arc<Detached>,
     /// Cancelled when a shutdown drain starts: connections finish what they serve, then close.
     draining: CancellationToken,
 }
@@ -507,8 +442,7 @@ impl Listener {
                 self.max_unread_body_bytes,
                 request_permit,
                 connection_permit,
-                self.detached_tasks.clone(),
-                self.detached_shutdown.clone(),
+                &self.detached,
             )
             .await
             {
@@ -629,8 +563,7 @@ async fn handle_h2_request(
     max_unread_body_bytes: u64,
     request_permit: RequestPermit,
     connection_permit: ConnectionPermitSlot,
-    detached_tasks: TaskTracker,
-    detached_shutdown: CancellationToken,
+    detached: &Arc<Detached>,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
     if enable_websocket && is_websocket_upgrade(&req) {
         if let Some(key) = req.headers().get("sec-websocket-key") {
@@ -698,8 +631,9 @@ async fn handle_h2_request(
                     Err(e) => error!("WebSocket upgrade failed: {}", e),
                 }
             };
+            let detached_shutdown = detached.shutdown.clone();
             drop(
-                detached_tasks.spawn(
+                detached.tasks.spawn(
                     async move {
                         let _request_permit = request_permit;
                         let _connection_permit = websocket_connection_permit;
@@ -741,27 +675,12 @@ async fn handle_h2_request(
     if router.has_body_stream_handler(parts.uri.path()) {
         let stream = incoming_body_stream(body, drain_unread);
         let req = http::Request::from_parts(parts, ());
-        return handle_h2_body_stream(
-            req,
-            stream,
-            router,
-            request_permit,
-            detached_tasks,
-            detached_shutdown,
-        )
-        .await;
+        return handle_h2_body_stream(req, stream, router, request_permit, detached).await;
     }
 
     if router.is_streaming(parts.uri.path()) {
         let req = http::Request::from_parts(parts, ());
-        return handle_h2_stream(
-            req,
-            router,
-            request_permit,
-            detached_tasks,
-            detached_shutdown,
-        )
-        .await;
+        return handle_h2_stream(req, router, request_permit, detached).await;
     }
 
     if router.has_body_handler(parts.uri.path()) {
@@ -912,42 +831,12 @@ async fn handle_h2_stream(
     req: http::Request<()>,
     router: Arc<dyn Router>,
     request_permit: RequestPermit,
-    detached_tasks: TaskTracker,
-    detached_shutdown: CancellationToken,
+    detached: &Arc<Detached>,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
-    let (response_tx, response_rx) = oneshot::channel();
-    let (data_tx, data_rx) = mpsc::channel(32);
-    let handler_cancellation = CancellationToken::new();
-    let task_cancellation = handler_cancellation.clone();
-    let completed = Arc::new(AtomicBool::new(false));
-    let writer_completed = Arc::clone(&completed);
-    drop(
-        detached_tasks.spawn(
-            async move {
-                let _request_permit = request_permit;
-                let writer = H2StreamWriter::new(response_tx, data_tx, writer_completed);
-                tokio::select! {
-                    _ = detached_shutdown.cancelled() => {}
-                    _ = task_cancellation.cancelled() => {}
-                    result = router.route_stream(req, Box::new(writer)) => {
-                        if let Err(err) = result {
-                            error!("streaming handler error: {}", err);
-                        }
-                    }
-                }
-            }
-            .instrument(Span::current()),
-        ),
-    );
-    await_h2_stream_response(
-        response_rx,
-        H2StreamBodyState {
-            data_rx,
-            handler_cancellation,
-            completed,
-        },
-    )
-    .await
+    let start = move |writer: Box<dyn StreamWriter>| -> HandlerFuture {
+        Box::pin(async move { router.route_stream(req, writer).await })
+    };
+    streaming_response(start, "streaming handler", request_permit, detached).await
 }
 
 async fn handle_h2_body_stream(
@@ -955,58 +844,26 @@ async fn handle_h2_body_stream(
     body: BodyStream,
     router: Arc<dyn Router>,
     request_permit: RequestPermit,
-    detached_tasks: TaskTracker,
-    detached_shutdown: CancellationToken,
+    detached: &Arc<Detached>,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
-    let (response_tx, response_rx) = oneshot::channel();
-    let (data_tx, data_rx) = mpsc::channel(32);
-    let handler_cancellation = CancellationToken::new();
-    let task_cancellation = handler_cancellation.clone();
-    let completed = Arc::new(AtomicBool::new(false));
-    let writer_completed = Arc::clone(&completed);
-    drop(
-        detached_tasks.spawn(
-            async move {
-                let _request_permit = request_permit;
-                let writer = H2StreamWriter::new(response_tx, data_tx, writer_completed);
-                tokio::select! {
-                    _ = detached_shutdown.cancelled() => {}
-                    _ = task_cancellation.cancelled() => {}
-                    result = router.route_body_stream(req, body, Box::new(writer)) => {
-                        if let Err(err) = result {
-                            error!("streaming body handler error: {}", err);
-                        }
-                    }
-                }
-            }
-            .instrument(Span::current()),
-        ),
-    );
-    await_h2_stream_response(
-        response_rx,
-        H2StreamBodyState {
-            data_rx,
-            handler_cancellation,
-            completed,
-        },
-    )
-    .await
+    let start = move |writer: Box<dyn StreamWriter>| -> HandlerFuture {
+        Box::pin(async move { router.route_body_stream(req, body, writer).await })
+    };
+    streaming_response(start, "streaming body handler", request_permit, detached).await
 }
 
-async fn await_h2_stream_response(
-    response_rx: oneshot::Receiver<Result<Response<()>, ServerError>>,
-    body_state: H2StreamBodyState,
+async fn streaming_response(
+    start: impl FnOnce(Box<dyn StreamWriter>) -> HandlerFuture,
+    label: &'static str,
+    request_permit: RequestPermit,
+    detached: &Arc<Detached>,
 ) -> Result<Response<H2ResponseBody>, H2Error> {
-    let response = match response_rx.await {
-        Ok(Ok(response)) => response,
-        Ok(Err(err)) => return Err(H2Error::Router(err)),
-        Err(_) => {
-            return Err(H2Error::Router(ServerError::Config(
-                "stream handler finished before sending response".into(),
-            )));
-        }
-    };
-    build_streaming_response(response, body_state)
+    let response = stream_response::respond(start, label, request_permit, detached)
+        .await
+        .map_err(H2Error::Router)?;
+    let mut response = response.map(BodyExt::boxed_unsync);
+    add_cors_headers(&mut response);
+    Ok(response)
 }
 
 fn build_buffered_response(
@@ -1040,32 +897,6 @@ fn build_buffered_response(
 
     add_cors_headers(&mut response);
 
-    Ok(response)
-}
-
-fn build_streaming_response(
-    response_head: Response<()>,
-    body_state: H2StreamBodyState,
-) -> Result<Response<H2ResponseBody>, H2Error> {
-    let (parts, ()) = response_head.into_parts();
-    let body_stream = unfold(Some(body_state), |state| async move {
-        let mut state = state?;
-        match state.data_rx.recv().await {
-            Some(chunk) => Some((Ok(Frame::data(chunk)), Some(state))),
-            // The handler dropped its writer without calling `finish`, so the
-            // body is short. Fail the body to reset the stream instead of
-            // letting the peer read a truncated response as a complete one.
-            None if !state.completed.load(Ordering::Acquire) => Some((
-                Err(ServerError::Config(
-                    "streaming response ended before the handler finished".into(),
-                )),
-                None,
-            )),
-            None => None,
-        }
-    });
-    let mut response = Response::from_parts(parts, StreamBody::new(body_stream).boxed());
-    add_cors_headers(&mut response);
     Ok(response)
 }
 

@@ -13,6 +13,7 @@ pub mod raw_tcp;
 mod request_limit;
 pub mod server;
 pub mod static_files;
+mod stream_response;
 pub mod tls;
 pub mod traits;
 
