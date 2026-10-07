@@ -6,7 +6,7 @@ use crate::{
     traits::{RawStream, RawTcpHandler, StartupSender},
 };
 use bytes::Bytes;
-use std::io;
+use std::io::{self, IoSlice};
 use std::{net::SocketAddr, sync::Arc};
 use tls_helpers::tls_acceptor_from_base64;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -77,11 +77,20 @@ where
 {
     let response_len = u32::try_from(payload.len())
         .map_err(|_| ServerError::Config("raw TCP response too large for u32 frame".into()))?;
-    stream
-        .write_all(&response_len.to_be_bytes())
-        .await
-        .map_err(ServerError::Io)?;
-    stream.write_all(payload).await.map_err(ServerError::Io)?;
+    // One vectored write for prefix and payload: two writes would leave as two segments.
+    let prefix = response_len.to_be_bytes();
+    let mut slices = [IoSlice::new(&prefix), IoSlice::new(payload)];
+    let mut remaining: &mut [IoSlice<'_>] = &mut slices;
+    while !remaining.is_empty() {
+        let written = stream
+            .write_vectored(remaining)
+            .await
+            .map_err(ServerError::Io)?;
+        if written == 0 {
+            return Err(ServerError::Io(io::ErrorKind::WriteZero.into()));
+        }
+        IoSlice::advance_slices(&mut remaining, written);
+    }
     stream.flush().await.map_err(ServerError::Io)
 }
 
@@ -302,5 +311,77 @@ mod tests {
             Some(bytes::Bytes::from_static(b"response"))
         );
         writer.await.unwrap();
+    }
+
+    /// Records each write; takes at most `limit` bytes per write.
+    struct Recorder {
+        writes: Vec<Vec<u8>>,
+        limit: usize,
+    }
+
+    impl tokio::io::AsyncWrite for Recorder {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let n = buf.len().min(self.limit);
+            self.writes.push(buf[..n].to_vec());
+            std::task::Poll::Ready(Ok(n))
+        }
+
+        fn poll_write_vectored(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let mut write = Vec::new();
+            for buf in bufs {
+                let n = buf.len().min(self.limit - write.len());
+                write.extend_from_slice(&buf[..n]);
+            }
+            let n = write.len();
+            self.writes.push(write);
+            std::task::Poll::Ready(Ok(n))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_goes_out_in_one_write_and_survives_partial_writes() {
+        let mut whole = Recorder {
+            writes: Vec::new(),
+            limit: usize::MAX,
+        };
+        write_length_prefixed_frame(&mut whole, b"response")
+            .await
+            .unwrap();
+        assert_eq!(whole.writes, vec![frame(b"response")]);
+
+        let mut partial = Recorder {
+            writes: Vec::new(),
+            limit: 3,
+        };
+        write_length_prefixed_frame(&mut partial, b"response")
+            .await
+            .unwrap();
+        assert_eq!(partial.writes.concat(), frame(b"response"));
     }
 }

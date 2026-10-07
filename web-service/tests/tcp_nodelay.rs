@@ -4,7 +4,8 @@
 //! prefix and then a payload. With Nagle's algorithm on, each small write after the first
 //! waits for the ACK of the one before it, and a client that delays its ACK adds about 40 ms
 //! per exchange. With `TCP_NODELAY` on the accepted socket, an exchange on loopback takes a
-//! few milliseconds.
+//! few milliseconds. HTTP/2 output is batched below TLS instead; a test here checks that many
+//! concurrent streams still arrive intact.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -27,6 +28,8 @@ use web_service::{
 };
 
 /// Well under the 40 ms of a delayed ACK, and well over a loopback exchange.
+const LARGE_CHUNK: usize = 16 * 1024;
+const LARGE_CHUNKS: usize = 64;
 const EXCHANGE_LIMIT: Duration = Duration::from_millis(20);
 /// Enough exchanges for a Linux client to leave its quick-ACK mode and delay its ACKs. The
 /// median is compared with the limit, so that a scheduling pause on a busy test machine does
@@ -44,14 +47,23 @@ impl Router for TwoWrites {
     }
 
     fn is_streaming(&self, path: &str) -> bool {
-        path == "/two-writes"
+        path == "/two-writes" || path == "/large"
     }
 
     async fn route_stream(
         &self,
-        _req: Request<()>,
+        req: Request<()>,
         mut writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()> {
+        if req.uri().path() == "/large" {
+            writer.send_response(Response::new(())).await?;
+            for index in 0..LARGE_CHUNKS {
+                writer
+                    .send_data(Bytes::from(vec![index as u8; LARGE_CHUNK]))
+                    .await?;
+            }
+            return writer.finish().await;
+        }
         writer.send_response(Response::new(())).await?;
         writer.send_data(Bytes::from_static(b"first;")).await?;
         tokio::time::sleep(Duration::from_millis(2)).await;
@@ -230,6 +242,46 @@ async fn http2_responses_in_several_writes_arrive_without_delay() {
         exchanges.push(started.elapsed());
     }
     assert_fast(exchanges, "HTTP/2");
+    connection.abort();
+    server.stop().await;
+}
+
+/// HTTP/2 output is batched below TLS. Many concurrent streams of many frames arrive intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn http2_streams_through_batched_writes_arrive_intact() {
+    let server = start().await;
+    let io = TokioIo::new(server.tls(b"h2").await);
+    let (sender, connection) =
+        hyper::client::conn::http2::handshake::<_, _, Empty<Bytes>>(TokioExecutor::new(), io)
+            .await
+            .unwrap();
+    let connection = tokio::spawn(connection);
+    let mut streams = Vec::new();
+    for _ in 0..32 {
+        let mut sender = sender.clone();
+        streams.push(tokio::spawn(async move {
+            sender.ready().await.unwrap();
+            let response = sender
+                .send_request(
+                    Request::get("https://localhost/large")
+                        .body(Empty::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            response.into_body().collect().await.unwrap().to_bytes()
+        }));
+    }
+    for stream in streams {
+        let body = tokio::time::timeout(Duration::from_secs(30), stream)
+            .await
+            .expect("a stream stalled")
+            .unwrap();
+        assert_eq!(body.len(), LARGE_CHUNK * LARGE_CHUNKS);
+        for (index, chunk) in body.chunks(LARGE_CHUNK).enumerate() {
+            assert!(chunk.iter().all(|byte| *byte == index as u8));
+        }
+    }
     connection.abort();
     server.stop().await;
 }
