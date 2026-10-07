@@ -1,0 +1,32 @@
+[package]
+name = "wsb-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A standalone workspace, so that the build of the code under test does not
+# depend on any other workspace.
+[workspace]
+
+[dependencies]
+# run.sh copies this crate to build/<label>/server and replaces @WS_SRC@ with the
+# absolute path of the web-services source tree under test.
+av-web-service = { path = "@WS_SRC@/web-service" }
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+http = "1"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha2 = "0.11"
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+
+# The same settings as the web-services workspace release profile. Line tables
+# are kept so that a profiler can resolve symbols; they do not change codegen.
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+debug = "line-tables-only"
+strip = false

@@ -1,0 +1,271 @@
+scenario,tree,metric,n,median,min,max
+h2short-c10000-pc16,main,streams/s,3,433096.81355971657,431751.8391676386,433172.3265073369
+h2short-c10000-pc16,main,GiB/s,3,26.43260408816801,26.352709378488942,26.438664333180267
+h2short-c10000-pc16,main,TTFB p50 ms,3,3.423,3.341,3.546
+h2short-c10000-pc16,main,TTFB p99 ms,3,11.115,10.485,11.333
+h2short-c10000-pc16,main,TTFB p99.9 ms,3,14.901,13.823,27.326
+h2short-c10000-pc16,main,TTLB p50 ms,3,7.735,7.731,7.995
+h2short-c10000-pc16,main,TTLB p99 ms,3,51.028,51.006,51.643
+h2short-c10000-pc16,main,TTLB p99.9 ms,3,55.068,54.338,61.71
+h2short-c10000-pc16,main,srv CPU us/stream,3,54.35502993013608,54.34642080105793,54.52153226422918
+h2short-c10000-pc16,main,srv cores busy,3,23.540990263684957,23.539771829318695,23.541365535740994
+h2short-c10000-pc16,main,srv ctxsw/stream,3,0.10785132629277068,0.1067662572011647,0.1082283511660999
+h2short-c10000-pc16,main,srv peak RSS MiB,3,188.99609375,188.3203125,190.734375
+h2short-c10000-pc16,main,errors,3,0,0,0
+h2short-c10000-pc16,main,timeouts,3,0,0,0
+h2short-c10000-pc16,main,client CPU %,3,77.53412971355449,77.00446670569484,78.17743038646418
+h2short-c10000-pc16,listener-nodelay,streams/s,3,357430.7183951917,353111.1295614355,359538.4782934831
+h2short-c10000-pc16,listener-nodelay,GiB/s,3,21.813053195303468,21.550091611970615,21.941897495347746
+h2short-c10000-pc16,listener-nodelay,TTFB p50 ms,3,27.493,27.424,27.939
+h2short-c10000-pc16,listener-nodelay,TTFB p99 ms,3,50.01,49.238,50.584
+h2short-c10000-pc16,listener-nodelay,TTFB p99.9 ms,3,58.174,57.309,59.582
+h2short-c10000-pc16,listener-nodelay,TTLB p50 ms,3,27.826,27.758,28.269
+h2short-c10000-pc16,listener-nodelay,TTLB p99 ms,3,50.35,49.574,50.919
+h2short-c10000-pc16,listener-nodelay,TTLB p99.9 ms,3,58.55,57.641,59.915
+h2short-c10000-pc16,listener-nodelay,srv CPU us/stream,3,65.28391170723081,65.02671500067872,65.86715600654027
+h2short-c10000-pc16,listener-nodelay,srv cores busy,3,23.334475461163773,23.258425858468723,23.379606159768038
+h2short-c10000-pc16,listener-nodelay,srv ctxsw/stream,3,0.22896348219661952,0.22077149717495265,0.27958931023866646
+h2short-c10000-pc16,listener-nodelay,srv peak RSS MiB,3,203.1953125,200.78125,204.39453125
+h2short-c10000-pc16,listener-nodelay,errors,3,0,0,0
+h2short-c10000-pc16,listener-nodelay,timeouts,3,0,0,0
+h2short-c10000-pc16,listener-nodelay,client CPU %,3,72.09764855114422,70.53735706044887,72.37806809181731
+h2short-c10000-pc16,inline-streaming-nodelay,streams/s,3,359293.55649444455,358083.5291280734,359365.4218073742
+h2short-c10000-pc16,inline-streaming-nodelay,GiB/s,3,21.926908984346774,21.852947958651722,21.931882828283182
+h2short-c10000-pc16,inline-streaming-nodelay,TTFB p50 ms,3,25.51,25.507,25.537
+h2short-c10000-pc16,inline-streaming-nodelay,TTFB p99 ms,3,73.491,72.835,74.608
+h2short-c10000-pc16,inline-streaming-nodelay,TTFB p99.9 ms,3,92.514,90.465,94.445
+h2short-c10000-pc16,inline-streaming-nodelay,TTLB p50 ms,3,25.968,25.96,25.99
+h2short-c10000-pc16,inline-streaming-nodelay,TTLB p99 ms,3,73.977,73.335,75.094
+h2short-c10000-pc16,inline-streaming-nodelay,TTLB p99.9 ms,3,93.032,90.901,94.953
+h2short-c10000-pc16,inline-streaming-nodelay,srv CPU us/stream,3,65.17943830333046,65.1662147574092,65.41907813925273
+h2short-c10000-pc16,inline-streaming-nodelay,srv cores busy,3,23.418552198313822,23.418484253886287,23.425494372408814
+h2short-c10000-pc16,inline-streaming-nodelay,srv ctxsw/stream,3,0.2953780578319543,0.29470397578985813,0.29717097328997943
+h2short-c10000-pc16,inline-streaming-nodelay,srv peak RSS MiB,3,584.515625,579.19921875,590.19921875
+h2short-c10000-pc16,inline-streaming-nodelay,errors,3,0,0,0
+h2short-c10000-pc16,inline-streaming-nodelay,timeouts,3,0,0,0
+h2short-c10000-pc16,inline-streaming-nodelay,client CPU %,3,69.07732778510103,68.85500394915489,69.12736075741354
+h2short-c10000-pc32,main,streams/s,3,422222.06737384934,421094.0259137388,422803.22126396495
+h2short-c10000-pc32,main,GiB/s,3,25.768436511611256,25.693718739076964,25.801291684353302
+h2short-c10000-pc32,main,TTFB p50 ms,3,4.367,4.263,4.476
+h2short-c10000-pc32,main,TTFB p99 ms,3,14.076,13.452,14.216
+h2short-c10000-pc32,main,TTFB p99.9 ms,3,18.737,17.655,19.093
+h2short-c10000-pc32,main,TTLB p50 ms,3,9.965,9.735,10.041
+h2short-c10000-pc32,main,TTLB p99 ms,3,54.503,54.051,54.91
+h2short-c10000-pc32,main,TTLB p99.9 ms,3,59.087,58.076,59.288
+h2short-c10000-pc32,main,srv CPU us/stream,3,55.54568603067448,55.40307737578364,55.62271553802271
+h2short-c10000-pc32,main,srv cores busy,3,23.42459958241802,23.422393218160657,23.452614389570122
+h2short-c10000-pc32,main,srv ctxsw/stream,3,0.14477773601481517,0.13659288209865578,0.14532253812483523
+h2short-c10000-pc32,main,srv peak RSS MiB,3,167.87890625,163.65625,171.4140625
+h2short-c10000-pc32,main,errors,3,0,0,0
+h2short-c10000-pc32,main,timeouts,3,0,0,0
+h2short-c10000-pc32,main,client CPU %,3,77.27039521853706,77.07109153075683,77.42609248449523
+h2short-c10000-pc32,listener-nodelay,streams/s,3,344506.0074892305,340954.32234031585,344898.4669472102
+h2short-c10000-pc32,listener-nodelay,GiB/s,3,21.025058224806,20.806676597786733,21.04844894076902
+h2short-c10000-pc32,listener-nodelay,TTFB p50 ms,3,27.925,27.874,28.183
+h2short-c10000-pc32,listener-nodelay,TTFB p99 ms,3,52.738,52.435,53.251
+h2short-c10000-pc32,listener-nodelay,TTFB p99.9 ms,3,62.734,62.123,63.251
+h2short-c10000-pc32,listener-nodelay,TTLB p50 ms,3,28.627,28.569,28.882
+h2short-c10000-pc32,listener-nodelay,TTLB p99 ms,3,53.709,53.375,54.344
+h2short-c10000-pc32,listener-nodelay,TTLB p99.9 ms,3,64.421,63.911,65.473
+h2short-c10000-pc32,listener-nodelay,srv CPU us/stream,3,67.50713347827211,67.44180179626359,68.1240912118925
+h2short-c10000-pc32,listener-nodelay,srv cores busy,3,23.25661303164209,23.227203354200675,23.26057404768892
+h2short-c10000-pc32,listener-nodelay,srv ctxsw/stream,3,0.4010371956931761,0.39173282630676826,0.42715101730001087
+h2short-c10000-pc32,listener-nodelay,srv peak RSS MiB,3,194.01953125,192.24609375,198.8828125
+h2short-c10000-pc32,listener-nodelay,errors,3,0,0,0
+h2short-c10000-pc32,listener-nodelay,timeouts,3,0,0,0
+h2short-c10000-pc32,listener-nodelay,client CPU %,3,70.00036499600968,69.36206599303316,71.39040016162843
+h2short-c10000-pc32,inline-streaming-nodelay,streams/s,3,360332.5617046812,359921.0592498866,361975.47300934966
+h2short-c10000-pc32,inline-streaming-nodelay,GiB/s,3,21.990488114537918,21.96561616199414,22.091650104306
+h2short-c10000-pc32,inline-streaming-nodelay,TTFB p50 ms,3,24.634,24.473,24.663
+h2short-c10000-pc32,inline-streaming-nodelay,TTFB p99 ms,3,71.976,71.908,72.348
+h2short-c10000-pc32,inline-streaming-nodelay,TTFB p99.9 ms,3,92.398,90.467,94.939
+h2short-c10000-pc32,inline-streaming-nodelay,TTLB p50 ms,3,25.693,25.536,25.733
+h2short-c10000-pc32,inline-streaming-nodelay,TTLB p99 ms,3,73.062,72.979,73.403
+h2short-c10000-pc32,inline-streaming-nodelay,TTLB p99.9 ms,3,93.448,91.503,95.874
+h2short-c10000-pc32,inline-streaming-nodelay,srv CPU us/stream,3,64.78338463417275,64.51662813793645,64.85477143833656
+h2short-c10000-pc32,inline-streaming-nodelay,srv cores busy,3,23.343562941131143,23.34259803349539,23.353436987197863
+h2short-c10000-pc32,inline-streaming-nodelay,srv ctxsw/stream,3,0.325297251035759,0.32386651072822753,0.33160733070029114
+h2short-c10000-pc32,inline-streaming-nodelay,srv peak RSS MiB,3,568.578125,564.7109375,587.7578125
+h2short-c10000-pc32,inline-streaming-nodelay,errors,3,0,0,0
+h2short-c10000-pc32,inline-streaming-nodelay,timeouts,3,0,0,0
+h2short-c10000-pc32,inline-streaming-nodelay,client CPU %,3,71.81499406698688,71.36033480815132,71.95300837702766
+h2short-c10000-pc64,main,streams/s,3,395598.9073735581,393153.1243862277,396133.3331780772
+h2short-c10000-pc64,main,GiB/s,3,24.138100720295707,23.99378322733832,24.167806441302258
+h2short-c10000-pc64,main,TTFB p50 ms,3,7.476,7.365,7.587
+h2short-c10000-pc64,main,TTFB p99 ms,3,20.021,19.891,20.2
+h2short-c10000-pc64,main,TTFB p99.9 ms,3,25.675,25.511,26.636
+h2short-c10000-pc64,main,TTLB p50 ms,3,14.567,14.384,14.661
+h2short-c10000-pc64,main,TTLB p99 ms,3,63.975,63.938,64.576
+h2short-c10000-pc64,main,TTLB p99.9 ms,3,70.256,70.057,72.053
+h2short-c10000-pc64,main,srv CPU us/stream,3,58.58186975570663,58.509104698350534,58.92351822474935
+h2short-c10000-pc64,main,srv cores busy,3,23.17492366725763,23.165965289889034,23.177406665422694
+h2short-c10000-pc64,main,srv ctxsw/stream,3,0.264535129233371,0.26226469493718885,0.26770589737301825
+h2short-c10000-pc64,main,srv peak RSS MiB,3,283.125,278.5625,291.3359375
+h2short-c10000-pc64,main,errors,3,0,0,0
+h2short-c10000-pc64,main,timeouts,3,0,0,0
+h2short-c10000-pc64,main,client CPU %,3,75.0677947920875,74.79707417508855,76.23461749252169
+h2short-c10000-pc64,listener-nodelay,streams/s,3,329226.0743574138,328454.9167940757,330342.1183682447
+h2short-c10000-pc64,listener-nodelay,GiB/s,3,20.088362997992817,20.04748181858436,20.156754039988037
+h2short-c10000-pc64,listener-nodelay,TTFB p50 ms,3,19.525,19.517,19.563
+h2short-c10000-pc64,listener-nodelay,TTFB p99 ms,3,45.516,45.071,45.62
+h2short-c10000-pc64,listener-nodelay,TTFB p99.9 ms,3,55.853,55.57,56.032
+h2short-c10000-pc64,listener-nodelay,TTLB p50 ms,3,28.57,28.456,28.601
+h2short-c10000-pc64,listener-nodelay,TTLB p99 ms,3,68.143,67.516,68.252
+h2short-c10000-pc64,listener-nodelay,TTLB p99.9 ms,3,81.655,81.122,82.197
+h2short-c10000-pc64,listener-nodelay,srv CPU us/stream,3,69.22087556038623,69.01170216856293,69.35935692101577
+h2short-c10000-pc64,listener-nodelay,srv cores busy,3,22.789317124329003,22.781421806382834,22.797471886561464
+h2short-c10000-pc64,listener-nodelay,srv ctxsw/stream,3,0.48760529242100437,0.4772486450277084,0.49167994663306525
+h2short-c10000-pc64,listener-nodelay,srv peak RSS MiB,3,375.046875,374.52734375,380.75
+h2short-c10000-pc64,listener-nodelay,errors,3,0,0,0
+h2short-c10000-pc64,listener-nodelay,timeouts,3,0,0,0
+h2short-c10000-pc64,listener-nodelay,client CPU %,3,67.4196671286177,67.07431984183681,68.14238854971991
+h2short-c10000-pc64,inline-streaming-nodelay,streams/s,3,360217.90263645025,358564.8373513972,362091.32272960583
+h2short-c10000-pc64,inline-streaming-nodelay,GiB/s,3,21.984043839218803,21.88085365648398,22.096123782695933
+h2short-c10000-pc64,inline-streaming-nodelay,TTFB p50 ms,3,18.103,18.08,18.339
+h2short-c10000-pc64,inline-streaming-nodelay,TTFB p99 ms,3,50.496,49.985,50.65
+h2short-c10000-pc64,inline-streaming-nodelay,TTFB p99.9 ms,3,64.492,63.048,64.836
+h2short-c10000-pc64,inline-streaming-nodelay,TTLB p50 ms,3,26.144,26.025,26.37
+h2short-c10000-pc64,inline-streaming-nodelay,TTLB p99 ms,3,67.699,67.048,68.564
+h2short-c10000-pc64,inline-streaming-nodelay,TTLB p99.9 ms,3,82.626,81.446,87.184
+h2short-c10000-pc64,inline-streaming-nodelay,srv CPU us/stream,3,64.7178028930607,64.39793482484872,64.94513481868077
+h2short-c10000-pc64,inline-streaming-nodelay,srv cores busy,3,23.312511221377516,23.287041703024833,23.31793340178442
+h2short-c10000-pc64,inline-streaming-nodelay,srv ctxsw/stream,3,0.37743111690822706,0.3746895898567453,0.3825314461637326
+h2short-c10000-pc64,inline-streaming-nodelay,srv peak RSS MiB,3,632.75,617.0625,642.77734375
+h2short-c10000-pc64,inline-streaming-nodelay,errors,3,0,0,0
+h2short-c10000-pc64,inline-streaming-nodelay,timeouts,3,0,0,0
+h2short-c10000-pc64,inline-streaming-nodelay,client CPU %,3,72.42600518773494,72.27383664476474,72.61032157657921
+h2short-c10000-pc128,main,streams/s,3,383512.7692364399,382989.04907111137,383757.57047016965
+h2short-c10000-pc128,main,GiB/s,3,23.407648865170017,23.373902632896012,23.41754978013346
+h2short-c10000-pc128,main,TTFB p50 ms,3,9.358,9.214,9.37
+h2short-c10000-pc128,main,TTFB p99 ms,3,23.361,23.347,23.484
+h2short-c10000-pc128,main,TTFB p99.9 ms,3,30.653,30.514,30.755
+h2short-c10000-pc128,main,TTLB p50 ms,3,19.473,19.301,19.486
+h2short-c10000-pc128,main,TTLB p99 ms,3,74.446,74.24,74.8
+h2short-c10000-pc128,main,TTLB p99.9 ms,3,83.027,82.665,84.246
+h2short-c10000-pc128,main,srv CPU us/stream,3,60.41486945881921,60.39153773122443,60.55131781634003
+h2short-c10000-pc128,main,srv cores busy,3,23.175709796692267,23.16987388920977,23.19049163048271
+h2short-c10000-pc128,main,srv ctxsw/stream,3,0.3437602682068673,0.32685281731535804,0.3447357879997196
+h2short-c10000-pc128,main,srv peak RSS MiB,3,454.6953125,453.640625,460.40625
+h2short-c10000-pc128,main,errors,3,0,0,0
+h2short-c10000-pc128,main,timeouts,3,0,0,0
+h2short-c10000-pc128,main,client CPU %,3,73.77362590743559,73.63041099125469,75.00930382400539
+h2short-c10000-pc128,listener-nodelay,streams/s,3,346803.363873818,346775.53450733953,348779.87812743
+h2short-c10000-pc128,listener-nodelay,GiB/s,3,21.165431786509266,21.165134312916106,21.28365143642827
+h2short-c10000-pc128,listener-nodelay,TTFB p50 ms,3,14.382,14.308,14.451
+h2short-c10000-pc128,listener-nodelay,TTFB p99 ms,3,37.16,36.937,37.407
+h2short-c10000-pc128,listener-nodelay,TTFB p99.9 ms,3,47.428,46.96,47.769
+h2short-c10000-pc128,listener-nodelay,TTLB p50 ms,3,27.829,27.684,28.059
+h2short-c10000-pc128,listener-nodelay,TTLB p99 ms,3,59.107,58.968,59.786
+h2short-c10000-pc128,listener-nodelay,TTLB p99.9 ms,3,72.83,71.522,72.832
+h2short-c10000-pc128,listener-nodelay,srv CPU us/stream,3,67.0272134581578,66.72321322065314,67.08800231644241
+h2short-c10000-pc128,listener-nodelay,srv cores busy,3,23.264477862313953,23.245263098377574,23.27171417536993
+h2short-c10000-pc128,listener-nodelay,srv ctxsw/stream,3,0.35212588662243877,0.3466793140423362,0.3614936257388191
+h2short-c10000-pc128,listener-nodelay,srv peak RSS MiB,3,547.8984375,544.125,556.51953125
+h2short-c10000-pc128,listener-nodelay,errors,3,0,0,0
+h2short-c10000-pc128,listener-nodelay,timeouts,3,0,0,0
+h2short-c10000-pc128,listener-nodelay,client CPU %,3,70.52001097353677,70.25069332431228,71.28444006774546
+h2short-c10000-pc128,inline-streaming-nodelay,streams/s,3,359775.18309573864,357728.0880215365,360149.67390473606
+h2short-c10000-pc128,inline-streaming-nodelay,GiB/s,3,21.951481304598996,21.834264435241852,21.975453909950915
+h2short-c10000-pc128,inline-streaming-nodelay,TTFB p50 ms,3,14.333,14.305,14.45
+h2short-c10000-pc128,inline-streaming-nodelay,TTFB p99 ms,3,38.346,38.298,38.486
+h2short-c10000-pc128,inline-streaming-nodelay,TTFB p99.9 ms,3,50.192,49.851,50.745
+h2short-c10000-pc128,inline-streaming-nodelay,TTLB p50 ms,3,26.547,26.494,26.562
+h2short-c10000-pc128,inline-streaming-nodelay,TTLB p99 ms,3,62.365,62.178,63.105
+h2short-c10000-pc128,inline-streaming-nodelay,TTLB p99.9 ms,3,77.087,76.899,77.425
+h2short-c10000-pc128,inline-streaming-nodelay,srv CPU us/stream,3,64.6585812862054,64.6000823642025,65.06760751993
+h2short-c10000-pc128,inline-streaming-nodelay,srv cores busy,3,23.265698597686622,23.262552920955248,23.27651083024031
+h2short-c10000-pc128,inline-streaming-nodelay,srv ctxsw/stream,3,0.3720645462766136,0.35965998442783476,0.37245836595087195
+h2short-c10000-pc128,inline-streaming-nodelay,srv peak RSS MiB,3,653.3203125,640.38671875,654.7890625
+h2short-c10000-pc128,inline-streaming-nodelay,errors,3,0,0,0
+h2short-c10000-pc128,inline-streaming-nodelay,timeouts,3,0,0,0
+h2short-c10000-pc128,inline-streaming-nodelay,client CPU %,3,71.74773940712552,71.46828963550213,72.83549324380346
+h2short-c2500-pc16,main,streams/s,3,380244.4509118776,379659.62291971187,380769.4186768405
+h2short-c2500-pc16,main,GiB/s,3,23.206358187153985,23.169681866829173,23.237752627216736
+h2short-c2500-pc16,main,TTFB p50 ms,3,0.704,0.701,0.71
+h2short-c2500-pc16,main,TTFB p99 ms,3,1.467,1.435,1.472
+h2short-c2500-pc16,main,TTFB p99.9 ms,3,1.862,1.812,1.895
+h2short-c2500-pc16,main,TTLB p50 ms,3,1.122,1.119,1.132
+h2short-c2500-pc16,main,TTLB p99 ms,3,43.185,43.183,43.191
+h2short-c2500-pc16,main,TTLB p99.9 ms,3,43.733,43.699,43.753
+h2short-c2500-pc16,main,srv CPU us/stream,3,58.67644107619152,58.59834133336835,58.73536028323209
+h2short-c2500-pc16,main,srv cores busy,3,22.311391118479587,22.29944473718532,22.31245636493374
+h2short-c2500-pc16,main,srv ctxsw/stream,3,0.5022818157343507,0.5022527909635476,0.5063238469273181
+h2short-c2500-pc16,main,srv peak RSS MiB,3,73.76953125,72.6796875,75.90234375
+h2short-c2500-pc16,main,errors,3,0,0,0
+h2short-c2500-pc16,main,timeouts,3,0,0,0
+h2short-c2500-pc16,main,client CPU %,3,68.42733337784631,68.35749418247372,69.99020517969412
+h2short-c2500-pc16,listener-nodelay,streams/s,3,410501.56177905126,406339.6255941454,411759.7387085695
+h2short-c2500-pc16,listener-nodelay,GiB/s,3,25.05212747443469,24.798672281755913,25.128941869903727
+h2short-c2500-pc16,listener-nodelay,TTFB p50 ms,3,5.365,4.713,5.389
+h2short-c2500-pc16,listener-nodelay,TTFB p99 ms,3,13.999,12.338,15.455
+h2short-c2500-pc16,listener-nodelay,TTFB p99.9 ms,3,15.91,13.75,19.573
+h2short-c2500-pc16,listener-nodelay,TTLB p50 ms,3,5.65,4.977,5.691
+h2short-c2500-pc16,listener-nodelay,TTLB p99 ms,3,14.378,12.589,15.776
+h2short-c2500-pc16,listener-nodelay,TTLB p99.9 ms,3,16.231,13.97,19.936
+h2short-c2500-pc16,listener-nodelay,srv CPU us/stream,3,58.447147723155915,58.2830214388542,59.055205319841754
+h2short-c2500-pc16,listener-nodelay,srv cores busy,3,23.99647001904988,23.992645421886422,23.99860167880856
+h2short-c2500-pc16,listener-nodelay,srv ctxsw/stream,3,0.0003776285075902112,0.0001321302036286743,0.0005028331435710456
+h2short-c2500-pc16,listener-nodelay,srv peak RSS MiB,3,76.80078125,76.03515625,77.76953125
+h2short-c2500-pc16,listener-nodelay,errors,3,0,0,0
+h2short-c2500-pc16,listener-nodelay,timeouts,3,0,0,0
+h2short-c2500-pc16,listener-nodelay,client CPU %,3,79.50611922658291,79.29624317998415,80.13824883831238
+h2short-c2500-pc16,inline-streaming-nodelay,streams/s,3,386102.1430116647,385992.192574975,387902.61577396054
+h2short-c2500-pc16,inline-streaming-nodelay,GiB/s,3,23.563701734879555,23.556726888186017,23.67323373519371
+h2short-c2500-pc16,inline-streaming-nodelay,TTFB p50 ms,3,5.015,4.982,5.035
+h2short-c2500-pc16,inline-streaming-nodelay,TTFB p99 ms,3,21.215,21.207,21.304
+h2short-c2500-pc16,inline-streaming-nodelay,TTFB p99.9 ms,3,28.281,27.49,28.584
+h2short-c2500-pc16,inline-streaming-nodelay,TTLB p50 ms,3,5.399,5.37,5.418
+h2short-c2500-pc16,inline-streaming-nodelay,TTLB p99 ms,3,21.676,21.676,21.78
+h2short-c2500-pc16,inline-streaming-nodelay,TTLB p99.9 ms,3,28.758,27.96,29.044
+h2short-c2500-pc16,inline-streaming-nodelay,srv CPU us/stream,3,61.190018020528946,60.84900880906777,61.20222826791035
+h2short-c2500-pc16,inline-streaming-nodelay,srv cores busy,3,23.623582279604836,23.603489684290153,23.625597088648604
+h2short-c2500-pc16,inline-streaming-nodelay,srv ctxsw/stream,3,0.10945200155460552,0.10927739932450863,0.11601197024609546
+h2short-c2500-pc16,inline-streaming-nodelay,srv peak RSS MiB,3,186.6953125,182.3984375,187.1875
+h2short-c2500-pc16,inline-streaming-nodelay,errors,3,0,0,0
+h2short-c2500-pc16,inline-streaming-nodelay,timeouts,3,0,0,0
+h2short-c2500-pc16,inline-streaming-nodelay,client CPU %,3,71.16750671302434,71.11031693669888,71.19028176698579
+h2short-c10000-1x64k,main,streams/s,3,439837.034648125,438251.0791475538,440122.26253274747
+h2short-c10000-1x64k,main,GiB/s,3,26.84390602042791,26.745287975553225,26.85697794284853
+h2short-c10000-1x64k,main,TTFB p50 ms,3,6.004,5.987,6.082
+h2short-c10000-1x64k,main,TTFB p99 ms,3,15.526,15.509,15.777
+h2short-c10000-1x64k,main,TTFB p99.9 ms,3,19.772,19.655,20.727
+h2short-c10000-1x64k,main,TTLB p50 ms,3,11.529,11.488,11.628
+h2short-c10000-1x64k,main,TTLB p99 ms,3,59.306,59.191,59.664
+h2short-c10000-1x64k,main,TTLB p99.9 ms,3,64.31,64.127,65.781
+h2short-c10000-1x64k,main,srv CPU us/stream,3,53.397104554909674,53.375235472296644,53.616494756902426
+h2short-c10000-1x64k,main,srv cores busy,3,23.491629399285358,23.486024126227363,23.497486687321647
+h2short-c10000-1x64k,main,srv ctxsw/stream,3,0.10865174641479937,0.10670857706455453,0.11012632668486362
+h2short-c10000-1x64k,main,srv peak RSS MiB,3,351.234375,338.53515625,354.28515625
+h2short-c10000-1x64k,main,errors,3,0,0,0
+h2short-c10000-1x64k,main,timeouts,3,0,0,0
+h2short-c10000-1x64k,main,client CPU %,3,81.47112190959524,81.22909190727391,81.9605534703544
+h2short-c10000-1x64k,listener-nodelay,streams/s,3,387519.2833340835,387150.6051080664,388651.94605850376
+h2short-c10000-1x64k,listener-nodelay,GiB/s,3,23.652576222333074,23.62548672523914,23.720530392944816
+h2short-c10000-1x64k,listener-nodelay,TTFB p50 ms,3,16.808,16.73,16.82
+h2short-c10000-1x64k,listener-nodelay,TTFB p99 ms,3,37.692,37.602,38.146
+h2short-c10000-1x64k,listener-nodelay,TTFB p99.9 ms,3,46.864,46.045,46.963
+h2short-c10000-1x64k,listener-nodelay,TTLB p50 ms,3,24.4,24.321,24.417
+h2short-c10000-1x64k,listener-nodelay,TTLB p99 ms,3,56.696,56.463,57.11
+h2short-c10000-1x64k,listener-nodelay,TTLB p99.9 ms,3,68.614,66.911,69.157
+h2short-c10000-1x64k,listener-nodelay,srv CPU us/stream,3,60.31066093970457,60.18429171716548,60.381809356739346
+h2short-c10000-1x64k,listener-nodelay,srv cores busy,3,23.376854029981544,23.371544104759217,23.39074209802905
+h2short-c10000-1x64k,listener-nodelay,srv ctxsw/stream,3,0.13531586769902015,0.13409268108166528,0.13544485829842381
+h2short-c10000-1x64k,listener-nodelay,srv peak RSS MiB,3,490.21484375,485.6640625,493.41796875
+h2short-c10000-1x64k,listener-nodelay,errors,3,0,0,0
+h2short-c10000-1x64k,listener-nodelay,timeouts,3,0,0,0
+h2short-c10000-1x64k,listener-nodelay,client CPU %,3,78.23370475424092,77.41576577914527,78.36102997424564
+h2short-c10000-1x64k,inline-streaming-nodelay,streams/s,3,396450.3100069217,396233.7880940931,400013.4004767688
+h2short-c10000-1x64k,inline-streaming-nodelay,GiB/s,3,24.195486845918353,24.180768244923584,24.41036791938887
+h2short-c10000-1x64k,inline-streaming-nodelay,TTFB p50 ms,3,16.309,16.166,16.332
+h2short-c10000-1x64k,inline-streaming-nodelay,TTFB p99 ms,3,46.266,46.167,46.294
+h2short-c10000-1x64k,inline-streaming-nodelay,TTFB p99.9 ms,3,59.054,58.398,59.89
+h2short-c10000-1x64k,inline-streaming-nodelay,TTLB p50 ms,3,23.761,23.471,23.801
+h2short-c10000-1x64k,inline-streaming-nodelay,TTLB p99 ms,3,61.779,61.353,62.157
+h2short-c10000-1x64k,inline-streaming-nodelay,TTLB p99.9 ms,3,76.882,76.558,77.717
+h2short-c10000-1x64k,inline-streaming-nodelay,srv CPU us/stream,3,59.23726160483484,58.738979565865584,59.25184418998754
+h2short-c10000-1x64k,inline-streaming-nodelay,srv cores busy,3,23.484630727197892,23.47758267495974,23.49637895667733
+h2short-c10000-1x64k,inline-streaming-nodelay,srv ctxsw/stream,3,0.17214627733845536,0.1716430643665593,0.17251968820887614
+h2short-c10000-1x64k,inline-streaming-nodelay,srv peak RSS MiB,3,735.52734375,712.2734375,742.59375
+h2short-c10000-1x64k,inline-streaming-nodelay,errors,3,0,0,0
+h2short-c10000-1x64k,inline-streaming-nodelay,timeouts,3,0,0,0
+h2short-c10000-1x64k,inline-streaming-nodelay,client CPU %,3,78.05874407025787,77.82356105865782,78.88548698200886

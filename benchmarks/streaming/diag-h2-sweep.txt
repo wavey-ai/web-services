@@ -1,0 +1,7 @@
+# HTTP/2 short streams (16 KB x 4): streams per connection and concurrency sweep.
+h2short-c10000-pc16  |h2|closed|10000|16 |/stream?chunks=4&size=16384|65536|
+h2short-c10000-pc32  |h2|closed|10000|32 |/stream?chunks=4&size=16384|65536|
+h2short-c10000-pc64  |h2|closed|10000|64 |/stream?chunks=4&size=16384|65536|
+h2short-c10000-pc128 |h2|closed|10000|128|/stream?chunks=4&size=16384|65536|
+h2short-c2500-pc16   |h2|closed|2500 |16 |/stream?chunks=4&size=16384|65536|
+h2short-c10000-1x64k |h2|closed|10000|64 |/stream?chunks=1&size=65536|65536|
