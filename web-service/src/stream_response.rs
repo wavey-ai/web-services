@@ -7,6 +7,11 @@
 //!
 //! The writer holds at most one chunk. `send_data` stays pending until the body has taken the
 //! previous chunk, so the handler is never more than one chunk ahead of what hyper accepted.
+//!
+//! A handler that computes its chunks without waiting would run its whole response in one poll
+//! of the task: hyper keeps polling a body that is always ready, and on HTTP/1.1 flushes only
+//! when its write buffer is full. The body therefore yields the task after each
+//! [`HANDLER_SLICE`] of handler time.
 
 use crate::{
     error::ServerError,
@@ -22,14 +27,55 @@ use std::{
     future::Future,
     panic::{catch_unwind, AssertUnwindSafe},
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-    task::{Context, Poll, Waker},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+    },
+    task::{Context, Poll, Wake, Waker},
+    time::{Duration, Instant},
 };
 use tokio_util::{
     sync::CancellationToken,
     task::{task_tracker::TaskTrackerToken, TaskTracker},
 };
 use tracing::{error, Span};
+
+/// Handler time after which the body yields its task, so that a handler that never waits shares
+/// its worker with the other connections and its first chunk is flushed early.
+const HANDLER_SLICE: Duration = Duration::from_micros(500);
+
+/// Wakes the task after the poll in which it yielded, and records that it did.
+struct YieldWaker {
+    resumed: AtomicBool,
+    task: Waker,
+}
+
+impl Wake for YieldWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.resumed.store(true, Ordering::Release);
+        self.task.wake_by_ref();
+    }
+}
+
+/// Make the current task yield. The runtime defers the wake-up until the current poll of the
+/// task has returned. hyper may poll the body again within that poll (HTTP/1.1 loops back after
+/// a flush), so the body stays `Pending` until the returned waker has fired.
+fn yield_task(cx: &Context<'_>) -> Arc<YieldWaker> {
+    let yielded = Arc::new(YieldWaker {
+        resumed: AtomicBool::new(false),
+        task: cx.waker().clone(),
+    });
+    let waker = Waker::from(Arc::clone(&yielded));
+    let mut yield_cx = Context::from_waker(&waker);
+    let _ = std::pin::pin!(tokio::task::yield_now())
+        .as_mut()
+        .poll(&mut yield_cx);
+    yielded
+}
 
 /// A handler call that owns everything it borrows.
 pub(crate) type HandlerFuture = Pin<Box<dyn Future<Output = HandlerResult<()>> + Send>>;
@@ -233,16 +279,38 @@ pub(crate) struct StreamResponseBody {
     detached: Arc<Detached>,
     _tracked: TaskTrackerToken,
     ended: bool,
+    /// Handler time since the body last returned `Pending`.
+    busy: Duration,
+    /// Set while the task yields; the handler runs again once it has resumed.
+    yielding: Option<Arc<YieldWaker>>,
 }
 
 impl StreamResponseBody {
-    fn poll_handler(&mut self, cx: &mut Context<'_>) {
-        if let Some(handler) = self.handler.as_mut() {
-            if Pin::new(handler).poll(cx).is_ready() {
-                // Drops the writer the handler owned, and the request permit.
-                drop_handler(self.handler.take());
+    /// `Pending` when the handler has used its slice: the task yields before the handler runs
+    /// again.
+    fn poll_handler(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let Some(handler) = self.handler.as_mut() else {
+            return Poll::Ready(());
+        };
+        if let Some(yielding) = &self.yielding {
+            if !yielding.resumed.load(Ordering::Acquire) {
+                return Poll::Pending;
             }
+            self.yielding = None;
         }
+        if self.busy >= HANDLER_SLICE {
+            self.busy = Duration::ZERO;
+            self.yielding = Some(yield_task(cx));
+            return Poll::Pending;
+        }
+        let started = Instant::now();
+        let done = Pin::new(handler).poll(cx).is_ready();
+        self.busy += started.elapsed();
+        if done {
+            // Drops the writer the handler owned, and the request permit.
+            drop_handler(self.handler.take());
+        }
+        Poll::Ready(())
     }
 
     fn poll_head(&mut self, cx: &mut Context<'_>) -> Poll<Result<Response<()>, ServerError>> {
@@ -253,7 +321,7 @@ impl StreamResponseBody {
             }
             slot.body_waker.take()
         };
-        self.poll_handler(cx);
+        let yielded = self.poll_handler(cx).is_pending();
         let mut slot = lock(&self.shared);
         if let Some(head) = slot.head.take() {
             return Poll::Ready(Ok(head));
@@ -264,6 +332,9 @@ impl StreamResponseBody {
             )));
         }
         slot.body_waker = Some(current_waker(previous, cx));
+        if !yielded {
+            self.busy = Duration::ZERO;
+        }
         Poll::Pending
     }
 
@@ -318,7 +389,7 @@ impl Body for StreamResponseBody {
             }
             slot.body_waker.take()
         };
-        this.poll_handler(cx);
+        let yielded = this.poll_handler(cx).is_pending();
         let mut slot = lock(&this.shared);
         if let Some(chunk) = slot.chunk.take() {
             return Self::yield_chunk(chunk, slot, cx);
@@ -340,6 +411,9 @@ impl Body for StreamResponseBody {
             ))));
         }
         slot.body_waker = Some(current_waker(previous, cx));
+        if !yielded {
+            this.busy = Duration::ZERO;
+        }
         Poll::Pending
     }
 }
@@ -381,6 +455,8 @@ pub(crate) async fn respond(
         detached: Arc::clone(detached),
         _tracked: detached.tasks.token(),
         ended: false,
+        busy: Duration::ZERO,
+        yielding: None,
     };
     let head = poll_fn(|cx| body.poll_head(cx)).await?;
     let (parts, ()) = head.into_parts();
@@ -437,13 +513,29 @@ mod tests {
         responding.as_mut().poll(cx)
     }
 
+    /// Poll the body once, or again after a yield: these tests poll outside the runtime, where
+    /// a yield's wake-up fires at once. A handler that never waits yields after its slice.
     fn poll_body(
         body: &mut StreamResponseBody,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Bytes, ServerError>>> {
-        Pin::new(body)
-            .poll_frame(cx)
-            .map(|frame| frame.map(|frame| frame.map(|frame| frame.into_data().unwrap())))
+        poll_body_counting_yields(body, cx, &mut 0)
+    }
+
+    fn poll_body_counting_yields(
+        body: &mut StreamResponseBody,
+        cx: &mut Context<'_>,
+        yielded: &mut usize,
+    ) -> Poll<Option<Result<Bytes, ServerError>>> {
+        loop {
+            let polled = Pin::new(&mut *body).poll_frame(cx);
+            if polled.is_pending() && body.yielding.is_some() {
+                *yielded += 1;
+                continue;
+            }
+            return polled
+                .map(|frame| frame.map(|frame| frame.map(|frame| frame.into_data().unwrap())));
+        }
     }
 
     #[test]
@@ -472,8 +564,9 @@ mod tests {
         let mut body = response.into_body();
         assert_eq!(produced.load(Ordering::SeqCst), 1);
 
+        let mut yielded = 0;
         for taken in 0..64 {
-            match poll_body(&mut body, &mut cx) {
+            match poll_body_counting_yields(&mut body, &mut cx, &mut yielded) {
                 Poll::Ready(Some(Ok(data))) => assert_eq!(data, chunk(taken)),
                 other => panic!("chunk {taken}: {other:?}"),
             }
@@ -484,7 +577,8 @@ mod tests {
                 taken + 1
             );
         }
-        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        // The only wake-ups are the yields' own.
+        assert_eq!(wakes.0.load(Ordering::SeqCst), yielded);
     }
 
     #[test]
@@ -613,6 +707,54 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(detached.tasks.len(), 0);
         assert!(Arc::clone(&limiter).try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_handler_that_never_waits_yields_the_task_after_its_slice() {
+        let start = start_with(|mut writer| async move {
+            writer.send_response(Response::new(())).await?;
+            for index in 0..8 {
+                let until = Instant::now() + HANDLER_SLICE * 2;
+                while Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+                writer.send_data(chunk(index)).await?;
+            }
+            writer.finish().await
+        });
+        let detached = Arc::new(Detached::new());
+        let response = respond(start, "test handler", RequestPermit::unlimited(), &detached)
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+
+        // Within one poll of the task the body hands over what is ready, then stays pending
+        // however often it is polled again, as hyper does after a flush.
+        let ready_in_one_poll = poll_fn(|cx| {
+            let mut frames = 0;
+            loop {
+                match Pin::new(&mut body).poll_frame(cx) {
+                    Poll::Ready(Some(Ok(_))) => frames += 1,
+                    Poll::Pending => break,
+                    other => panic!("{other:?}"),
+                }
+            }
+            for _ in 0..16 {
+                assert!(Pin::new(&mut body).poll_frame(cx).is_pending());
+            }
+            Poll::Ready(frames)
+        })
+        .await;
+        assert!(
+            ready_in_one_poll <= 2,
+            "{ready_in_one_poll} frames in one poll"
+        );
+
+        let rest = body.collect().await.unwrap().to_bytes();
+        let expected: Vec<u8> = (ready_in_one_poll..8)
+            .flat_map(|index| chunk(index).to_vec())
+            .collect();
+        assert_eq!(rest.as_ref(), expected.as_slice());
     }
 
     #[tokio::test]

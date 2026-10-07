@@ -81,6 +81,8 @@ check, so the wakeup cannot be missed.
 response body, on the task that serves the stream. The writer holds one chunk.
 `send_data` waits until hyper takes the previous chunk. hyper takes a chunk only
 when it can send or buffer it. A handler is at most one chunk ahead of hyper.
+After 500 µs of handler time without a wait, the body yields the task. Other
+connections then run, and hyper flushes the chunks it has buffered.
 
 **Sizing.** A producer writing one slot per unit of output exhausts the ring
 after `slots_per_stream` writes and paces to the client for the remainder. For

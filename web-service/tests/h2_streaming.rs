@@ -10,7 +10,7 @@ use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -39,6 +39,13 @@ const ECHO_CHUNK: usize = 256 * 1024;
 const ECHO_CHUNKS: usize = 64;
 /// The HTTP/2 client's flow-control windows: the protocol's initial default.
 const CLIENT_WINDOW: u32 = 65_535;
+/// Streams that share one HTTP/2 connection window in the window test.
+const WINDOW_STREAMS: usize = 16;
+const WINDOW_CHUNK: usize = 32 * 1024;
+const WINDOW_CHUNKS: usize = 8;
+/// A handler that computes each chunk without waiting.
+const BUSY_CHUNKS: usize = 40;
+const BUSY_PER_CHUNK: Duration = Duration::from_millis(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Proto {
@@ -51,6 +58,8 @@ struct State {
     go: Notify,
     release: Semaphore,
     produced: AtomicUsize,
+    /// Per `/window` stream: chunks the handler has computed, and chunks the writer accepted.
+    window: Vec<(AtomicUsize, AtomicUsize)>,
     dropped: AtomicBool,
     dropped_notify: Notify,
     completed: AtomicBool,
@@ -63,6 +72,9 @@ impl Default for State {
             go: Notify::new(),
             release: Semaphore::new(0),
             produced: AtomicUsize::new(0),
+            window: (0..WINDOW_STREAMS)
+                .map(|_| (AtomicUsize::new(0), AtomicUsize::new(0)))
+                .collect(),
             dropped: AtomicBool::new(false),
             dropped_notify: Notify::new(),
             completed: AtomicBool::new(false),
@@ -206,6 +218,20 @@ impl TestRouter {
                 }
                 Ok(())
             }
+            "/busy" => {
+                writer.send_response(Response::new(())).await?;
+                for index in 0..BUSY_CHUNKS {
+                    let until = Instant::now() + BUSY_PER_CHUNK;
+                    while Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                    writer
+                        .send_data(Bytes::from(vec![index as u8; 1024]))
+                        .await?;
+                    state.produced.fetch_add(1, Ordering::SeqCst);
+                }
+                writer.finish().await
+            }
             "/hold" => {
                 let _guard = DropGuard(Arc::clone(state));
                 writer.send_response(Response::new(())).await?;
@@ -244,6 +270,18 @@ impl Router for TestRouter {
         req: Request<()>,
         mut writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()> {
+        if req.uri().path() == "/window" {
+            let id: usize = req.uri().query().unwrap_or_default().parse().unwrap();
+            let (computed, accepted) = &self.state.window[id];
+            writer.send_response(Response::new(())).await?;
+            for index in 0..WINDOW_CHUNKS {
+                let chunk = Bytes::from(vec![index as u8; WINDOW_CHUNK]);
+                computed.fetch_add(1, Ordering::SeqCst);
+                writer.send_data(chunk).await?;
+                accepted.fetch_add(1, Ordering::SeqCst);
+            }
+            return writer.finish().await;
+        }
         self.stream(req.uri().path(), &mut writer).await
     }
 
@@ -611,15 +649,14 @@ async fn many_concurrent_streams_complete(proto: Proto) {
 
 // 2. Backpressure.
 
-/// The most chunks a handler may hand over while its client reads nothing. On HTTP/2 the
-/// client's 64 KiB windows admit part of one chunk; hyper holds that chunk in its send buffer
-/// and the next while it waits for capacity. On HTTP/1.1 hyper's write buffer takes one chunk
+/// The most chunks a writer may accept while the client reads nothing. On HTTP/2 the client's
+/// 64 KiB windows admit part of one chunk: hyper's send buffer holds that chunk, and hyper
+/// holds the next while it waits for capacity. On HTTP/1.1 hyper's write buffer takes one chunk
 /// and the socket buffers take part of the next; up to 4 MiB of socket buffers is allowed for.
-/// The handler may also have one chunk in the writer's slot.
 fn stalled_bound(proto: Proto) -> usize {
     match proto {
         Proto::Http1 => 2 + 4,
-        Proto::Http2 => 3,
+        Proto::Http2 => 2,
     }
 }
 
@@ -652,6 +689,141 @@ async fn a_stalled_client_holds_the_handler_back(proto: Proto) {
     }
     assert_eq!(server.state.produced.load(Ordering::SeqCst), FLOOD_CHUNKS);
     server.stop().await;
+}
+
+/// Streams that wait for capacity in a full HTTP/2 connection window each have their next
+/// chunk computed already, so it is ready the moment capacity arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn streams_waiting_for_window_have_their_next_chunk_ready() {
+    let server = start(|builder| builder).await;
+    let client = server.connect(Proto::Http2).await;
+    let mut responses = Vec::new();
+    for id in 0..WINDOW_STREAMS {
+        let mut sender = client.http2_sender();
+        let req = Request::get(format!("https://localhost/window?{id}"))
+            .body(Empty::new().boxed_unsync())
+            .unwrap();
+        sender.ready().await.unwrap();
+        responses.push(tokio::spawn(sender.send_request(req)));
+    }
+    let mut bodies = Vec::new();
+    for response in responses {
+        let response = timeout(Duration::from_secs(5), response)
+            .await
+            .expect("no response head")
+            .unwrap()
+            .unwrap();
+        bodies.push(response.into_body());
+    }
+
+    let counts = || {
+        server
+            .state
+            .window
+            .iter()
+            .map(|(computed, accepted)| {
+                (
+                    computed.load(Ordering::SeqCst),
+                    accepted.load(Ordering::SeqCst),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut settled = counts();
+    loop {
+        sleep(Duration::from_millis(200)).await;
+        let now = counts();
+        if now == settled {
+            break;
+        }
+        settled = now;
+    }
+    for (id, (computed, accepted)) in settled.iter().enumerate() {
+        assert!(*accepted < WINDOW_CHUNKS, "stream {id} was not held back");
+        assert_eq!(
+            *computed,
+            accepted + 1,
+            "stream {id} has no next chunk ready: computed {computed}, accepted {accepted}"
+        );
+    }
+
+    // The streams share the connection window, so they are read together.
+    let reads: Vec<_> = bodies
+        .into_iter()
+        .map(|body| tokio::spawn(body.collect()))
+        .collect();
+    for (id, read) in reads.into_iter().enumerate() {
+        let body = timeout(Duration::from_secs(10), read)
+            .await
+            .expect("the body stalled")
+            .unwrap()
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body.len(), WINDOW_CHUNK * WINDOW_CHUNKS, "stream {id}");
+        for (index, chunk) in body.chunks(WINDOW_CHUNK).enumerate() {
+            assert!(chunk.iter().all(|byte| *byte == index as u8), "stream {id}");
+        }
+    }
+    server.stop().await;
+}
+
+/// A handler that computes chunks without waiting yields its worker now and then: its first
+/// chunk reaches the client before the handler has produced the rest, and another request on
+/// the same single-threaded runtime is answered meanwhile.
+async fn a_handler_that_never_waits_shares_the_worker(proto: Proto) {
+    let server = start(|builder| builder).await;
+    let mut busy = server.connect(proto).await;
+    let mut other = server.connect(proto).await;
+    assert!(other.serves_another_request().await);
+
+    // Counted in chunks rather than time, so that a loaded test machine does not change the
+    // outcome. Without yields the handler produces every chunk before anything else runs.
+    let response = busy.get("/busy").await.unwrap();
+    let mut body = response.into_body();
+    let first = timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("no first chunk")
+        .unwrap()
+        .unwrap();
+    assert!(first.is_data());
+    let at_first_chunk = server.state.produced.load(Ordering::SeqCst);
+    assert!(
+        at_first_chunk < BUSY_CHUNKS / 2,
+        "the first chunk arrived after the handler produced {at_first_chunk} of {BUSY_CHUNKS}"
+    );
+
+    let asked = server.state.produced.load(Ordering::SeqCst);
+    assert!(other.serves_another_request().await);
+    let meanwhile = server.state.produced.load(Ordering::SeqCst) - asked;
+    assert!(
+        meanwhile < BUSY_CHUNKS / 2,
+        "another request waited while the handler produced {meanwhile} of {BUSY_CHUNKS} chunks"
+    );
+
+    let rest = read_body_rest(body).await;
+    assert_eq!(rest + first.into_data().unwrap().len(), 1024 * BUSY_CHUNKS);
+    server.stop().await;
+}
+
+async fn read_body_rest(body: Incoming) -> usize {
+    timeout(Duration::from_secs(10), body.collect())
+        .await
+        .expect("the body stalled")
+        .unwrap()
+        .to_bytes()
+        .len()
+}
+
+mod single_threaded {
+    #[tokio::test(flavor = "current_thread")]
+    async fn http1_a_handler_that_never_waits_shares_the_worker() {
+        super::a_handler_that_never_waits_shares_the_worker(super::Proto::Http1).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http2_a_handler_that_never_waits_shares_the_worker() {
+        super::a_handler_that_never_waits_shares_the_worker(super::Proto::Http2).await;
+    }
 }
 
 // 3. A handler that stops without `finish` after the head.
