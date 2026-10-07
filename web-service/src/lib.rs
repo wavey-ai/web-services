@@ -16,6 +16,7 @@ pub mod static_files;
 mod stream_response;
 pub mod tls;
 pub mod traits;
+mod write_batch;
 
 pub use config::{H3Backend, ServerConfig};
 pub use error::{ServerError, ServerResult};

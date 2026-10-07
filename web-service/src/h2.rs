@@ -8,6 +8,7 @@ use crate::{
         response_header_name, response_header_value, BodyStream, HandlerResponse, Router,
         StartupSender, StreamWriter,
     },
+    write_batch::WriteBatch,
 };
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue, RANGE};
@@ -318,21 +319,30 @@ impl Listener {
         let (io, is_h2, client_certificate): (Box<dyn Io>, bool, _) = match &self.tls_acceptor {
             None => (Box::new(stream), false, None),
             Some(tls_acceptor) => {
-                let tls_stream =
-                    match timeout(self.handshake_timeout, tls_acceptor.accept(stream)).await {
-                        Ok(Ok(stream)) => stream,
-                        Err(_) => {
-                            debug!(%peer, "TLS handshake timed out");
-                            return;
-                        }
-                        Ok(Err(e)) => {
-                            debug!(%peer, %e, "TLS handshake failed");
-                            return;
-                        }
-                    };
+                let mut tls_stream = match timeout(
+                    self.handshake_timeout,
+                    tls_acceptor.accept(WriteBatch::new(stream)),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Err(_) => {
+                        debug!(%peer, "TLS handshake timed out");
+                        return;
+                    }
+                    Ok(Err(e)) => {
+                        debug!(%peer, %e, "TLS handshake failed");
+                        return;
+                    }
+                };
 
                 let alpn = tls_stream.get_ref().1.alpn_protocol();
                 let is_h2 = matches!(alpn, Some(proto) if proto == b"h2");
+                // hyper's HTTP/2 connection flushes after each DATA frame. HTTP/1.1 flushes
+                // once per message, and a WebSocket upgrade must see each flush go out.
+                if is_h2 {
+                    tls_stream.get_mut().0.start_batching();
+                }
                 if self.require_client_certificate && !is_h2 {
                     debug!(%peer, "mutual TLS listener rejected a non-HTTP/2 client");
                     return;
