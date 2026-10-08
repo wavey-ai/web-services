@@ -41,8 +41,10 @@ HTTP/2 writes below TLS. The measurements are in
 - [ ] Reduce the TCP segments of an HTTP/1.1 response under `TCP_NODELAY`.
   `echo-h1-c1000` has 156 segments per stream against 86 before the merge, and
   its throughput decreases 22.9%. `WriteBatch` covers HTTP/2 connections only.
-  Branch `h1-flat-writes` sets `http1::Builder::writev(false)`; in its first
-  repeat, `short-h1-c1000` and `short-h1-c10000` decrease 8% and 11%.
+  `http1::Builder::writev(false)` (branch `h1-flat-writes`) does not recover
+  it: `echo-h1-c1000` gives 13,700 streams/s against 14,365 without it, and
+  `short-h1-c1000` and `short-h1-c10000` decrease 8% and 11% (one repeat,
+  October 8, 2026).
 - [ ] Find the cause of the 9.7% throughput decrease of `echo-h2-c64` and the
   9.2% decrease of `echo-h2old-c64`. The decrease starts with HTTP/2 write
   batching. With the h2 0.4.19 client, `echo-h2-c64` has 3,000 to 3,400
