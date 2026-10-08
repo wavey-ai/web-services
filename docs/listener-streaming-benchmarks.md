@@ -523,16 +523,17 @@ HTTP/1.1 limit.
 
 ## Merge decision
 
-`inline-streaming-nodelay` (`8a211ec`) is not merged into `main`. These items
-are open:
+`inline-streaming-nodelay` is merged into `main` on October 8, 2026, after
+round 5. The merge gives these results against `main` in round 5:
 
-- Short HTTP/2 streams at 5,000 and 10,000: TTFB p50 increases 2.8-3.0 times
-  and peak RSS increases 1.9 times against `main`. At 10,000 streams,
-  throughput decreases 3.6%. `listener-nodelay` alone decreases throughput
-  19.4% at 10,000 streams. At 5,000 streams, throughput increases 5.6%, and
-  TTLB p99 decreases from 51.4 ms to 31.1 ms.
-- `echo-h1-c1000`: throughput decreases 22.9%.
-- `echo-h2-c64` and `echo-h2old-c64`: throughput decreases 9.7% and 9.2%.
+- TTLB p99 decreases from about 44 ms to 3-5 ms in the scenarios with the
+  41-45 ms delays.
+- Peak RSS of `long256k-h2-c5000` decreases from 38,610 MiB to 7,851 MiB.
+- CPU per stream of the slow-reader scenarios decreases up to 26%.
+- `echo-h1-c1000` throughput decreases 22.9%.
+- `echo-h2-c64` and `echo-h2old-c64` throughput decreases 9.7% and 9.2%.
+- `short-h2-c10000` throughput decreases 3.6%. At 5,000 streams, throughput
+  increases 5.6%, and TTLB p99 decreases from 51.4 ms to 31.1 ms.
 
 The send-first echo limit is a property of send-first clients on all trees.
 The planned work and the open questions are in [`TODO.md`](../TODO.md).

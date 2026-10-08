@@ -30,27 +30,30 @@ These items concern the upstream libraries.
 
 The server continues to require TLS. Cleartext server support is excluded at the user's request.
 
-## Listener streaming merge
+## Listener streaming
 
-The measurements are in `docs/listener-streaming-benchmarks.md`.
+The listener runs streaming handlers inline, sets `TCP_NODELAY`, and batches
+HTTP/2 writes below TLS. The measurements are in
+`docs/listener-streaming-benchmarks.md`.
 
 ### Planned work
 
-- [ ] Find the cause of the short HTTP/2 result at 5,000 and 10,000 streams on
-  `inline-streaming-nodelay` (`8a211ec`). Against `main`, TTFB p50 is 2.8-3.0
-  times higher and peak RSS is 1.9 times higher.
-- [ ] Find the cause of the `listener-nodelay` (`400b5c9`) throughput decrease
-  of 19.4% for `short-h2-c10000`.
-- [ ] Find the cause of the echo results on `inline-streaming-nodelay`.
-  Throughput decreases 22.9% for `echo-h1-c1000`, 9.7% for `echo-h2-c64` and
-  9.2% for `echo-h2old-c64`.
-- [ ] For each change, run a focused set of about 20 decision scenarios with
-  `benchmarks/streaming/run.sh` and `ONLY` or `SCENARIO_FILE`.
-- [ ] Before the merge into `main`, run the full matrix: 56 scenarios, 3 trees,
-  3 repeats (504 runs).
+- [ ] Reduce the TCP segments of an HTTP/1.1 response under `TCP_NODELAY`.
+  `echo-h1-c1000` has 156 segments per stream against 86 before the merge, and
+  its throughput decreases 22.9%. `WriteBatch` covers HTTP/2 connections only.
+  Branch `h1-flat-writes` sets `http1::Builder::writev(false)`; in its first
+  repeat, `short-h1-c1000` and `short-h1-c10000` decrease 8% and 11%.
+- [ ] Find the cause of the 9.7% throughput decrease of `echo-h2-c64` and the
+  9.2% decrease of `echo-h2old-c64`. The decrease starts with HTTP/2 write
+  batching. With the h2 0.4.19 client, `echo-h2-c64` has 3,000 to 3,400
+  `too_many_data_frames` errors in each window on all trees.
+- [ ] Find the cause of the short HTTP/2 result at 10,000 streams: throughput
+  decreases 3.6%, and TTFB p50 increases from 7.7 ms to 23.0 ms. At 5,000
+  streams, throughput increases 5.6%, and TTLB p99 decreases from 51.4 ms to
+  31.1 ms.
 
 ### Open questions
 
 - [ ] Decide whether a send-first echo larger than N MB is a requirement. On
-  HTTP/2 with one stream on each connection, `main` completes 3 MiB and
-  `inline-streaming-nodelay` completes 2 MiB. All trees time out at 4 MiB.
+  HTTP/2 with one stream on each connection, the listener completes 2 MiB.
+  Before the merge it completed 3 MiB. All trees time out at 4 MiB.
