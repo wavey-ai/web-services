@@ -238,6 +238,8 @@ impl PureRistIngestStats {
 
 struct RistIngressPacket {
     peer: SocketAddr,
+    /// The receiver session the payload came from (see [`PeerSessions`]).
+    session: u64,
     payload: ReceivedPayload,
     overflow_epoch: u64,
 }
@@ -296,16 +298,20 @@ struct PureRistRequest {
     reported_order: OrderedStats,
     last_skip_warning_at: Option<Instant>,
     last_payload_at: Instant,
+    /// The receiver session this request's sequence space belongs to.
+    session: u64,
 }
 
 impl PureRistRequest {
     /// When this request next needs the writer without a new packet: a
-    /// gap's reorder deadline, or the end of the idle timeout.
-    fn next_timer(&self, session_idle_timeout: Duration) -> Instant {
-        let idle_at = self.last_payload_at + session_idle_timeout;
-        self.ordered_payloads
-            .next_deadline()
-            .map_or(idle_at, |deadline| deadline.min(idle_at))
+    /// gap's reorder deadline, or the end of the idle timeout. An idle
+    /// timeout too long to represent never ends.
+    fn next_timer(&self, session_idle_timeout: Duration) -> Option<Instant> {
+        let idle_at = self.last_payload_at.checked_add(session_idle_timeout);
+        match (self.ordered_payloads.next_deadline(), idle_at) {
+            (Some(deadline), Some(idle_at)) => Some(deadline.min(idle_at)),
+            (deadline, idle_at) => deadline.or(idle_at),
+        }
     }
 }
 
@@ -402,6 +408,15 @@ impl Receiver {
         match self {
             Self::Simple(_) => 0,
             Self::Main(receiver) => receiver.evict_idle_peers(now, idle),
+        }
+    }
+
+    /// Whether the receiver still has a session for `peer`. A Simple
+    /// receiver has one session whatever the peer and never evicts it.
+    fn knows_peer(&self, peer: SocketAddr) -> bool {
+        match self {
+            Self::Simple(_) => true,
+            Self::Main(receiver) => receiver.peer_flow_count(peer).is_some(),
         }
     }
 
@@ -810,6 +825,55 @@ impl NackCounters {
     }
 }
 
+/// Numbers the receiver sessions payloads come from. A Main profile peer
+/// the receiver evicted and then re-created starts its sequences again
+/// from scratch, so the writer must not feed them to the request (and the
+/// reorder buffer) opened for the evicted session.
+struct PeerSessions {
+    per_peer: bool,
+    ids: HashMap<SocketAddr, u64>,
+    next_id: u64,
+    last: Option<(SocketAddr, u64)>,
+}
+
+impl PeerSessions {
+    fn new(receiver: &Receiver) -> Self {
+        Self {
+            per_peer: matches!(receiver, Receiver::Main(_)),
+            ids: HashMap::new(),
+            next_id: 0,
+            last: None,
+        }
+    }
+
+    /// The session `peer`'s payloads belong to now (one map lookup per
+    /// change of peer, not per packet).
+    fn session(&mut self, peer: SocketAddr) -> u64 {
+        if !self.per_peer {
+            return 0;
+        }
+        if let Some((last_peer, id)) = self.last {
+            if last_peer == peer {
+                return id;
+            }
+        }
+        let next_id = &mut self.next_id;
+        let id = *self.ids.entry(peer).or_insert_with(|| {
+            *next_id += 1;
+            *next_id
+        });
+        self.last = Some((peer, id));
+        id
+    }
+
+    /// Forgets the sessions of peers the receiver no longer has, so a peer
+    /// that comes back gets a new session.
+    fn forget_evicted(&mut self, receiver: &Receiver) {
+        self.ids.retain(|peer, _| receiver.knows_peer(*peer));
+        self.last = None;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_receiver<A: PureRistAuth>(
     mut receiver: Receiver,
@@ -825,6 +889,7 @@ fn run_receiver<A: PureRistAuth>(
     let mut buf = vec![0u8; 65_536];
     let mut events = Events::with_capacity(2);
     let mut nacks = NackCounters::default();
+    let mut sessions = PeerSessions::new(&receiver);
     // A peer is forgotten well after its request finished idle, so a
     // sender that pauses briefly keeps its session.
     let peer_idle = session_idle_timeout.saturating_mul(2);
@@ -838,6 +903,7 @@ fn run_receiver<A: PureRistAuth>(
             &ingress_tx,
             stats.as_ref(),
             &mut nacks,
+            &mut sessions,
         ) {
             Some(drained) => drained,
             None => {
@@ -876,6 +942,7 @@ fn run_receiver<A: PureRistAuth>(
                     .evicted_peers
                     .fetch_add(evicted as u64, Ordering::Relaxed);
                 nacks.record(&receiver, stats.as_ref());
+                sessions.forget_evicted(&receiver);
                 debug!(evicted, "pure Rust RIST idle peers evicted");
             }
             next_eviction = now + PEER_EVICTION_INTERVAL;
@@ -920,6 +987,7 @@ fn drain_receiver<A: PureRistAuth>(
     ingress_tx: &mpsc::Sender<RistIngressPacket>,
     stats: &PureRistIngestStats,
     nacks: &mut NackCounters,
+    sessions: &mut PeerSessions,
 ) -> Option<usize> {
     let mut drained = 0;
     for _ in 0..128 {
@@ -959,7 +1027,8 @@ fn drain_receiver<A: PureRistAuth>(
             continue;
         }
 
-        if !enqueue_ingress_packet(ingress_tx, stats, peer, payload) {
+        let session = sessions.session(peer);
+        if !enqueue_ingress_packet(ingress_tx, stats, peer, session, payload) {
             return None;
         }
     }
@@ -971,12 +1040,14 @@ fn enqueue_ingress_packet(
     ingress_tx: &mpsc::Sender<RistIngressPacket>,
     stats: &PureRistIngestStats,
     peer: SocketAddr,
+    session: u64,
     payload: ReceivedPayload,
 ) -> bool {
     let depth = stats.begin_enqueue();
     let overflow_epoch = stats.overflow_packets.load(Ordering::Relaxed);
     match ingress_tx.try_send(RistIngressPacket {
         peer,
+        session,
         payload,
         overflow_epoch,
     }) {
@@ -1027,7 +1098,7 @@ async fn run_writer(
 
         let next_timer = requests
             .values()
-            .map(|request| request.next_timer(config.session_idle_timeout))
+            .filter_map(|request| request.next_timer(config.session_idle_timeout))
             .min();
         // Re-arm only for an earlier instant: each packet moves its idle
         // end later, and a timer that fires early finds nothing due and is
@@ -1110,8 +1181,22 @@ async fn process_ingress_packet(
     config: &RistWriterConfig,
 ) {
     let peer = packet.peer;
+    if let Some(request) = requests
+        .get(&peer)
+        .filter(|request| request.session != packet.session)
+    {
+        // The receiver evicted this peer and re-created it: its sequences
+        // start again, so they get a new request. (Usually the old one
+        // finished idle long before; not when the writer lags.)
+        debug!(
+            stream_id = request.stream.stream_id(),
+            %peer,
+            "pure Rust RIST peer session restarted; finishing its request"
+        );
+        release_and_finish(service, requests, completion_tasks, stats, peer).await;
+    }
     if let std::collections::hash_map::Entry::Vacant(entry) = requests.entry(peer) {
-        match open_request(service, config, peer).await {
+        match open_request(service, config, peer, packet.session).await {
             Some(opened) => {
                 entry.insert(opened);
             }
@@ -1173,7 +1258,11 @@ async fn service_request_timers(
 ) {
     let due = requests
         .iter()
-        .filter(|(_, request)| request.next_timer(session_idle_timeout) <= now)
+        .filter(|(_, request)| {
+            request
+                .next_timer(session_idle_timeout)
+                .is_some_and(|at| at <= now)
+        })
         .map(|(peer, _)| *peer)
         .collect::<Vec<_>>();
     for peer in due {
@@ -1290,6 +1379,7 @@ async fn open_request(
     service: &Arc<UploadResponseService>,
     config: &RistWriterConfig,
     peer: SocketAddr,
+    session: u64,
 ) -> Option<PureRistRequest> {
     let local_addr = config.local_addr;
     let profile = config.profile;
@@ -1357,6 +1447,7 @@ async fn open_request(
         reported_order: OrderedStats::default(),
         last_skip_warning_at: None,
         last_payload_at: Instant::now(),
+        session,
     })
 }
 
@@ -1521,12 +1612,14 @@ mod tests {
             &tx,
             &stats,
             peer,
+            1,
             received_payload(1)
         ));
         assert!(enqueue_ingress_packet(
             &tx,
             &stats,
             peer,
+            1,
             received_payload(2)
         ));
         let first = rx.try_recv().unwrap();
@@ -1536,6 +1629,7 @@ mod tests {
             &tx,
             &stats,
             peer,
+            1,
             received_payload(3)
         ));
         let after_overflow = rx.try_recv().unwrap();
@@ -1838,6 +1932,7 @@ mod tests {
                 &stats,
                 RistIngressPacket {
                     peer,
+                    session: 1,
                     payload: received_payload(sequence),
                     overflow_epoch: 0,
                 },
@@ -1885,6 +1980,175 @@ mod tests {
             .await;
         drain_completion_tasks(&mut completion_tasks, Duration::from_millis(500)).await;
         assert!(completion_tasks.is_empty());
+    }
+
+    fn writer_test_service() -> Arc<UploadResponseService> {
+        Arc::new(UploadResponseService::new(UploadResponseConfig {
+            num_streams: 2,
+            slot_size_kb: 1,
+            slots_per_stream: 8,
+            response_timeout_ms: 1_000,
+        }))
+    }
+
+    async fn wait_for_end(service: &UploadResponseService, stream_id: u64, slot: usize) {
+        let ended = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(TailSlot::End) = service.tail_request(stream_id, slot).await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "request {stream_id} did not end at slot {slot}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_re_created_peer_session_gets_a_new_request() {
+        let service = writer_test_service();
+        let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_000));
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_001));
+        let stats = PureRistIngestStats::new(1, DEFAULT_SOCKET_RECEIVE_BUFFER_BYTES);
+        let config = writer_config(local, Duration::from_secs(60));
+        let mut requests = HashMap::new();
+        let mut completion_tasks = JoinSet::new();
+        // Session 1 ran past one 16-bit epoch; after eviction the receiver
+        // extends the same sender's sequences from scratch (session 2), so
+        // they are far behind the old release point.
+        for (session, sequence) in [(1, 70_000), (1, 70_001), (2, 4_500), (2, 4_501)] {
+            process_ingress_packet(
+                &service,
+                &mut requests,
+                &mut completion_tasks,
+                &stats,
+                RistIngressPacket {
+                    peer,
+                    session,
+                    payload: received_payload(sequence),
+                    overflow_epoch: 0,
+                },
+                &config,
+            )
+            .await;
+        }
+
+        let request = requests.get(&peer).unwrap();
+        assert_eq!(request.session, 2);
+        let new_stream = request.stream.stream_id();
+        assert_eq!(stats.snapshot().reorder_late_dropped, 0);
+        let mut streams = service
+            .active_streams()
+            .await
+            .into_iter()
+            .map(|stream| stream.stream_id)
+            .collect::<Vec<_>>();
+        streams.sort_unstable();
+        assert_eq!(streams.len(), 2, "{streams:?}");
+        let old_stream = *streams.iter().find(|id| **id != new_stream).unwrap();
+        // The old request was finished with its own bytes only.
+        wait_for_end(&service, old_stream, 3).await;
+        match service.tail_request(old_stream, 2).await {
+            Some(TailSlot::Body(body)) => {
+                assert_eq!(&body[..], &[70_000u32 as u8, 70_001u32 as u8])
+            }
+            other => panic!("expected the old session's body, got {other:?}"),
+        }
+
+        let request = requests.remove(&peer).unwrap();
+        finish_request_in_background(&mut completion_tasks, &service, request);
+        wait_for_end(&service, new_stream, 3).await;
+        match service.tail_request(new_stream, 2).await {
+            Some(TailSlot::Body(body)) => {
+                assert_eq!(&body[..], &[4_500u32 as u8, 4_501u32 as u8])
+            }
+            other => panic!("expected the new session's body, got {other:?}"),
+        }
+        for stream_id in [old_stream, new_stream] {
+            service
+                .complete_response(stream_id, Err("test done".to_string()))
+                .await;
+        }
+        drain_completion_tasks(&mut completion_tasks, Duration::from_millis(500)).await;
+        assert!(completion_tasks.is_empty());
+    }
+
+    #[test]
+    fn an_evicted_peer_comes_back_in_a_new_session() {
+        let receiver =
+            Receiver::bind(PureRistProfile::Main, localhost_any(), DEFAULT_FLOW_ID).unwrap();
+        let mut sessions = PeerSessions::new(&receiver);
+        let first = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_001));
+        let second = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_002));
+        let a = sessions.session(first);
+        let b = sessions.session(second);
+        assert_ne!(a, b);
+        assert_eq!(sessions.session(first), a);
+        // The receiver knows neither peer (as after their eviction).
+        sessions.forget_evicted(&receiver);
+        let again = sessions.session(first);
+        assert!(again != a && again != b);
+
+        let simple =
+            Receiver::bind(PureRistProfile::Simple, localhost_any(), DEFAULT_FLOW_ID).unwrap();
+        let mut sessions = PeerSessions::new(&simple);
+        assert_eq!(sessions.session(first), sessions.session(second));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unbounded_idle_timeout_never_ends_a_request() {
+        let service = writer_test_service();
+        let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_000));
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_001));
+        let stats = PureRistIngestStats::new(1, DEFAULT_SOCKET_RECEIVE_BUFFER_BYTES);
+        let mut config = writer_config(local, Duration::from_millis(1));
+        config.session_idle_timeout = Duration::MAX;
+        let mut requests = HashMap::new();
+        let mut completion_tasks = JoinSet::new();
+        for sequence in [1, 3] {
+            process_ingress_packet(
+                &service,
+                &mut requests,
+                &mut completion_tasks,
+                &stats,
+                RistIngressPacket {
+                    peer,
+                    session: 1,
+                    payload: received_payload(sequence),
+                    overflow_epoch: 0,
+                },
+                &config,
+            )
+            .await;
+        }
+        let request = requests.get(&peer).unwrap();
+        let deadline = request.next_timer(config.session_idle_timeout);
+        assert!(deadline.is_some(), "the held gap has a deadline");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        service_request_timers(
+            &service,
+            &mut requests,
+            &mut completion_tasks,
+            &stats,
+            config.session_idle_timeout,
+            Instant::now(),
+        )
+        .await;
+        let request = requests.get(&peer).expect("the request must stay open");
+        assert_eq!(request.ordered_payloads.pending_len(), 0);
+        assert_eq!(request.next_timer(config.session_idle_timeout), None);
+        assert_eq!(stats.snapshot().reorder_gaps_skipped, 1);
+        let stream_id = request.stream.stream_id();
+        service
+            .complete_response(stream_id, Err("test done".to_string()))
+            .await;
+        for (_, request) in requests.drain() {
+            abort_request_in_background(&mut completion_tasks, request);
+        }
+        drain_completion_tasks(&mut completion_tasks, Duration::from_millis(500)).await;
     }
 
     const TEST_PACKET_BYTES: usize = 1_316;
