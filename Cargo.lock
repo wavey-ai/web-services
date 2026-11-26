@@ -61,6 +61,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes-kw"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69fa2b352dcefb5f7f3a5fb840e02665d311d878955380515e4fd50095dd3d8c"
+dependencies = [
+ "aes",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5033,6 +5042,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "srt-core"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/av-rs.git?rev=6817073d1b3cfa2241a3932bb87a150ff9b54d3b#6817073d1b3cfa2241a3932bb87a150ff9b54d3b"
+dependencies = [
+ "aes",
+ "aes-kw",
+ "ctr",
+ "getrandom 0.2.17",
+ "pbkdf2",
+ "sha1",
+]
+
+[[package]]
+name = "srt-mio"
+version = "0.1.0"
+source = "git+https://github.com/wavey-ai/av-rs.git?rev=6817073d1b3cfa2241a3932bb87a150ff9b54d3b#6817073d1b3cfa2241a3932bb87a150ff9b54d3b"
+dependencies = [
+ "libc",
+ "mio",
+ "socket2 0.5.10",
+ "srt-core",
+]
+
+[[package]]
 name = "srt-sys"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6026,14 +6059,16 @@ dependencies = [
 [[package]]
 name = "wavey-srt"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc1583ebb3b3a58a25e21dd69c3b7c50643cd87c554afd06c8c14bd1cdb398ac"
+source = "git+https://github.com/wavey-ai/av-rs.git?rev=6817073d1b3cfa2241a3932bb87a150ff9b54d3b#6817073d1b3cfa2241a3932bb87a150ff9b54d3b"
 dependencies = [
  "lazy_static",
  "libc",
  "log",
+ "mio",
  "num-derive",
  "num-traits",
+ "srt-core",
+ "srt-mio",
  "srt-sys",
  "tokio",
 ]
