@@ -13,6 +13,9 @@ use tracing::{debug, error, info};
 const MAX_SRT_PACKET_SIZE: usize = 1316;
 const READ_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_LIVE_LATENCY_MS: i32 = 120;
+/// Pause after a failed accept, doubled per consecutive failure up to the max.
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(100);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// Auth callback for SRT connections
 /// The stream_id typically contains: "bearer:<token>" or just the stream key
@@ -133,6 +136,7 @@ impl<A: SrtAuth> SrtIngest<A> {
         info!("SRT ingest server listening on {}", addr);
 
         tokio::spawn(async move {
+            let mut backoff = ACCEPT_BACKOFF_MIN;
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
@@ -142,6 +146,7 @@ impl<A: SrtAuth> SrtIngest<A> {
                     accept_result = listener.accept() => {
                         match accept_result {
                             Ok((stream, peer_addr)) => {
+                                backoff = ACCEPT_BACKOFF_MIN;
                                 let service = Arc::clone(&service);
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_srt_connection(stream, peer_addr, service).await {
@@ -149,8 +154,21 @@ impl<A: SrtAuth> SrtIngest<A> {
                                     }
                                 });
                             }
+                            Err(e) if is_fatal_accept_error(&e) => {
+                                error!("SRT listener failed, no longer accepting: {:?}", e);
+                                break;
+                            }
                             Err(e) => {
                                 error!("SRT accept error: {:?}", e);
+                                // never spin on a failing accept
+                                tokio::select! {
+                                    _ = shutdown_rx.changed() => {
+                                        info!("SRT ingest server shutting down");
+                                        break;
+                                    }
+                                    _ = tokio::time::sleep(backoff) => {}
+                                }
+                                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
                             }
                         }
                     }
@@ -328,6 +346,20 @@ async fn handle_srt_connection(
     result
 }
 
+/// The listener socket itself is broken (SRT_ESOCKFAIL from a listener
+/// whose I/O ended, or an invalid / non-listening socket): accept() will
+/// keep failing at once, so retrying is pointless.
+fn is_fatal_accept_error(error: &srt::Error) -> bool {
+    const SRT_ESOCKFAIL: i32 = 1003;
+    const SRT_EINVSOCK: i32 = 5004;
+    const SRT_ENOLISTEN: i32 = 5006;
+    matches!(
+        error,
+        srt::Error::SRTError { fn_name: "srt_accept", code, .. }
+            if matches!(*code, SRT_ESOCKFAIL | SRT_EINVSOCK | SRT_ENOLISTEN)
+    )
+}
+
 fn is_srt_peer_closed_error(error: &std::io::Error) -> bool {
     let text = error.to_string();
     text.contains("srt_recv error: 2001")
@@ -335,8 +367,19 @@ fn is_srt_peer_closed_error(error: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_srt_peer_closed_error;
+    use super::{is_fatal_accept_error, is_srt_peer_closed_error};
     use std::io;
+
+    #[test]
+    fn classifies_fatal_accept_errors() {
+        let srt_err = |fn_name, code| srt::Error::SRTError { fn_name, code, errno: 0 };
+        assert!(is_fatal_accept_error(&srt_err("srt_accept", 1003)));
+        assert!(is_fatal_accept_error(&srt_err("srt_accept", 5004)));
+        assert!(!is_fatal_accept_error(&srt_err("srt_accept", 6002)));
+        assert!(!is_fatal_accept_error(&srt_err("srt_recv", 1003)));
+        let refused = srt::Error::IOError(io::Error::new(io::ErrorKind::PermissionDenied, "refused"));
+        assert!(!is_fatal_accept_error(&refused));
+    }
 
     #[test]
     fn classifies_srt_peer_close_error() {

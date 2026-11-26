@@ -5044,7 +5044,7 @@ dependencies = [
 [[package]]
 name = "srt-core"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/av-rs.git?rev=e86574c5f652cf2ad47733eae61bb8e5fe519bd0#e86574c5f652cf2ad47733eae61bb8e5fe519bd0"
+source = "git+https://github.com/wavey-ai/av-rs.git?rev=2196f4ffdafde9347446932db429a03456a302d5#2196f4ffdafde9347446932db429a03456a302d5"
 dependencies = [
  "aes",
  "aes-kw",
@@ -5057,7 +5057,7 @@ dependencies = [
 [[package]]
 name = "srt-mio"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/av-rs.git?rev=e86574c5f652cf2ad47733eae61bb8e5fe519bd0#e86574c5f652cf2ad47733eae61bb8e5fe519bd0"
+source = "git+https://github.com/wavey-ai/av-rs.git?rev=2196f4ffdafde9347446932db429a03456a302d5#2196f4ffdafde9347446932db429a03456a302d5"
 dependencies = [
  "libc",
  "mio",
@@ -6059,7 +6059,7 @@ dependencies = [
 [[package]]
 name = "wavey-srt"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/av-rs.git?rev=e86574c5f652cf2ad47733eae61bb8e5fe519bd0#e86574c5f652cf2ad47733eae61bb8e5fe519bd0"
+source = "git+https://github.com/wavey-ai/av-rs.git?rev=2196f4ffdafde9347446932db429a03456a302d5#2196f4ffdafde9347446932db429a03456a302d5"
 dependencies = [
  "lazy_static",
  "libc",
