@@ -452,8 +452,8 @@ dependencies = [
  "raptorq-datagram-fec",
  "rcgen",
  "reqwest",
- "rist-core 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=f1be8f87bf2c38122642682bf92894e85c55c578)",
- "rist-mio 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=f1be8f87bf2c38122642682bf92894e85c55c578)",
+ "rist-core 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=7fb6a17d4aaeea1880ea4d64d06ef46de5297ee7)",
+ "rist-mio 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=7fb6a17d4aaeea1880ea4d64d06ef46de5297ee7)",
  "rustls 0.23.43",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
@@ -4266,7 +4266,7 @@ dependencies = [
 [[package]]
 name = "rist-core"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/rist-rs.git?rev=f1be8f87bf2c38122642682bf92894e85c55c578#f1be8f87bf2c38122642682bf92894e85c55c578"
+source = "git+https://github.com/wavey-ai/rist-rs.git?rev=7fb6a17d4aaeea1880ea4d64d06ef46de5297ee7#7fb6a17d4aaeea1880ea4d64d06ef46de5297ee7"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4296,12 +4296,12 @@ dependencies = [
 [[package]]
 name = "rist-mio"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/rist-rs.git?rev=f1be8f87bf2c38122642682bf92894e85c55c578#f1be8f87bf2c38122642682bf92894e85c55c578"
+source = "git+https://github.com/wavey-ai/rist-rs.git?rev=7fb6a17d4aaeea1880ea4d64d06ef46de5297ee7#7fb6a17d4aaeea1880ea4d64d06ef46de5297ee7"
 dependencies = [
  "libc",
  "mio",
  "nix 0.29.0",
- "rist-core 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=f1be8f87bf2c38122642682bf92894e85c55c578)",
+ "rist-core 0.1.0 (git+https://github.com/wavey-ai/rist-rs.git?rev=7fb6a17d4aaeea1880ea4d64d06ef46de5297ee7)",
  "socket2 0.6.5",
 ]
 
