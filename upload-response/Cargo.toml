@@ -36,7 +36,7 @@ reqwest = { version = "0.13.4", features = ["rustls", "http2"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Pure Rust SRT (srt-core + srt-mio, AES included): no C compiler, cmake or bindgen.
-srt = { package = "wavey-srt", git = "https://github.com/wavey-ai/av-rs.git", rev = "6817073d1b3cfa2241a3932bb87a150ff9b54d3b", default-features = false, features = ["async", "pure-rust"], optional = true }
+srt = { package = "wavey-srt", git = "https://github.com/wavey-ai/av-rs.git", rev = "e86574c5f652cf2ad47733eae61bb8e5fe519bd0", default-features = false, features = ["async", "pure-rust"], optional = true }
 raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git", package = "raptorq-datagram-fec", default-features = false, optional = true }
 rist = { package = "wavey-rist", version = "0.1.0", features = ["tokio"], optional = true }
 rist-core-pure = { package = "rist-core", git = "https://github.com/wavey-ai/rist-rs.git", rev = "614c10ab03fb37e25b7d892a2224caaddcbb89a6", optional = true }
