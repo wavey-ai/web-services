@@ -9,6 +9,7 @@ use rist_core_pure::packet::rtcp::NackMode;
 use rist_core_pure::time::ntp_now;
 use rist_core_pure::{
     CongestionControlMode, OrderedPayloadBuffer, OrderedStats, ReceivedPayload, RecoveryConfig,
+    RecoveryTuning,
 };
 use rist_mio_pure::{MainMioReceiver, MainReceiverEvent, SimpleMioReceiver, SimpleReceiverEvent};
 use std::collections::HashMap;
@@ -253,6 +254,23 @@ struct RistWriterConfig {
     body_flush_bytes: usize,
     reorder_deadline: Duration,
     reorder_capacity_packets: usize,
+    /// How long a request's ordered buffer holds its first payload while
+    /// the start of the stream is unknown (see [`product_recovery_tuning`]).
+    startup_hold: Duration,
+}
+
+/// The receiver tuning the ingest runs with: rist-core's default (product)
+/// tuning, the one the transport bench measures. With it the receiver
+/// recovers the start of a stream like the middle (`startup_recovery`:
+/// packets before the first one seen are NACKed, and a first sequence of
+/// 1..=16 is taken as a stream numbered from 0), and each request's
+/// [`OrderedPayloadBuffer`] holds a first payload whose start is unknown
+/// for `ordered_startup_hold(reorder deadline)` (25 ms, at most the
+/// deadline), taking the packets below it meanwhile. That is what
+/// `OrderedPayloadBuffer::with_deadline` gives by default; the hold is
+/// derived from the tuning here so the two cannot drift apart.
+fn product_recovery_tuning() -> RecoveryTuning {
+    RecoveryTuning::default()
 }
 
 /// Pure Rust RIST profile used by [`PureRistIngest`].
@@ -350,6 +368,13 @@ impl Receiver {
         match self {
             Self::Simple(receiver) => receiver.set_recovery_config(recovery, congestion_control),
             Self::Main(receiver) => receiver.set_recovery_config(recovery, congestion_control),
+        }
+    }
+
+    fn set_recovery_tuning(&mut self, tuning: RecoveryTuning) {
+        match self {
+            Self::Simple(receiver) => receiver.set_recovery_tuning(tuning),
+            Self::Main(receiver) => receiver.set_recovery_tuning(tuning),
         }
     }
 
@@ -686,6 +711,9 @@ impl<A: PureRistAuth> PureRistIngest<A> {
         if let Some((recovery, congestion_control)) = self.recovery {
             receiver.set_recovery_config(recovery, congestion_control);
         }
+        let tuning = product_recovery_tuning();
+        receiver.set_recovery_tuning(tuning);
+        let startup_hold = tuning.ordered_startup_hold(reorder_deadline);
         let effective_socket_receive_buffer_bytes = receiver
             .set_socket_receive_buffer_size(socket_receive_buffer_bytes)
             .or_else(|error| {
@@ -709,6 +737,7 @@ impl<A: PureRistAuth> PureRistIngest<A> {
             ingress_queue_packets,
             reorder_deadline_ms = reorder_deadline.as_millis() as u64,
             reorder_capacity_packets,
+            startup_hold_ms = startup_hold.as_millis() as u64,
             requested_socket_receive_buffer_bytes = socket_receive_buffer_bytes,
             effective_socket_receive_buffer_bytes,
             "pure Rust RIST ingest server listening"
@@ -757,6 +786,7 @@ impl<A: PureRistAuth> PureRistIngest<A> {
             body_flush_bytes,
             reorder_deadline,
             reorder_capacity_packets,
+            startup_hold,
         };
         let writer_task = tokio::spawn(async move {
             run_writer(ingress_rx, writer_service, writer_stats, writer_config).await;
@@ -1442,7 +1472,8 @@ async fn open_request(
         ordered_payloads: OrderedPayloadBuffer::with_deadline(
             config.reorder_capacity_packets,
             config.reorder_deadline,
-        ),
+        )
+        .with_startup_hold(config.startup_hold),
         released: Vec::new(),
         reported_order: OrderedStats::default(),
         last_skip_warning_at: None,
@@ -1906,6 +1937,7 @@ mod tests {
             body_flush_bytes: 1_024,
             reorder_deadline,
             reorder_capacity_packets: DEFAULT_REORDER_CAPACITY_PACKETS,
+            startup_hold: product_recovery_tuning().ordered_startup_hold(reorder_deadline),
         }
     }
 
@@ -1924,7 +1956,9 @@ mod tests {
         let config = writer_config(local, Duration::from_secs(60));
         let mut requests = HashMap::new();
         let mut completion_tasks = JoinSet::new();
-        for sequence in [1, 3] {
+        // Sequence 0 first (streams are numbered from 0): released at once,
+        // and 2 waits behind the gap at 1.
+        for sequence in [0, 2] {
             process_ingress_packet(
                 &service,
                 &mut requests,
@@ -1969,7 +2003,7 @@ mod tests {
         .await;
         assert!(ended.is_ok(), "idle request did not end");
         match service.tail_request(stream_id, 2).await {
-            Some(TailSlot::Body(body)) => assert_eq!(&body[..], &[1, 3]),
+            Some(TailSlot::Body(body)) => assert_eq!(&body[..], &[0, 2]),
             other => panic!("expected the body past the gap, got {other:?}"),
         }
         let metrics = stats.snapshot();
@@ -2040,6 +2074,21 @@ mod tests {
         assert_eq!(request.session, 2);
         let new_stream = request.stream.stream_id();
         assert_eq!(stats.snapshot().reorder_late_dropped, 0);
+        // The new session's start is unknown (its first sequence is far
+        // from 0): its payloads wait out the startup hold, then go in order.
+        assert!(request.ordered_payloads.in_startup());
+        assert_eq!(request.ordered_payloads.pending_len(), 2);
+        tokio::time::sleep(config.startup_hold + Duration::from_millis(5)).await;
+        service_request_timers(
+            &service,
+            &mut requests,
+            &mut completion_tasks,
+            &stats,
+            config.session_idle_timeout,
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(requests[&peer].ordered_payloads.pending_len(), 0);
         let mut streams = service
             .active_streams()
             .await
@@ -2108,7 +2157,9 @@ mod tests {
         config.session_idle_timeout = Duration::MAX;
         let mut requests = HashMap::new();
         let mut completion_tasks = JoinSet::new();
-        for sequence in [1, 3] {
+        // Sequence 0 first (streams are numbered from 0): released at once,
+        // and 2 waits behind the gap at 1.
+        for sequence in [0, 2] {
             process_ingress_packet(
                 &service,
                 &mut requests,
@@ -2149,6 +2200,198 @@ mod tests {
             abort_request_in_background(&mut completion_tasks, request);
         }
         drain_completion_tasks(&mut completion_tasks, Duration::from_millis(500)).await;
+    }
+
+    async fn push_payloads(
+        service: &Arc<UploadResponseService>,
+        requests: &mut HashMap<SocketAddr, PureRistRequest>,
+        completion_tasks: &mut JoinSet<()>,
+        stats: &PureRistIngestStats,
+        config: &RistWriterConfig,
+        peer: SocketAddr,
+        payloads: impl IntoIterator<Item = ReceivedPayload>,
+    ) {
+        for payload in payloads {
+            process_ingress_packet(
+                service,
+                requests,
+                completion_tasks,
+                stats,
+                RistIngressPacket {
+                    peer,
+                    session: 1,
+                    payload,
+                    overflow_epoch: 0,
+                },
+                config,
+            )
+            .await;
+        }
+    }
+
+    /// Finishes `peer`'s request the way an idle or restarted session does
+    /// and returns its one body slot.
+    async fn finished_body(
+        service: &Arc<UploadResponseService>,
+        requests: &mut HashMap<SocketAddr, PureRistRequest>,
+        completion_tasks: &mut JoinSet<()>,
+        stats: &PureRistIngestStats,
+        peer: SocketAddr,
+    ) -> Vec<u8> {
+        let stream_id = requests[&peer].stream.stream_id();
+        release_and_finish(service, requests, completion_tasks, stats, peer).await;
+        wait_for_end(service, stream_id, 3).await;
+        let body = match service.tail_request(stream_id, 2).await {
+            Some(TailSlot::Body(body)) => body.to_vec(),
+            other => panic!("expected one body slot, got {other:?}"),
+        };
+        service
+            .complete_response(stream_id, Err("test done".to_string()))
+            .await;
+        drain_completion_tasks(completion_tasks, Duration::from_millis(500)).await;
+        body
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reordered_first_packets_of_a_stream_are_written_in_order() {
+        let service = writer_test_service();
+        let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_000));
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_001));
+        let stats = PureRistIngestStats::new(1, DEFAULT_SOCKET_RECEIVE_BUFFER_BYTES);
+        let config = writer_config(local, Duration::from_secs(60));
+        let mut requests = HashMap::new();
+        let mut completion_tasks = JoinSet::new();
+        // Packet 3 overtakes 0..2 (path jitter): the stream is numbered from
+        // 0, so 3 waits behind a gap back to 0 instead of being released
+        // first and 0..2 dropped as late.
+        push_payloads(
+            &service,
+            &mut requests,
+            &mut completion_tasks,
+            &stats,
+            &config,
+            peer,
+            [3, 0, 1, 2, 4].map(received_payload),
+        )
+        .await;
+        let order = requests[&peer].ordered_payloads.stats();
+        assert_eq!(requests[&peer].ordered_payloads.pending_len(), 0);
+        assert_eq!(order.zero_starts, 1);
+        assert_eq!(order.late_dropped, 0);
+        assert_eq!(order.gaps_skipped, 0);
+        let body =
+            finished_body(&service, &mut requests, &mut completion_tasks, &stats, peer).await;
+        assert_eq!(body, vec![0, 1, 2, 3, 4]);
+        let metrics = stats.snapshot();
+        assert_eq!(metrics.reorder_late_dropped, 0);
+        assert_eq!(metrics.reorder_gaps_skipped, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_starting_far_from_zero_takes_packets_below_its_first_during_the_hold() {
+        let service = writer_test_service();
+        let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_000));
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_001));
+        let stats = PureRistIngestStats::new(1, DEFAULT_SOCKET_RECEIVE_BUFFER_BYTES);
+        let deadline = Duration::from_secs(60);
+        let config = writer_config(local, deadline);
+        // The hold is the product tuning's, the same as the default
+        // `with_deadline` buffer the transport bench measures.
+        assert!(product_recovery_tuning().startup_recovery);
+        assert_eq!(
+            config.startup_hold,
+            OrderedPayloadBuffer::with_deadline(DEFAULT_REORDER_CAPACITY_PACKETS, deadline)
+                .startup_hold()
+        );
+        assert!(config.startup_hold > Duration::ZERO);
+        let mut requests = HashMap::new();
+        let mut completion_tasks = JoinSet::new();
+        push_payloads(
+            &service,
+            &mut requests,
+            &mut completion_tasks,
+            &stats,
+            &config,
+            peer,
+            [502, 500, 501, 503].map(received_payload),
+        )
+        .await;
+        let request = &requests[&peer];
+        assert_eq!(request.ordered_payloads.startup_hold(), config.startup_hold);
+        assert!(request.ordered_payloads.in_startup());
+        assert_eq!(request.ordered_payloads.pending_len(), 4);
+        assert!(request
+            .next_timer(config.session_idle_timeout)
+            .is_some_and(|at| at <= Instant::now() + config.startup_hold));
+
+        tokio::time::sleep(config.startup_hold + Duration::from_millis(5)).await;
+        service_request_timers(
+            &service,
+            &mut requests,
+            &mut completion_tasks,
+            &stats,
+            config.session_idle_timeout,
+            Instant::now(),
+        )
+        .await;
+        let order = requests[&peer].ordered_payloads.stats();
+        assert_eq!(requests[&peer].ordered_payloads.pending_len(), 0);
+        assert_eq!(order.startup_timeouts, 1);
+        assert_eq!(order.late_dropped, 0);
+        let body =
+            finished_body(&service, &mut requests, &mut completion_tasks, &stats, peer).await;
+        assert_eq!(
+            body,
+            (500u32..504)
+                .map(|sequence| sequence as u8)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(stats.snapshot().reorder_late_dropped, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_senders_copy_of_its_first_packet_ends_the_startup_hold() {
+        let service = writer_test_service();
+        let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_000));
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9_001));
+        let stats = PureRistIngestStats::new(1, DEFAULT_SOCKET_RECEIVE_BUFFER_BYTES);
+        let config = writer_config(local, Duration::from_secs(60));
+        let mut requests = HashMap::new();
+        let mut completion_tasks = JoinSet::new();
+        push_payloads(
+            &service,
+            &mut requests,
+            &mut completion_tasks,
+            &stats,
+            &config,
+            peer,
+            [received_payload(700)],
+        )
+        .await;
+        assert!(requests[&peer].ordered_payloads.in_startup());
+        // The receiver flags the copy as a duplicate; the ingest still
+        // pushes it, and it shows 700 is the first packet.
+        let copy = ReceivedPayload {
+            duplicate: true,
+            ..received_payload(700)
+        };
+        push_payloads(
+            &service,
+            &mut requests,
+            &mut completion_tasks,
+            &stats,
+            &config,
+            peer,
+            [copy, received_payload(701)],
+        )
+        .await;
+        let request = &requests[&peer];
+        assert!(!request.ordered_payloads.in_startup());
+        assert_eq!(request.ordered_payloads.pending_len(), 0);
+        assert_eq!(request.ordered_payloads.stats().duplicates, 1);
+        let body =
+            finished_body(&service, &mut requests, &mut completion_tasks, &stats, peer).await;
+        assert_eq!(body, vec![700u32 as u8, 701u32 as u8]);
     }
 
     const TEST_PACKET_BYTES: usize = 1_316;
@@ -2390,6 +2633,45 @@ mod tests {
         let metrics = stats.snapshot();
         assert!(metrics.nack_packets_sent >= 2, "{metrics:?}");
         assert_eq!(metrics.reorder_gaps_skipped, 0);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pure_rist_recovers_the_first_packets_of_a_stream_lost_in_transit() {
+        let service = packet_service(2);
+        let (ingest_addr, stats, shutdown) = start_packet_per_slot_ingest(&service, None).await;
+        let mut sender =
+            MainMioSender::connect(localhost_any(), ingest_addr, DEFAULT_FLOW_ID, 64).unwrap();
+
+        // The first three packets never arrive: the ingest sees 3 first,
+        // takes the stream as numbered from 0 and NACKs 0..2.
+        send_fills(&mut sender, 0..10, &[0, 1, 2]);
+        let mut feedback = vec![0u8; 65_536];
+        let repaired = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                while let Ok(Some(_)) = sender.try_recv_feedback_and_retransmit(&mut feedback) {}
+                let streams = service.active_streams().await;
+                if streams.iter().any(|stream| stream.request_last > 10) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(
+            repaired.is_ok(),
+            "the first packets were not recovered; ingest={:?}; sender={:?}",
+            stats.snapshot(),
+            sender.stats()
+        );
+
+        let fills = single_stream_fills(&service, 10).await;
+        assert_eq!(fills, (0..10).collect::<Vec<u8>>());
+        let metrics = stats.snapshot();
+        assert_eq!(metrics.reorder_gaps_skipped, 0);
+        assert_eq!(metrics.reorder_late_dropped, 0);
+        assert!(metrics.nack_packets_sent >= 1, "{metrics:?}");
+        assert!(sender.stats().nack_requests > 0, "{:?}", sender.stats());
         let _ = shutdown.send(());
     }
 
