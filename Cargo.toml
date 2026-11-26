@@ -18,3 +18,15 @@ strip = true
 debug = false
 codegen-units = 1
 lto = true
+
+# The pure Rust SRT stack and its AES are optimized in test/dev builds too:
+# unoptimized software AES-CTR moves about 2 MB/s (proto_benchmark's
+# encrypted SRT upload), optimized it keeps up with the clear path.
+[profile.dev.package.srt-core]
+opt-level = 3
+[profile.dev.package.srt-mio]
+opt-level = 3
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.ctr]
+opt-level = 3
